@@ -2033,6 +2033,65 @@ fn buildToolResultEventLine(
     );
 }
 
+// Execute tool calls embedded in model response (TOOL_CALL format)
+fn executeInlineToolCalls(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    response: []const u8,
+    paths: *std.ArrayList([]u8),
+    tool_calls: *usize,
+) !?[]u8 {
+    var result_buf = std.ArrayList(u8).empty;
+    defer result_buf.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
+
+        // Parse: TOOL_CALL name args
+        const after_prefix = trimmed[10..]; // Skip "TOOL_CALL "
+        const space_idx = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse continue;
+        const tool_name = after_prefix[0..space_idx];
+        const args = std.mem.trim(u8, after_prefix[space_idx..], " \t");
+
+        if (!isKnownToolName(tool_name)) continue;
+
+        tool_calls.* += 1;
+
+        // Track path
+        if (parsePrimaryPathFromArgs(allocator, args)) |p| {
+            var found = false;
+            for (paths.items) |existing| {
+                if (std.mem.eql(u8, existing, p)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try paths.append(allocator, p);
+            } else {
+                allocator.free(p);
+            }
+        }
+
+        // Execute tool
+        try stdout.print("event=tool-inline tool={s}\n", .{tool_name});
+
+        const tool_out = tools.executeNamed(allocator, tool_name, args) catch |err| {
+            try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
+            continue;
+        };
+        defer allocator.free(tool_out);
+
+        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, tool_out });
+    }
+
+    if (result_buf.items.len == 0) return null;
+    const value = try result_buf.toOwnedSlice(allocator);
+    return @as(?[]u8, value);
+}
+
 fn parsePrimaryPathFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) ?[]u8 {
     const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null };
     var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
@@ -2162,6 +2221,26 @@ fn runModelTurnWithTools(
             }
 
             const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
+
+            // Check if response contains inline tool calls (TOOL_CALL format)
+            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
+                // Execute inline tool calls from model response
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                allocator.free(final);
+
+                if (tool_result) |result| {
+                    // Append tool result to context and continue loop
+                    const next_prompt = try std.fmt.allocPrint(
+                        allocator,
+                        "{s}\n\nTool execution result:\n{s}\n\nContinue with next action if needed.",
+                        .{ context_prompt, result },
+                    );
+                    allocator.free(result);
+                    context_prompt = next_prompt;
+                    continue;
+                }
+            }
+
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2176,6 +2255,22 @@ fn runModelTurnWithTools(
 
         if (!isKnownToolName(routed.?.tool)) {
             const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
+
+            // Check for inline tool calls
+            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                allocator.free(final);
+                if (tool_result) |result| {
+                    allocator.free(result);
+                    return .{
+                        .response = try allocator.dupe(u8, "Executed tool from model response."),
+                        .tool_calls = tool_calls,
+                        .error_count = 0,
+                        .files_touched = try joinPaths(allocator, paths.items),
+                    };
+                }
+            }
+
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2186,6 +2281,22 @@ fn runModelTurnWithTools(
 
         if (!mutation_request and isMutatingToolName(routed.?.tool)) {
             const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
+
+            // Check for inline tool calls
+            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                allocator.free(final);
+                if (tool_result) |result| {
+                    allocator.free(result);
+                    return .{
+                        .response = try allocator.dupe(u8, "Executed tool from model response."),
+                        .tool_calls = tool_calls,
+                        .error_count = 0,
+                        .files_touched = try joinPaths(allocator, paths.items),
+                    };
+                }
+            }
+
             return .{
                 .response = final,
                 .tool_calls = tool_calls,

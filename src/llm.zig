@@ -493,7 +493,42 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]
     return result.stdout;
 }
 
+// Extract tool calls from OpenAI-compatible response and format as text commands
+fn extractToolCallsAsText(allocator: std.mem.Allocator, json: []const u8) !?[]u8 {
+    const FunctionDef = struct { name: []const u8, arguments: []const u8 };
+    const ToolCall = struct { type: []const u8, function: FunctionDef };
+    const Message = struct { content: ?[]const u8 = null, tool_calls: ?[]const ToolCall = null };
+    const Choice = struct { message: Message, finish_reason: ?[]const u8 = null };
+    const Resp = struct { choices: ?[]const Choice = null };
+
+    var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    const choices = parsed.value.choices orelse return null;
+    if (choices.len == 0) return null;
+
+    const tool_calls = choices[0].message.tool_calls orelse return null;
+    if (tool_calls.len == 0) return null;
+
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(allocator);
+
+    for (tool_calls) |tc| {
+        if (!std.mem.eql(u8, tc.type, "function")) continue;
+        try result.writer(allocator).print("TOOL_CALL {s} {s}\n", .{ tc.function.name, tc.function.arguments });
+    }
+
+    if (result.items.len == 0) return null;
+    const value = try result.toOwnedSlice(allocator);
+    return @as(?[]u8, value);
+}
+
 fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    // First check for tool calls
+    if (try extractToolCallsAsText(allocator, json)) |tool_text| {
+        return tool_text;
+    }
+
     const OutputContent = struct { text: ?[]const u8 = null };
     const OutputItem = struct {
         text: ?[]const u8 = null,
