@@ -434,7 +434,7 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
         try w.print("{{\"model\":\"{s}\",\"messages\":", .{model_id});
         // Serialize messages manually
         try w.print("[{{\"role\":\"user\",\"content\":\"", .{});
-        // Escape the prompt
+        // Escape the prompt - handle all control characters
         for (prompt) |ch| {
             switch (ch) {
                 '\\' => try w.print("\\\\", .{}),
@@ -442,7 +442,15 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
                 '\n' => try w.print("\\n", .{}),
                 '\r' => try w.print("\\r", .{}),
                 '\t' => try w.print("\\t", .{}),
-                else => try w.print("{c}", .{ch}),
+                0x08 => try w.print("\\b", .{}), // backspace
+                0x0C => try w.print("\\f", .{}), // form feed
+                else => {
+                    if (ch < 0x20) {
+                        try w.print("\\u{x:0>4}", .{ch}); // other control chars
+                    } else {
+                        try w.print("{c}", .{ch});
+                    }
+                },
             }
         }
         try w.print("\"}}],\"tools\":{s}}}", .{tj});
