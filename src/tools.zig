@@ -10,14 +10,18 @@ pub const ToolDef = struct {
     parameters_json: []const u8,
 };
 
+const DEFAULT_READ_OFFSET: usize = 0;
+const DEFAULT_READ_LIMIT: usize = 4096;
+const MAX_READ_LIMIT: usize = 16384;
+
 pub const definitions = [_]ToolDef{
     .{ .name = "bash", .description = "Execute a shell command and return stdout.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}" },
-    .{ .name = "read_file", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 4096, ~100 lines)\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
+    .{ .name = "read_file", .description = "Read a file and return its contents. Always provide offset and limit for bounded reads.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of bytes to skip from the start (always include; use 0 first)\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum bytes to read (always include; use <=16384)\"}},\"required\":[\"path\",\"offset\",\"limit\"],\"additionalProperties\":false}" },
     .{ .name = "list_files", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write_file", .description = "Write complete file contents to a path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "replace_in_file", .description = "Replace text in a file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\",\"replace\"],\"additionalProperties\":false}" },
     // OpenCode-compatible aliases.
-    .{ .name = "read", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 4096, ~100 lines)\"}},\"required\":[\"filePath\"],\"additionalProperties\":false}" },
+    .{ .name = "read", .description = "Read a file and return its contents. Always provide offset and limit for bounded reads.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of bytes to skip from the start (always include; use 0 first)\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum bytes to read (always include; use <=16384)\"}},\"required\":[\"filePath\",\"offset\",\"limit\"],\"additionalProperties\":false}" },
     .{ .name = "list", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write", .description = "Write full content to a file path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"filePath\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "edit", .description = "Replace oldString with newString in one file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
@@ -41,7 +45,7 @@ pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     if (std.mem.startsWith(u8, trimmed, "read ")) {
         const path = std.mem.trim(u8, trimmed[5..], " \t");
         if (path.len == 0) return ToolError.InvalidToolCommand;
-        return readFileAtPath(allocator, path, 1024 * 1024);
+        return readFileAtPathWithOffset(allocator, path, DEFAULT_READ_OFFSET, DEFAULT_READ_LIMIT);
     }
 
     if (std.mem.startsWith(u8, trimmed, "list ")) {
@@ -74,8 +78,10 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
         const path = p.value.path orelse p.value.filePath orelse p.value.file_path orelse p.value.file_name orelse return NamedToolError.InvalidArguments;
-        const offset = p.value.offset orelse 0;
-        const limit = p.value.limit orelse 4096;
+        const offset = p.value.offset orelse DEFAULT_READ_OFFSET;
+        const limit_raw = p.value.limit orelse DEFAULT_READ_LIMIT;
+        const normalized_limit = if (limit_raw == 0) DEFAULT_READ_LIMIT else limit_raw;
+        const limit = @min(normalized_limit, MAX_READ_LIMIT);
         return readFileAtPathWithOffset(allocator, path, offset, limit) catch |err| {
             // Return snarky error to guide model back on track
             if (err == NamedToolError.InvalidArguments) {
@@ -260,6 +266,7 @@ fn readFileAtPathWithOffset(allocator: std.mem.Allocator, path: []const u8, offs
 
     // Read the content
     const content = try allocator.alloc(u8, bytes_to_read);
+    errdefer allocator.free(content);
     const len = try file.readAll(content);
     if (len < bytes_to_read) {
         const trimmed = try allocator.realloc(content, len);

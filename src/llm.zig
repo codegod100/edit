@@ -85,29 +85,26 @@ pub fn query(
 
 fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, _tool_defs: ?[]const ToolRouteDef) ![]u8 {
     _ = _tool_defs;
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    defer allocator.free(auth);
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    defer allocator.free(auth_value);
 
     const endpoint = if (isLikelyOAuthToken(api_key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
     const is_codex = std.mem.eql(u8, endpoint, OPENAI_CODEX_ENDPOINT);
     const body = try buildOpenAIRequestBody(allocator, model_id, prompt, is_codex);
     defer allocator.free(body);
 
-    const output = try runCommandCapture(allocator, &.{
-        "curl",
-        "-sS",
-        "-X",
-        "POST",
+    const headers = std.http.Client.Request.Headers{
+        .authorization = .{ .override = auth_value },
+        .content_type = .{ .override = "application/json" },
+    };
+    const output = try httpRequest(
+        allocator,
+        .POST,
         endpoint,
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        auth,
-        "-H",
-        "originator: zagent",
-        "-d",
+        headers,
+        &.{.{ .name = "originator", .value = "zagent" }},
         body,
-    });
+    );
     defer allocator.free(output);
 
     const first = try extractOpenAIText(allocator, output);
@@ -131,17 +128,14 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
             var attempt: usize = 0;
             while (attempt < 15) : (attempt += 1) {
                 std.Thread.sleep(400 * std.time.ns_per_ms);
-                const polled = try runCommandCapture(allocator, &.{
-                    "curl",
-                    "-sS",
-                    "-X",
-                    "GET",
+                const polled = try httpRequest(
+                    allocator,
+                    .GET,
                     follow_url,
-                    "-H",
-                    auth,
-                    "-H",
-                    "originator: zagent",
-                });
+                    headers,
+                    &.{.{ .name = "originator", .value = "zagent" }},
+                    null,
+                );
                 defer allocator.free(polled);
 
                 const parsed = try extractOpenAIText(allocator, polled);
@@ -184,19 +178,26 @@ pub fn inferToolCallWithThinking(
     if (!std.mem.eql(u8, provider_id, "openai")) return null;
     const key = api_key orelse return QueryError.MissingApiKey;
 
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
-    defer allocator.free(auth);
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
+    defer allocator.free(auth_value);
 
     const endpoint = if (isLikelyOAuthToken(key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
     const stream = std.mem.eql(u8, endpoint, OPENAI_CODEX_ENDPOINT);
     const body = try buildOpenAIToolRouteBody(allocator, model_id, prompt, defs, stream, force_tool);
     defer allocator.free(body);
 
-    const output = try runCommandCapture(allocator, &.{
-        "curl",               "-sS",                            "-X", "POST", endpoint,
-        "-H",                 "Content-Type: application/json", "-H", auth,   "-H",
-        "originator: zagent", "-d",                             body,
-    });
+    const headers = std.http.Client.Request.Headers{
+        .authorization = .{ .override = auth_value },
+        .content_type = .{ .override = "application/json" },
+    };
+    const output = try httpRequest(
+        allocator,
+        .POST,
+        endpoint,
+        headers,
+        &.{.{ .name = "originator", .value = "zagent" }},
+        body,
+    );
     defer allocator.free(output);
 
     // Parse both the function call and any thinking content
@@ -438,24 +439,21 @@ fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: [
     );
     defer allocator.free(body);
 
-    const key_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{api_key});
-    defer allocator.free(key_header);
-
-    const output = try runCommandCapture(allocator, &.{
-        "curl",
-        "-sS",
-        "-X",
-        "POST",
+    const headers = std.http.Client.Request.Headers{
+        .content_type = .{ .override = "application/json" },
+        .user_agent = .{ .override = "zagent/0.1" },
+    };
+    const output = try httpRequest(
+        allocator,
+        .POST,
         "https://api.anthropic.com/v1/messages",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        "anthropic-version: 2023-06-01",
-        "-H",
-        key_header,
-        "-d",
+        headers,
+        &.{
+            .{ .name = "anthropic-version", .value = "2023-06-01" },
+            .{ .name = "x-api-key", .value = api_key },
+        },
         body,
-    });
+    );
     defer allocator.free(output);
 
     return extractAnthropicText(allocator, output);
@@ -502,19 +500,20 @@ fn getProviderConfig(provider_id: []const u8) ProviderConfig {
 }
 
 fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, tool_defs: ?[]const ToolRouteDef, provider_id: []const u8) ![]u8 {
-    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    defer allocator.free(auth);
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    defer allocator.free(auth_value);
 
     const config = getProviderConfig(provider_id);
 
     const system_prompt =
         "STOP LISTING. USE GREP. " ++
         "1. bash {\"command\":\"rg -l 'keyword' src/\"} to find files. " ++
-        "2. read_file {\"path\":\"src/file.zig\"} to understand. " ++
+        "2. read_file {\"path\":\"src/file.zig\",\"offset\":0,\"limit\":400} to inspect in chunks. " ++
+        "2b. For large files, bisect with multiple read_file calls (vary offset) instead of full reads. " ++
         "3. edit to change. " ++
         "4. bash {\"command\":\"zig build\"} to verify. " ++
         "5. DONE. " ++
-        "Files are in src/. Never list more than once. One tool per response. " ++
+        "Files are in src/. Never list more than once. Prefer grep-first then targeted bounded reads. One tool per response. " ++
         "If unclear what user wants, ASK: 'QUESTION: What do you mean by X?' instead of guessing.";
 
     const Message = struct { role: []const u8, content: []const u8 };
@@ -586,39 +585,27 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     }
     defer allocator.free(body);
 
-    // Build curl arguments dynamically
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-
-    try argv.appendSlice(allocator, &.{ "curl", "-sS", "-X", "POST", config.endpoint, "-H", "Content-Type: application/json" });
-
-    // Track dynamically allocated headers so we can free them
-    var allocated_headers = std.ArrayList([]u8).empty;
-    defer {
-        for (allocated_headers.items) |h| allocator.free(h);
-        allocated_headers.deinit(allocator);
-    }
-
-    if (config.referer) |r| {
-        const header = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{r});
-        try allocated_headers.append(allocator, header);
-        try argv.appendSlice(allocator, &.{ "-H", header });
-    }
-    if (config.title) |t| {
-        const header = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{t});
-        try allocated_headers.append(allocator, header);
-        try argv.appendSlice(allocator, &.{ "-H", header });
-    }
+    var headers = std.http.Client.Request.Headers{
+        .authorization = .{ .override = auth_value },
+        .content_type = .{ .override = "application/json" },
+    };
     if (config.user_agent) |ua| {
-        const header = try std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua});
-        try allocated_headers.append(allocator, header);
-        try argv.appendSlice(allocator, &.{ "-H", header });
+        headers.user_agent = .{ .override = ua };
     }
-    try argv.appendSlice(allocator, &.{ "-H", auth });
-    try argv.append(allocator, "-d");
-    try argv.append(allocator, body);
 
-    const output = try runCommandCapture(allocator, argv.items);
+    var extra_headers = std.ArrayList(std.http.Header).empty;
+    defer extra_headers.deinit(allocator);
+    if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
+    if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
+
+    const output = try httpRequest(
+        allocator,
+        .POST,
+        config.endpoint,
+        headers,
+        extra_headers.items,
+        body,
+    );
     defer allocator.free(output);
 
     return extractOpenAIText(allocator, output);
@@ -626,14 +613,32 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
 
 // queryOpenRouter removed - now handled by queryOpenAICompatible
 
-fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 2 * 1024 * 1024,
+fn httpRequest(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    headers: std.http.Client.Request.Headers,
+    extra_headers: []const std.http.Header,
+    payload: ?[]const u8,
+) ![]u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var writer = out.writer(allocator);
+    var writer_adapter = writer.adaptToNewApi(&.{});
+
+    _ = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .headers = headers,
+        .extra_headers = extra_headers,
+        .payload = payload,
+        .response_writer = &writer_adapter.new_interface,
     });
-    defer allocator.free(result.stderr);
-    return result.stdout;
+
+    return out.toOwnedSlice(allocator);
 }
 
 // Extract tool calls from OpenAI-compatible response and format as text commands

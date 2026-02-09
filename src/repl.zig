@@ -619,15 +619,13 @@ fn buildPrompt(
         else
             model.model_id;
 
-        const effort_suffix = if (current_effort) |e| 
+        const effort_suffix = if (current_effort) |e|
             try std.fmt.allocPrint(allocator, ":{s}", .{e})
-        else 
+        else
             try allocator.dupe(u8, "");
         defer allocator.free(effort_suffix);
 
-        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}{s}]{s}> ", .{ 
-            C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, effort_suffix, C_RESET 
-        });
+        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}{s}]{s}> ", .{ C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, effort_suffix, C_RESET });
     } else {
         return std.fmt.allocPrint(allocator, "{s}{s}{s}> ", .{ C_BOLD, cwd, C_RESET });
     }
@@ -767,6 +765,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         stdout_file.deprecatedWriter()
     else
         stdout_file.writer();
+    const render_markdown = stdout_file.isTty();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
@@ -1109,7 +1108,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runWithBridge(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
+                var turn = runModel(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -1129,7 +1128,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
                 // Only print response if it's not a tool call instruction
                 if (!std.mem.startsWith(u8, turn.response, "TOOL_CALL ")) {
-                    try stdout.print("{s}{s}{s}\n", .{ C_BRIGHT_WHITE, turn.response, C_RESET });
+                    const rendered = try renderMarkdownForTerminal(allocator, turn.response, render_markdown);
+                    defer allocator.free(rendered);
+                    try stdout.print("{s}\n", .{rendered});
                 }
             },
         }
@@ -2182,7 +2183,7 @@ fn buildFallbackToolInferencePrompt(allocator: std.mem.Allocator, user_text: []c
 
     return std.fmt.allocPrint(
         allocator,
-        "Return exactly one line in this format and nothing else: TOOL_CALL <tool_name> <arguments_json>. Choose one tool from the list below. Arguments must be valid JSON object. {s}\n\nTools:\n{s}\nUser request:\n{s}",
+        "Return exactly one line in this format and nothing else: TOOL_CALL <tool_name> <arguments_json>. Choose one tool from the list below. Arguments must be valid JSON object. Prefer bash+rg first to locate targets, then read_file/read with offset+limit (bisection-style chunks) only on candidate files. {s}\n\nTools:\n{s}\nUser request:\n{s}",
         .{ if (require_mutation) "This request requires file mutation; prefer write_file, replace_in_file/edit, or apply_patch." else "", tools_list.items, user_text },
     );
 }
@@ -2227,10 +2228,14 @@ fn isMutatingToolName(name: []const u8) bool {
         std.mem.eql(u8, name, "apply_patch");
 }
 
+fn isReadToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read");
+}
+
 fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "Use local tools when they improve correctness. For repository-specific questions, inspect files first with list_files and read_file. For code changes, you may use read_file, write_file, or replace_in_file/edit directly. Only skip tools when the answer is purely general knowledge.\n\nUser request:\n{s}",
+        "Use local tools when they improve correctness. For repository-specific questions, start with bash+rg to find files and symbols, then inspect only candidate files with read_file/read using offset+limit. For long files, bisect with multiple bounded reads instead of broad scans. For code changes, use read_file, write_file, or replace_in_file/edit directly. Only skip tools when the answer is purely general knowledge.\n\nUser request:\n{s}",
         .{user_text},
     );
 }
@@ -2238,7 +2243,7 @@ fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) !
 fn buildStrictToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "This is a repository-specific question. You must call at least one local tool before giving the final answer. First call list_files, read_file, write_file, or replace_in_file/edit, then answer using concrete file evidence or action results.\n\nUser request:\n{s}",
+        "This is a repository-specific question. You must call at least one local tool before giving the final answer. First call bash with rg to locate relevant files/symbols, then read_file/read only targeted files with explicit offset+limit; use bisection-style chunking for large files. Then answer using concrete file evidence or action results.\n\nUser request:\n{s}",
         .{user_text},
     );
 }
@@ -2581,6 +2586,124 @@ fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []const
         .offset = value.offset,
         .limit = value.limit,
     };
+}
+
+fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, use_color: bool) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    var in_code_block = false;
+    var lines = std.mem.splitScalar(u8, input, '\n');
+    while (lines.next()) |line| {
+        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+        if (std.mem.startsWith(u8, trimmed_left, "```")) {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if (in_code_block) {
+            if (use_color) try out.writer(allocator).print("{s}{s}{s}\n", .{ C_GREY, line, C_RESET }) else {
+                try out.appendSlice(allocator, line);
+                try out.append(allocator, '\n');
+            }
+            continue;
+        }
+
+        // Render ATX headers as highlighted plain text.
+        var hashes: usize = 0;
+        while (hashes < trimmed_left.len and trimmed_left[hashes] == '#') : (hashes += 1) {}
+        if (hashes > 0 and hashes <= 6 and hashes < trimmed_left.len and trimmed_left[hashes] == ' ') {
+            const header_text = std.mem.trim(u8, trimmed_left[hashes + 1 ..], " \t");
+            if (use_color) try out.writer(allocator).print("{s}{s}{s}{s}\n", .{ C_BOLD, C_CYAN, header_text, C_RESET }) else {
+                try out.appendSlice(allocator, header_text);
+                try out.append(allocator, '\n');
+            }
+            continue;
+        }
+
+        var content = line;
+        if (std.mem.startsWith(u8, trimmed_left, ">")) {
+            if (use_color) try out.appendSlice(allocator, C_DIM);
+            try out.appendSlice(allocator, "| ");
+            content = std.mem.trimLeft(u8, trimmed_left[1..], " \t");
+        } else if ((std.mem.startsWith(u8, trimmed_left, "- ") or std.mem.startsWith(u8, trimmed_left, "* ") or std.mem.startsWith(u8, trimmed_left, "+ "))) {
+            try out.appendSlice(allocator, "• ");
+            content = trimmed_left[2..];
+        } else {
+            var i: usize = 0;
+            while (i < trimmed_left.len and std.ascii.isDigit(trimmed_left[i])) : (i += 1) {}
+            if (i > 0 and i + 1 < trimmed_left.len and trimmed_left[i] == '.' and trimmed_left[i + 1] == ' ') {
+                try out.appendSlice(allocator, trimmed_left[0 .. i + 2]);
+                content = trimmed_left[i + 2 ..];
+            }
+        }
+
+        try appendInlineMarkdown(allocator, &out, content, use_color);
+        if (use_color and std.mem.startsWith(u8, trimmed_left, ">")) {
+            try out.appendSlice(allocator, C_RESET);
+        }
+        try out.append(allocator, '\n');
+    }
+
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') out.items.len -= 1;
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendInlineMarkdown(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    use_color: bool,
+) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '`') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
+                const code = text[i + 1 .. end];
+                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_YELLOW, code, C_RESET }) else try out.appendSlice(allocator, code);
+                i = end + 1;
+                continue;
+            }
+        }
+
+        if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
+            if (std.mem.indexOfPos(u8, text, i + 2, "**")) |end| {
+                const bold_text = text[i + 2 .. end];
+                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_BOLD, bold_text, C_RESET }) else try out.appendSlice(allocator, bold_text);
+                i = end + 2;
+                continue;
+            }
+        }
+
+        if (text[i] == '*') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, '*')) |end| {
+                const em_text = text[i + 1 .. end];
+                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_ITALIC, em_text, C_RESET }) else try out.appendSlice(allocator, em_text);
+                i = end + 1;
+                continue;
+            }
+        }
+
+        if (text[i] == '[') {
+            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |close_bracket| {
+                if (close_bracket + 2 < text.len and text[close_bracket + 1] == '(') {
+                    if (std.mem.indexOfScalarPos(u8, text, close_bracket + 2, ')')) |close_paren| {
+                        const label = text[i + 1 .. close_bracket];
+                        const url = text[close_bracket + 2 .. close_paren];
+                        if (use_color) try out.writer(allocator).print("{s}{s}{s} ({s})", .{ C_UNDERLINE, label, C_RESET, url }) else {
+                            try out.appendSlice(allocator, label);
+                            try out.writer(allocator).print(" ({s})", .{url});
+                        }
+                        i = close_paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
 }
 
 fn containsPath(paths: []const []u8, candidate: []const u8) bool {
@@ -2950,7 +3073,7 @@ fn runModelTurnWithTools(
 }
 
 // Simplified bridge-based tool loop - uses Bun AI SDK
-fn runWithBridge(
+fn runModel(
     allocator: std.mem.Allocator,
     stdout: anytype,
     active: ActiveModel,
@@ -2972,10 +3095,6 @@ fn runWithBridge(
     }
     const api_key = active.api_key orelse "";
 
-    // Spawn the Bun AI bridge
-    var bridge = try ai_bridge.Bridge.spawn(allocator, api_key, active.model_id, active.provider_id);
-    defer bridge.deinit();
-
     try stdout.print("{s}Thinking...{s}\n", .{ C_DIM, C_RESET });
 
     // Build initial messages
@@ -2983,7 +3102,7 @@ fn runWithBridge(
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent, an AI coding assistant. Use tools to help. Use 'read_file' with 'offset' and 'limit' for large files to avoid huge payloads. Say DONE when finished.");
+    try writeJsonString(w, "You are zagent, an AI coding assistant. Use tools to help. Prefer bash with rg first to locate files/symbols. For read_file/read, always include explicit offset and limit; use bisection-style bounded chunks for large files instead of full-file reads. Say DONE when finished.");
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");
@@ -3016,8 +3135,15 @@ fn runWithBridge(
         const messages_json = try std.fmt.allocPrint(allocator, "{s}]", .{messages.items});
         defer allocator.free(messages_json);
 
-        // Call the bridge
-        const response = try bridge.chat(messages_json, max_iterations - iteration, active.reasoning_effort);
+        // Call the model directly (no bridge)
+        const response = try callModelDirect(
+            allocator,
+            api_key,
+            active.model_id,
+            active.provider_id,
+            messages_json,
+            active.reasoning_effort,
+        );
         defer {
             allocator.free(response.text);
             allocator.free(response.reasoning);
@@ -3074,7 +3200,7 @@ fn runWithBridge(
                 try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
-                
+
                 try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
                 try w.print("{f}", .{std.json.fmt(tc.id, .{})});
                 try w.writeAll(",\"content\":");
@@ -3084,8 +3210,10 @@ fn runWithBridge(
             };
             defer allocator.free(result);
 
-            // Indent and dim result
-            if (result.len > 0) {
+            // Avoid flooding terminal with file contents for read tools.
+            if (isReadToolName(tc.tool)) {
+                try stdout.print("  {s}[read output hidden]{s}\n", .{ C_GREY, C_RESET });
+            } else if (result.len > 0) {
                 var it = std.mem.splitScalar(u8, result, '\n');
                 while (it.next()) |line| {
                     if (line.len == 0) continue;
@@ -3254,6 +3382,17 @@ fn supportsSubscription(provider_id: []const u8) bool {
     return std.mem.eql(u8, provider_id, "openai");
 }
 
+fn callModelDirect(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model_id: []const u8,
+    provider_id: []const u8,
+    messages_json: []const u8,
+    reasoning_effort: ?[]const u8,
+) !ai_bridge.ChatResponse {
+    return ai_bridge.chatDirect(allocator, api_key, model_id, provider_id, messages_json, reasoning_effort);
+}
+
 fn chooseAuthMethod(input: []const u8, allow_subscription: bool) AuthMethod {
     if (!allow_subscription) return .api;
     if (std.mem.eql(u8, input, "subscription") or std.mem.eql(u8, input, "sub") or std.mem.eql(u8, input, "oauth")) {
@@ -3331,11 +3470,18 @@ fn openaiDeviceStart(allocator: std.mem.Allocator) !OpenAIDeviceStart {
     const body = try std.fmt.allocPrint(allocator, "{{\"client_id\":\"{s}\"}}", .{OPENAI_CLIENT_ID});
     defer allocator.free(body);
 
-    const out = try runCommandCapture(allocator, &.{
-        "curl",                                               "-sS", "-X",                             "POST",
-        OPENAI_ISSUER ++ "/api/accounts/deviceauth/usercode", "-H",  "Content-Type: application/json", "-H",
-        "User-Agent: zagent/0.1",                             "-d",  body,
-    });
+    const headers = std.http.Client.Request.Headers{
+        .content_type = .{ .override = "application/json" },
+        .user_agent = .{ .override = "zagent/0.1" },
+    };
+    const out = try httpRequest(
+        allocator,
+        .POST,
+        OPENAI_ISSUER ++ "/api/accounts/deviceauth/usercode",
+        headers,
+        &.{},
+        body,
+    );
     defer allocator.free(out);
 
     const StartResp = struct {
@@ -3370,11 +3516,18 @@ fn openaiPollAndExchange(
         );
         defer allocator.free(poll_body);
 
-        const poll = try runCommandCapture(allocator, &.{
-            "curl",                                            "-sS", "-X",                             "POST",
-            OPENAI_ISSUER ++ "/api/accounts/deviceauth/token", "-H",  "Content-Type: application/json", "-H",
-            "User-Agent: zagent/0.1",                          "-d",  poll_body,
-        });
+        const headers = std.http.Client.Request.Headers{
+            .content_type = .{ .override = "application/json" },
+            .user_agent = .{ .override = "zagent/0.1" },
+        };
+        const poll = try httpRequest(
+            allocator,
+            .POST,
+            OPENAI_ISSUER ++ "/api/accounts/deviceauth/token",
+            headers,
+            &.{},
+            poll_body,
+        );
         defer allocator.free(poll);
 
         const PollResp = struct {
@@ -3399,11 +3552,18 @@ fn openaiPollAndExchange(
         );
         defer allocator.free(form);
 
-        const token = try runCommandCapture(allocator, &.{
-            "curl",                          "-sS", "-X",                                              "POST",
-            OPENAI_ISSUER ++ "/oauth/token", "-H",  "Content-Type: application/x-www-form-urlencoded", "-d",
+        const token_headers = std.http.Client.Request.Headers{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .user_agent = .{ .override = "zagent/0.1" },
+        };
+        const token = try httpRequest(
+            allocator,
+            .POST,
+            OPENAI_ISSUER ++ "/oauth/token",
+            token_headers,
+            &.{},
             form,
-        });
+        );
         defer allocator.free(token);
 
         const TokenResp = struct {
@@ -3425,12 +3585,30 @@ fn openaiPollAndExchange(
     return null;
 }
 
-fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .max_output_bytes = 512 * 1024,
+fn httpRequest(
+    allocator: std.mem.Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    headers: std.http.Client.Request.Headers,
+    extra_headers: []const std.http.Header,
+    payload: ?[]const u8,
+) ![]u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var writer = out.writer(allocator);
+    var writer_adapter = writer.adaptToNewApi(&.{});
+
+    _ = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .headers = headers,
+        .extra_headers = extra_headers,
+        .payload = payload,
+        .response_writer = &writer_adapter.new_interface,
     });
-    defer allocator.free(result.stderr);
-    return result.stdout;
+
+    return out.toOwnedSlice(allocator);
 }
