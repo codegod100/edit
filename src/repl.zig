@@ -42,6 +42,7 @@ pub const CommandTag = enum {
     default_model,
     connect_provider,
     set_model,
+    set_effort,
     stats,
 };
 
@@ -99,6 +100,11 @@ pub fn parseCommand(line: []const u8) Command {
         var rest = trimmed[6..];
         rest = std.mem.trim(u8, rest, " \t");
         return .{ .tag = .set_model, .arg = rest };
+    }
+    if (std.mem.startsWith(u8, trimmed, "/effort")) {
+        var rest = trimmed[7..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .set_effort, .arg = rest };
     }
 
     return .{ .tag = .none, .arg = "" };
@@ -554,6 +560,7 @@ const ActiveModel = struct {
     provider_id: []const u8,
     model_id: []const u8,
     api_key: ?[]const u8,
+    reasoning_effort: ?[]const u8 = null,
 };
 
 const ModelOption = struct {
@@ -598,7 +605,12 @@ fn parseModelSelection(input: []const u8) ?ModelSelection {
     };
 }
 
-fn buildPrompt(allocator: std.mem.Allocator, cwd: []const u8, selected_model: ?OwnedModelSelection) ![]u8 {
+fn buildPrompt(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    selected_model: ?OwnedModelSelection,
+    current_effort: ?[]const u8,
+) ![]u8 {
     if (selected_model) |model| {
         // Shorten model name if it's long
         const max_model_len = 20;
@@ -606,7 +618,16 @@ fn buildPrompt(allocator: std.mem.Allocator, cwd: []const u8, selected_model: ?O
             model.model_id[0..max_model_len]
         else
             model.model_id;
-        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}]{s}> ", .{ C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, C_RESET });
+
+        const effort_suffix = if (current_effort) |e| 
+            try std.fmt.allocPrint(allocator, ":{s}", .{e})
+        else 
+            try allocator.dupe(u8, "");
+        defer allocator.free(effort_suffix);
+
+        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}{s}]{s}> ", .{ 
+            C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, effort_suffix, C_RESET 
+        });
     } else {
         return std.fmt.allocPrint(allocator, "{s}{s}{s}> ", .{ C_BOLD, cwd, C_RESET });
     }
@@ -801,12 +822,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
+    var current_effort: ?[]const u8 = null;
+    defer if (current_effort) |e| allocator.free(e);
+
     const persisted_model = try config_store.loadSelectedModel(allocator, config_dir);
     if (persisted_model) |persisted| {
+        var p = persisted;
+        defer p.deinit(allocator);
         selected_model = .{
-            .provider_id = persisted.provider_id,
-            .model_id = persisted.model_id,
+            .provider_id = try allocator.dupe(u8, p.provider_id),
+            .model_id = try allocator.dupe(u8, p.model_id),
         };
+        if (p.reasoning_effort) |e| {
+            current_effort = try allocator.dupe(u8, e);
+        }
     }
 
     try stdout.print(
@@ -818,7 +847,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         resetCancelled();
 
         // Build prompt dynamically with current model info
-        const prompt_text = try buildPrompt(allocator, cwd, selected_model);
+        const prompt_text = try buildPrompt(allocator, cwd, selected_model, current_effort);
         defer allocator.free(prompt_text);
 
         const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
@@ -996,6 +1025,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     try config_store.saveSelectedModel(allocator, config_dir, .{
                         .provider_id = picked.?.provider_id,
                         .model_id = picked.?.model_id,
+                        .reasoning_effort = current_effort,
                     });
                     try stdout.print("Active model set to {s}/{s}\n", .{ picked.?.provider_id, picked.?.model_id });
                     continue;
@@ -1019,8 +1049,35 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try config_store.saveSelectedModel(allocator, config_dir, .{
                     .provider_id = p.provider_id,
                     .model_id = p.model_id,
+                    .reasoning_effort = current_effort,
                 });
                 try stdout.print("Active model set to {s}/{s}\n", .{ p.provider_id, p.model_id });
+            },
+            .set_effort => {
+                if (command.arg.len == 0) {
+                    try stdout.print("Current reasoning effort: {s}\n", .{current_effort orelse "default"});
+                    try stdout.print("Usage: /effort <low|medium|high|default>\n", .{});
+                    continue;
+                }
+
+                if (current_effort) |e| allocator.free(e);
+                if (std.mem.eql(u8, command.arg, "default") or std.mem.eql(u8, command.arg, "none")) {
+                    current_effort = null;
+                } else if (std.mem.eql(u8, command.arg, "low") or std.mem.eql(u8, command.arg, "medium") or std.mem.eql(u8, command.arg, "high")) {
+                    current_effort = try allocator.dupe(u8, command.arg);
+                } else {
+                    try stdout.print("Invalid effort level: {s}. Use low, medium, high, or default.\n", .{command.arg});
+                    current_effort = null;
+                }
+
+                if (selected_model) |sm| {
+                    try config_store.saveSelectedModel(allocator, config_dir, .{
+                        .provider_id = sm.provider_id,
+                        .model_id = sm.model_id,
+                        .reasoning_effort = current_effort,
+                    });
+                }
+                try stdout.print("Reasoning effort set to {s}\n", .{current_effort orelse "default"});
             },
             .stats => {
                 var total_chars: usize = 0;
@@ -1042,7 +1099,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
 
-                const active = chooseActiveModel(providers, provider_states, selected_model);
+                const active = chooseActiveModel(providers, provider_states, selected_model, current_effort);
 
                 if (active == null) {
                     try stdout.print("No connected providers. Run /providers then /connect <provider-id>.\n", .{});
@@ -1702,6 +1759,7 @@ fn commandNames() []const []const u8 {
         "/default-model",
         "/connect",
         "/model",
+        "/effort",
         "/stats",
     };
 }
@@ -1916,17 +1974,28 @@ fn chooseActiveModel(
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
     selected: ?OwnedModelSelection,
+    reasoning_effort: ?[]const u8,
 ) ?ActiveModel {
     if (selected) |sel| {
         const provider = findConnectedProvider(connected, sel.provider_id);
         if (!providerHasModel(providers, sel.provider_id, sel.model_id)) return null;
-        return .{ .provider_id = sel.provider_id, .model_id = sel.model_id, .api_key = if (provider) |p| p.key else null };
+        return .{
+            .provider_id = sel.provider_id,
+            .model_id = sel.model_id,
+            .api_key = if (provider) |p| p.key else null,
+            .reasoning_effort = reasoning_effort,
+        };
     }
 
     if (connected.len == 0) return null;
     const provider = connected[0];
     const default_model = chooseDefaultModelForConnected(provider) orelse return null;
-    return .{ .provider_id = provider.id, .model_id = default_model, .api_key = provider.key };
+    return .{
+        .provider_id = provider.id,
+        .model_id = default_model,
+        .api_key = provider.key,
+        .reasoning_effort = reasoning_effort,
+    };
 }
 
 fn chooseDefaultModelForConnected(provider: pm.ProviderState) ?[]const u8 {
@@ -2948,7 +3017,7 @@ fn runWithBridge(
         defer allocator.free(messages_json);
 
         // Call the bridge
-        const response = try bridge.chat(messages_json, max_iterations - iteration);
+        const response = try bridge.chat(messages_json, max_iterations - iteration, active.reasoning_effort);
         defer {
             allocator.free(response.text);
             allocator.free(response.reasoning);

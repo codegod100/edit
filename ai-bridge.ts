@@ -40,7 +40,7 @@ async function handleChat(request: any) {
   console.error(`Chat request with ${messages.length} messages. Provider: ${providerId}, Model: ${modelId}`);
   
   try {
-    const completion = await openai.chat.completions.create({
+    const chatParams: any = {
       model: modelId,
       messages: messages,
       tools: [
@@ -117,7 +117,13 @@ async function handleChat(request: any) {
           }
         }
       ],
-    });
+    };
+
+    if (request.reasoning_effort) {
+      chatParams.reasoning_effort = request.reasoning_effort;
+    }
+
+    const completion = await openai.chat.completions.create(chatParams);
 
     const choice = completion.choices[0];
     const message = choice.message;

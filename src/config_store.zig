@@ -3,16 +3,19 @@ const std = @import("std");
 pub const SelectedModel = struct {
     provider_id: []u8,
     model_id: []u8,
+    reasoning_effort: ?[]u8 = null,
 
     pub fn deinit(self: *SelectedModel, allocator: std.mem.Allocator) void {
         allocator.free(self.provider_id);
         allocator.free(self.model_id);
+        if (self.reasoning_effort) |e| allocator.free(e);
     }
 };
 
 pub const ModelRef = struct {
     provider_id: []const u8,
     model_id: []const u8,
+    reasoning_effort: ?[]const u8 = null,
 };
 
 pub fn loadSelectedModel(allocator: std.mem.Allocator, base_path: []const u8) !?SelectedModel {
@@ -31,6 +34,7 @@ pub fn loadSelectedModel(allocator: std.mem.Allocator, base_path: []const u8) !?
     const SelectedModelJson = struct {
         provider_id: []const u8,
         model_id: []const u8,
+        reasoning_effort: ?[]const u8 = null,
     };
     const Json = struct {
         selected_model: ?SelectedModelJson = null,
@@ -43,6 +47,7 @@ pub fn loadSelectedModel(allocator: std.mem.Allocator, base_path: []const u8) !?
     return .{
         .provider_id = try allocator.dupe(u8, sm.provider_id),
         .model_id = try allocator.dupe(u8, sm.model_id),
+        .reasoning_effort = if (sm.reasoning_effort) |e| try allocator.dupe(u8, e) else null,
     };
 }
 
@@ -62,13 +67,18 @@ pub fn saveSelectedModel(allocator: std.mem.Allocator, base_path: []const u8, mo
     const SelectedModelJson = struct {
         provider_id: []const u8,
         model_id: []const u8,
+        reasoning_effort: ?[]const u8 = null,
     };
     const Payload = struct {
         selected_model: ?SelectedModelJson,
     };
 
     const payload: Payload = if (model) |m|
-        .{ .selected_model = .{ .provider_id = m.provider_id, .model_id = m.model_id } }
+        .{ .selected_model = .{ 
+            .provider_id = m.provider_id, 
+            .model_id = m.model_id,
+            .reasoning_effort = m.reasoning_effort,
+        } }
     else
         .{ .selected_model = null };
 

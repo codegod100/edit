@@ -94,7 +94,7 @@ pub const Bridge = struct {
         }
     }
 
-    pub fn chat(self: *Bridge, messages: []const u8, max_steps: usize) !ChatResponse {
+    pub fn chat(self: *Bridge, messages: []const u8, max_steps: usize, reasoning_effort: ?[]const u8) !ChatResponse {
         const stdin_file = self.child.stdin.?;
         const stdout_file = self.child.stdout.?;
 
@@ -114,7 +114,12 @@ pub const Bridge = struct {
         const w = request_buf.writer(self.allocator);
         try w.writeAll("{\"type\":\"chat\",\"messages\":");
         try w.writeAll(messages);
-        try w.print(",\"maxSteps\":{d}}}", .{max_steps});
+        try w.print(",\"maxSteps\":{d}", .{max_steps});
+        if (reasoning_effort) |effort| {
+            try w.writeAll(",\"reasoning_effort\":");
+            try w.print("{f}", .{std.json.fmt(effort, .{})});
+        }
+        try w.writeAll("}");
         try w.writeByte('\n');
 
         const request = request_buf.items;
