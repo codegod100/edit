@@ -2349,14 +2349,38 @@ fn executeInlineToolCalls(
             }
         }
 
-        // Extract file path from args for display
+        // Extract file path, bash command, or read params from args for display
         const file_path = parsePrimaryPathFromArgs(allocator, args);
         defer if (file_path) |fp| allocator.free(fp);
+        const bash_cmd = if (std.mem.eql(u8, tool_name, "bash"))
+            parseBashCommandFromArgs(allocator, args)
+        else
+            null;
+        defer if (bash_cmd) |bc| allocator.free(bc);
+        const read_params = if (std.mem.eql(u8, tool_name, "read") or std.mem.eql(u8, tool_name, "read_file"))
+            try parseReadParamsFromArgs(allocator, args)
+        else
+            null;
 
         // Execute tool
         try printColoredToolEvent(stdout, "tool-inline", null, null, tool_name);
         if (file_path) |fp| {
             try stdout.print(" {s}file={s}{s}", .{ C_CYAN, fp, C_RESET });
+        }
+        if (bash_cmd) |bc| {
+            // Truncate long commands
+            const max_cmd_len = 60;
+            const display_cmd = if (bc.len > max_cmd_len) bc[0..max_cmd_len] else bc;
+            const suffix = if (bc.len > max_cmd_len) "..." else "";
+            try stdout.print(" {s}cmd=\"{s}{s}\"{s}", .{ C_CYAN, display_cmd, suffix, C_RESET });
+        }
+        if (read_params) |rp| {
+            if (rp.offset) |off| {
+                try stdout.print(" {s}offset={d}{s}", .{ C_DIM, off, C_RESET });
+            }
+            if (rp.limit) |lim| {
+                try stdout.print(" {s}limit={d}{s}", .{ C_DIM, lim, C_RESET });
+            }
         }
         try stdout.print("\n", .{});
 
@@ -2385,6 +2409,33 @@ fn parsePrimaryPathFromArgs(allocator: std.mem.Allocator, arguments_json: []cons
     defer parsed.deinit();
     const p = parsed.value.path orelse parsed.value.filePath orelse return null;
     return allocator.dupe(u8, p) catch null;
+}
+
+fn parseBashCommandFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) ?[]u8 {
+    const A = struct { command: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const cmd = parsed.value.command orelse return null;
+    return allocator.dupe(u8, cmd) catch null;
+}
+
+const ReadParams = struct {
+    offset: ?usize = null,
+    limit: ?usize = null,
+};
+
+fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !?ReadParams {
+    const A = struct { offset: ?usize = null, limit: ?usize = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    const value = parsed.value;
+    if (value.offset == null and value.limit == null) return null;
+
+    return ReadParams{
+        .offset = value.offset,
+        .limit = value.limit,
+    };
 }
 
 fn containsPath(paths: []const []u8, candidate: []const u8) bool {
