@@ -1037,7 +1037,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runModelTurnWithTools(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
+                var turn = runModelTurnWithTools(allocator, stdout, active.?, model_input, &todo_list) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -2502,18 +2502,12 @@ fn runModelTurnWithTools(
     allocator: std.mem.Allocator,
     stdout: anytype,
     active: ActiveModel,
-    raw_user_request: []const u8,
     user_input: []const u8,
     todo_list: *todo.TodoList,
 ) !RunTurnResult {
     var context_prompt = try allocator.dupe(u8, user_input);
     // We'll manually free context_prompt before each reassignment and at function exit
-    var forced_repo_probe_done = false;
-    var forced_mutation_probe_done = false;
-    var forced_completion_probe_done = false;
-    const repo_specific = isLikelyRepoSpecificQuestion(raw_user_request);
-    const mutation_request = isLikelyFileMutationRequest(raw_user_request);
-    const multi_step_mutation = isLikelyMultiStepMutationRequest(raw_user_request);
+
     var tool_calls: usize = 0;
     var paths = std.ArrayList([]u8).empty;
     defer {
@@ -2521,12 +2515,8 @@ fn runModelTurnWithTools(
         paths.deinit(allocator);
     }
 
-    var step: usize = 0;
-    const soft_limit: usize = 6; // After this, check todos and ask model if we should continue
-    var just_received_tool_call: bool = false; // Track if we got TOOL_CALL at soft limit
-
-    while (true) : (step += 1) {
-        // Check for cancellation at start of each iteration
+    while (true) {
+        // Check for cancellation
         if (isCancelled()) {
             allocator.free(context_prompt);
             return .{
@@ -2537,293 +2527,128 @@ fn runModelTurnWithTools(
             };
         }
 
-        // On step 6+, check todos and ask model if we should continue
-        // Skip this check if we just received a TOOL_CALL (model wants to continue)
-        if (step >= soft_limit and !just_received_tool_call) {
-            const todo_summary = todo_list.summary();
-            try stdout.print("{s}[step {d}] Checking if more work needed... (todos: {s}){s}\n", .{ C_DIM, step, todo_summary, C_RESET });
-
-            const continue_prompt = try std.fmt.allocPrint(
-                allocator,
-                "{s}\n\n[SYSTEM] You have completed {d} tool steps. Todo status: {s}.\n\nDo you need more steps to complete the task? If yes, make another tool call. If no, provide the final answer.",
-                .{ context_prompt, step, todo_summary },
-            );
-            defer allocator.free(continue_prompt);
-
-            // Query model to see if it wants to continue
-            const check_response = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, continue_prompt, toolDefsToLlm(tools.definitions[0..]));
-
-            // If model returns TOOL_CALL, continue the loop
-            if (std.mem.startsWith(u8, check_response, "TOOL_CALL ")) {
-                try stdout.print("{s}[step {d}] Model requests more steps{s}\n", .{ C_CYAN, step, C_RESET });
-                allocator.free(context_prompt);
-                context_prompt = try allocator.dupe(u8, check_response);
-                allocator.free(check_response);
-                just_received_tool_call = true; // Mark that we got a TOOL_CALL
-                continue;
-            }
-
-            // Model gave final answer, return it
-            try stdout.print("{s}[step {d}] Model provides final answer{s}\n", .{ C_GREEN, step, C_RESET });
+        // Check if all todos are complete
+        if (!todo_list.hasPendingOrInProgress() and tool_calls > 0) {
+            // All work done, get final summary
             allocator.free(context_prompt);
             return .{
-                .response = check_response,
+                .response = try allocator.dupe(u8, "All tasks completed. Check the todos with /todos command."),
                 .tool_calls = tool_calls,
                 .error_count = 0,
                 .files_touched = try joinPaths(allocator, paths.items),
             };
         }
 
-        try stdout.print("{s}[step {d}]{s} ", .{ C_DIM, step, C_RESET });
-
-        const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
-        defer allocator.free(route_prompt);
-
+        // Ask model what to do next - simple one-step-at-a-time
         try stdout.print("{s}thinking...{s} ", .{ C_DIM, C_RESET });
-        var routed = try inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
-        if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
-            forced_repo_probe_done = true;
-            try stdout.print("{s}re-analyzing...{s} ", .{ C_DIM, C_RESET });
-            const strict_prompt = try buildStrictToolRoutingPrompt(allocator, context_prompt);
-            defer allocator.free(strict_prompt);
-            routed = try inferToolCallWithModel(allocator, stdout, active, strict_prompt, true);
+
+        const action = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
+        defer allocator.free(action);
+
+        // Check if model says we're done
+        if (std.mem.indexOf(u8, action, "DONE") != null) {
+            allocator.free(context_prompt);
+            return .{
+                .response = try allocator.dupe(u8, "Task completed."),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
         }
 
-        if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
-            forced_mutation_probe_done = true;
-            try stdout.print("{s}checking edit requirements...{s} ", .{ C_DIM, C_RESET });
-            const strict_mutation_prompt = try buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
-            defer allocator.free(strict_mutation_prompt);
-            routed = try inferToolCallWithModel(allocator, stdout, active, strict_mutation_prompt, true);
-        }
+        // Try to parse and execute a single tool
+        var tool_executed = false;
+        var lines = std.mem.splitScalar(u8, action, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) {
+                if (try executeSingleToolCall(allocator, stdout, trimmed, todo_list, &paths)) |tool_out| {
+                    defer allocator.free(tool_out);
+                    tool_calls += 1;
+                    try stdout.print("{s}\n", .{tool_out});
 
-        if (routed == null and step == 0 and mutation_request) {
-            try stdout.print("{s}fallback parsing...{s} ", .{ C_DIM, C_RESET });
-            routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
-        }
+                    // If we edited a file, auto-mark related todos as done
+                    const path = getPathFromToolCall(trimmed);
+                    todo_list.markTodosForPath(path);
 
-        if (routed == null and mutation_request and !forced_completion_probe_done and step < soft_limit) {
-            var touched = std.ArrayList([]const u8).empty;
-            defer touched.deinit(allocator);
-            for (paths.items) |p| try touched.append(allocator, p);
-
-            const missing_required = hasUnmetRequiredEdits(raw_user_request, touched.items);
-            if ((multi_step_mutation and tool_calls < 2) or missing_required) {
-                forced_completion_probe_done = true;
-                const completion_prompt = try std.fmt.allocPrint(
-                    allocator,
-                    "The user requested multiple edits. Completed tool calls so far: {d}. Touched paths: {s}. You must continue with a real tool call to complete remaining requested edits, especially any missing required files like .gitignore when requested.\n\nCurrent request:\n{s}",
-                    .{ tool_calls, if (try joinPaths(allocator, paths.items)) |jp| blk: {
-                        defer allocator.free(jp);
-                        break :blk jp;
-                    } else "(none)", raw_user_request },
-                );
-                defer allocator.free(completion_prompt);
-                routed = try inferToolCallWithModel(allocator, stdout, active, completion_prompt, true);
-                if (routed == null) {
-                    routed = try inferToolCallWithTextFallback(allocator, active, completion_prompt, true);
-                }
-            }
-        }
-
-        if (routed == null) {
-            try stdout.print("{s}no tool selected{s}\n", .{ C_YELLOW, C_RESET });
-
-            if (mutation_request and tool_calls == 0) {
-                allocator.free(context_prompt);
-                return .{
-                    .response = try allocator.dupe(
-                        u8,
-                        "Your request looks like a file edit, but I couldn't determine what to write. Please be more specific—include a filename and the content or change you want.",
-                    ),
-                    .tool_calls = 0,
-                    .error_count = 1,
-                    .files_touched = null,
-                };
-            }
-
-            if (mutation_request) {
-                var touched = std.ArrayList([]const u8).empty;
-                defer touched.deinit(allocator);
-                for (paths.items) |p| try touched.append(allocator, p);
-                if (hasUnmetRequiredEdits(raw_user_request, touched.items) or (multi_step_mutation and tool_calls < 2)) {
-                    allocator.free(context_prompt);
-                    return .{
-                        .response = try allocator.dupe(
-                            u8,
-                            "I completed only part of the requested edits. Please specify which remaining file(s) to modify and what changes to make.",
-                        ),
-                        .tool_calls = tool_calls,
-                        .error_count = 1,
-                        .files_touched = try joinPaths(allocator, paths.items),
-                    };
-                }
-            }
-
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
-
-            // Check if response contains inline tool calls (TOOL_CALL format)
-            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                // Execute inline tool calls from model response
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
-                allocator.free(final);
-
-                if (tool_result) |result| {
-                    // Append tool result to context and continue loop
+                    // Build next context
                     const next_prompt = try std.fmt.allocPrint(
                         allocator,
-                        "{s}\n\nTool execution result:\n{s}\n\nContinue with next action if needed.",
-                        .{ context_prompt, result },
+                        "{s}\n\nExecuted: {s}\nResult: {s}\n\nWhat's next?",
+                        .{ context_prompt, trimmed, tool_out },
                     );
-                    allocator.free(result);
-                    context_prompt = next_prompt;
-                    continue;
-                }
-            } else if (step < soft_limit) {
-                // Model returned text but we haven't hit max steps yet
-                // Add response to context and continue the loop
-                try stdout.print("{s}...continuing{s}\n", .{ C_DIM, C_RESET });
-                const next_prompt = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
-                    .{ context_prompt, final },
-                );
-                allocator.free(final);
-                context_prompt = next_prompt;
-                continue;
-            }
-
-            allocator.free(context_prompt);
-            return .{
-                .response = final,
-                .tool_calls = tool_calls,
-                .error_count = 0,
-                .files_touched = try joinPaths(allocator, paths.items),
-            };
-        }
-        defer {
-            var r = routed.?;
-            r.deinit(allocator);
-        }
-
-        if (!isKnownToolName(routed.?.tool)) {
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
-
-            // Check for inline tool calls
-            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
-                allocator.free(final);
-                if (tool_result) |result| {
-                    allocator.free(result);
                     allocator.free(context_prompt);
-                    return .{
-                        .response = try allocator.dupe(u8, "Executed tool from model response."),
-                        .tool_calls = tool_calls,
-                        .error_count = 0,
-                        .files_touched = try joinPaths(allocator, paths.items),
-                    };
+                    context_prompt = next_prompt;
+                    tool_executed = true;
+                    break; // Only execute first tool
                 }
-            } else if (step < soft_limit) {
-                // Model returned text but we haven't hit max steps yet
-                // Add response to context and continue the loop
-                try stdout.print("{s}...continuing{s}\n", .{ C_DIM, C_RESET });
-                const next_prompt = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
-                    .{ context_prompt, final },
-                );
-                allocator.free(final);
-                context_prompt = next_prompt;
-                continue;
-            }
-
-            allocator.free(context_prompt);
-            return .{
-                .response = final,
-                .tool_calls = tool_calls,
-                .error_count = 0,
-                .files_touched = try joinPaths(allocator, paths.items),
-            };
-        }
-
-        // Check for cancellation before executing tool
-        if (isCancelled()) {
-            allocator.free(context_prompt);
-            return .{
-                .response = try allocator.dupe(u8, "Operation cancelled by user during tool execution."),
-                .tool_calls = tool_calls,
-                .error_count = 0,
-                .files_touched = try joinPaths(allocator, paths.items),
-            };
-        }
-
-        try stdout.print("{s}→ {s}{s}\n", .{ C_GREEN, routed.?.tool, C_RESET });
-        tool_calls += 1;
-        if (parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
-            if (!containsPath(paths.items, p)) {
-                try paths.append(allocator, p);
-            } else {
-                allocator.free(p);
             }
         }
 
-        const call_id = try buildToolCallId(allocator, step + 1);
-        defer allocator.free(call_id);
-
-        try printColoredToolEvent(stdout, "tool-input-start", step + 1, call_id, routed.?.tool);
-        try printColoredToolEvent(stdout, "tool-call", step + 1, call_id, routed.?.tool);
-
-        const started_ms = std.time.milliTimestamp();
-
-        // Extract file path for file-related tools
-        const file_path = parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
-
-        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
-            const failed_ms = std.time.milliTimestamp();
-            const duration_ms = failed_ms - started_ms;
-            const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);
-            defer allocator.free(err_line);
-            if (file_path) |fp| allocator.free(fp);
-            try stdout.print("{s}\n", .{err_line});
+        if (!tool_executed) {
+            try stdout.print("{s}no action{s}\n", .{ C_YELLOW, C_RESET });
+            // Add model response to context and continue
+            const next_prompt = try std.fmt.allocPrint(
+                allocator,
+                "{s}\n\nModel said: {s}\n\nWhat should I do?",
+                .{ context_prompt, action },
+            );
             allocator.free(context_prompt);
-            return .{
-                .response = try std.fmt.allocPrint(
-                    allocator,
-                    "Tool execution failed at step {d} ({s}): {s}",
-                    .{ step + 1, routed.?.tool, @errorName(err) },
-                ),
-                .tool_calls = tool_calls,
-                .error_count = 1,
-                .files_touched = try joinPaths(allocator, paths.items),
-            };
-        };
-        defer allocator.free(tool_out);
-
-        const finished_ms = std.time.milliTimestamp();
-        const duration_ms = finished_ms - started_ms;
-        const ok_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms, file_path);
-        defer allocator.free(ok_line);
-        if (file_path) |fp| allocator.free(fp);
-        try stdout.print("{s}\n", .{ok_line});
-
-        if (isMutatingToolName(routed.?.tool)) {
-            // For mutating tools, show the full output including the colored diff
-            try printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
-            try stdout.print("{s}\n", .{tool_out});
+            context_prompt = next_prompt;
         }
-
-        const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
-        const next_prompt = try std.fmt.allocPrint(
-            allocator,
-            "{s}\n\nTool events:\n- event=tool-input-start step={d} call_id={s} tool={s}\n- event=tool-call step={d} call_id={s} tool={s}\n- {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",
-            .{ context_prompt, step + 1, call_id, routed.?.tool, step + 1, call_id, routed.?.tool, ok_line, routed.?.arguments_json, capped },
-        );
-        allocator.free(context_prompt);
-        context_prompt = next_prompt;
-
-        // Reset the flag after we've processed any TOOL_CALL from soft limit
-        just_received_tool_call = false;
     }
+}
+
+fn executeSingleToolCall(allocator: std.mem.Allocator, stdout: anytype, line: []const u8, todo_list: *todo.TodoList, paths: *std.ArrayList([]u8)) !?[]u8 {
+    // Parse: TOOL_CALL name args
+    if (!std.mem.startsWith(u8, line, "TOOL_CALL ")) return null;
+    const after_prefix = line[10..];
+    const space_idx = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse return null;
+    const tool_name = after_prefix[0..space_idx];
+    const args = std.mem.trim(u8, after_prefix[space_idx..], " \t");
+
+    if (!isKnownToolName(tool_name)) return null;
+
+    try stdout.print("{s}→ {s}{s}", .{ C_GREEN, tool_name, C_RESET });
+
+    // Track path
+    if (parsePrimaryPathFromArgs(allocator, args)) |p| {
+        if (!containsPath(paths.items, p)) {
+            try paths.append(allocator, p);
+        } else {
+            allocator.free(p);
+        }
+    }
+
+    // Execute single tool
+    const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list) catch |err| {
+        return try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+    };
+
+    return tool_out;
+}
+
+fn getPathFromToolCall(line: []const u8) ?[]const u8 {
+    // Extract path/filePath from TOOL_CALL line
+    if (!std.mem.startsWith(u8, line, "TOOL_CALL ")) return null;
+    const after_prefix = line[10..];
+    const space_idx = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse return null;
+    const args = after_prefix[space_idx..];
+
+    // Look for path or filePath in the JSON args
+    if (std.mem.indexOf(u8, args, "\"path\":\"")) |idx| {
+        const start = idx + 8;
+        if (std.mem.indexOfScalar(u8, args[start..], '"')) |end| {
+            return args[start .. start + end];
+        }
+    }
+    if (std.mem.indexOf(u8, args, "\"filePath\":\"")) |idx| {
+        const start = idx + 12;
+        if (std.mem.indexOfScalar(u8, args[start..], '"')) |end| {
+            return args[start .. start + end];
+        }
+    }
+    return null;
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

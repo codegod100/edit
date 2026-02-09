@@ -144,6 +144,26 @@ pub const TodoList = struct {
         }
     }
 
+    pub fn hasPendingOrInProgress(self: *const TodoList) bool {
+        for (self.items.items) |item| {
+            if (item.status != .done) return true;
+        }
+        return false;
+    }
+
+    pub fn markTodosForPath(self: *TodoList, path: ?[]const u8) void {
+        const p = path orelse return;
+        for (self.items.items) |*item| {
+            // Check if todo description contains the path
+            if (std.mem.indexOf(u8, item.description, p) != null) {
+                if (item.status != .done) {
+                    item.status = .done;
+                    item.completed_at = std.time.milliTimestamp();
+                }
+            }
+        }
+    }
+
     // Persistence - save todos to JSON file
     pub fn saveToFile(self: *const TodoList, allocator: std.mem.Allocator, file_path: []const u8) !void {
         var json = std.ArrayList(u8).empty;
