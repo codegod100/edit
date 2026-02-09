@@ -2559,36 +2559,54 @@ fn runModelTurnWithTools(
             };
         }
 
-        // Try to parse and execute a single tool
-        var tool_executed = false;
+        // Execute tools - allow multiple todo operations, one file operation
+        var results = std.ArrayList(u8).empty;
+        defer results.deinit(allocator);
+        const w = results.writer(allocator);
+
+        var file_op_executed = false;
         var lines = std.mem.splitScalar(u8, action, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
-            if (std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) {
+            if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
+
+            // Parse tool name
+            const after_prefix = trimmed[10..];
+            const space_idx = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse continue;
+            const tool_name = after_prefix[0..space_idx];
+
+            // Check if this is a todo tool
+            const is_todo_tool = std.mem.startsWith(u8, tool_name, "todo_");
+            const is_file_op = !is_todo_tool and isKnownToolName(tool_name);
+
+            // Execute todo tools freely, but only one file operation
+            if (is_todo_tool or (is_file_op and !file_op_executed)) {
                 if (try executeSingleToolCall(allocator, stdout, trimmed, todo_list, &paths)) |tool_out| {
-                    defer allocator.free(tool_out);
                     tool_calls += 1;
-                    try stdout.print("{s}\n", .{tool_out});
+                    try w.print("{s}: {s}\n", .{ tool_name, tool_out });
+                    allocator.free(tool_out);
 
-                    // If we edited a file, auto-mark related todos as done
-                    const path = getPathFromToolCall(trimmed);
-                    todo_list.markTodosForPath(path);
-
-                    // Build next context
-                    const next_prompt = try std.fmt.allocPrint(
-                        allocator,
-                        "{s}\n\nExecuted: {s}\nResult: {s}\n\nWhat's next?",
-                        .{ context_prompt, trimmed, tool_out },
-                    );
-                    allocator.free(context_prompt);
-                    context_prompt = next_prompt;
-                    tool_executed = true;
-                    break; // Only execute first tool
+                    // Track file operation executed
+                    if (is_file_op) {
+                        file_op_executed = true;
+                        // If we edited a file, auto-mark related todos as done
+                        const path = getPathFromToolCall(trimmed);
+                        todo_list.markTodosForPath(path);
+                    }
                 }
             }
         }
 
-        if (!tool_executed) {
+        if (tool_calls > 0 and results.items.len > 0) {
+            // Build context with all tool results
+            const next_prompt = try std.fmt.allocPrint(
+                allocator,
+                "{s}\n\nExecuted tools:\n{s}\n\nWhat's next?",
+                .{ context_prompt, results.items },
+            );
+            allocator.free(context_prompt);
+            context_prompt = next_prompt;
+        } else {
             try stdout.print("{s}no action{s}\n", .{ C_YELLOW, C_RESET });
             // Add model response to context and continue
             const next_prompt = try std.fmt.allocPrint(

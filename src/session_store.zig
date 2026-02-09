@@ -261,7 +261,7 @@ fn saveSession(allocator: std.mem.Allocator, session: *const Session) !void {
 }
 
 fn addToManifest(allocator: std.mem.Allocator, session: *const Session) !void {
-    var sessions = try listSessions(allocator);
+    const sessions = try listSessions(allocator);
     defer {
         for (sessions) |*s| {
             allocator.free(s.id);
@@ -398,7 +398,7 @@ fn removeFromManifest(allocator: std.mem.Allocator, id: []const u8) !void {
 
 test "session store" {
     const allocator = std.testing.allocator;
-    const tmp_dir = std.testing.tmpDir(.{});
+    var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     const orig_cwd = try std.process.getCwdAlloc(allocator);

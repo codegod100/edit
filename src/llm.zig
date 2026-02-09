@@ -352,37 +352,44 @@ fn buildOpenAIRequestBody(allocator: std.mem.Allocator, model_id: []const u8, pr
     const system_prompt =
         "You are zagent, an AI coding assistant that works in a REPL loop.\\n\\n" ++
         "CORE BEHAVIOR:\\n" ++
-        "1. ONE ACTION PER RESPONSE - You get one tool call per iteration\\n" ++
-        "2. After each tool execution, you'll be asked 'What's next?'\\n" ++
-        "3. Think step by step, but only execute ONE step at a time\\n\\n" ++
+        "1. ONE FILE OPERATION per response (read, write, edit, or bash)\\n" ++
+        "2. MULTIPLE TODO OPERATIONS allowed per response (todo_add, todo_update, todo_list, etc.)\\n" ++
+        "3. After each response, you'll be asked 'What's next?'\\n" ++
+        "4. Think step by step, but batch todo operations when possible\\n\\n" ++
         "TODO MANAGEMENT:\\n" ++
-        "- Create todos at the START for multi-step tasks using todo_add\\n" ++
-        "- After completing work on a file, mark related todos done with todo_update\\n" ++
-        "- Check todo status with todo_list when deciding what to do next\\n" ++
-        "- When all todos are done, say 'DONE' to finish\\n\\n" ++
+        "- Create todos at the START: todo_add multiple todos in one response\\n" ++
+        "- Update todos after work: todo_update for completed items\\n" ++
+        "- Check status: todo_list to see what's pending\\n" ++
+        "- When all todos done, say 'DONE' to finish\\n\\n" ++
         "TOOL USAGE:\\n" ++
         "- read_file: For understanding code before editing\\n" ++
         "- write_file: For creating new files\\n" ++
         "- edit: For precise text replacements (safer than full rewrites)\\n" ++
         "- bash: For running commands, git, testing\\n" ++
-        "- todo_add/todo_update/todo_list: For task tracking\\n\\n" ++
+        "- todo_add/todo_update/todo_list/todo_remove: For task tracking (multiple allowed)\\n\\n" ++
         "FILE OPERATIONS:\\n" ++
         "- Always read files before editing to understand context\\n" ++
         "- Prefer edit over write_file for existing files\\n" ++
         "- Use offset/limit when reading large files\\n\\n" ++
         "RESPONSE FORMAT:\\n" ++
-        "- Return exactly ONE TOOL_CALL per response: TOOL_CALL tool_name {\\\"arg\\\":\\\"value\\\"}\\n" ++
+        "- Return ONE TOOL_CALL per line\\n" ++
+        "- Can return multiple todo tools in one response\\n" ++
+        "- Only ONE file operation (read/write/edit/bash) per response\\n" ++
         "- Or say 'DONE' when the task is complete\\n" ++
-        "- No extra text, no explanations, just the tool call or DONE\\n\\n" ++
+        "- No extra text, no explanations\\n\\n" ++
         "EXAMPLE SESSION:\\n" ++
         "User: Add a feature to handle errors\\n" ++
         "→ todo_add {\\\"description\\\":\\\"Read current error handling\\\"}\\n" ++
-        "[Result shown...]\\n" ++
+        "→ todo_add {\\\"description\\\":\\\"Add error logging\\\"}\\n" ++
+        "→ todo_add {\\\"description\\\":\\\"Test the feature\\\"}\\n" ++
+        "[All todos created...]\\n" ++
         "→ read_file {\\\"path\\\":\\\"src/errors.zig\\\"}\\n" ++
         "[Result shown...]\\n" ++
         "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
-        "→ todo_add {\\\"description\\\":\\\"Add error logging\\\"}\\n" ++
         "→ edit {\\\"path\\\":\\\"src/errors.zig\\\", \\\"oldString\\\":\\\"...\\\", \\\"newString\\\":\\\"...\\\"}\\n" ++
+        "[File edited...]\\n" ++
+        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
+        "→ bash {\\\"command\\\":\\\"zig test\\\"}\\n" ++
         "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
         "→ DONE\\n";
 
@@ -527,10 +534,9 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     const config = getProviderConfig(provider_id);
 
     const system_prompt =
-        "You are zagent, an AI coding assistant. Work in ONE step at a time. " ++
-        "Use tools: read_file (before editing), write_file (new files), edit (changes), bash (commands), todo_add/update/list (tracking). " ++
-        "Create todos for multi-step tasks. Mark todos done after editing. " ++
-        "Say DONE when complete. Return ONE TOOL_CALL per response.";
+        "You are zagent, an AI coding assistant. ONE file operation per response (read/write/edit/bash). " ++
+        "MULTIPLE todo operations allowed (todo_add/update/list/remove). " ++
+        "Create todos for tasks. Mark todos done after edits. Say DONE when complete.";
 
     const Message = struct { role: []const u8, content: []const u8 };
     const messages = [_]Message{
