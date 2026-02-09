@@ -2949,11 +2949,13 @@ fn runWithBridge(
             try w.writeAll(",\"tool_calls\":[");
             for (response.tool_calls, 0..) |tc, i| {
                 if (i > 0) try w.writeAll(",");
-                try w.print("{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":", .{tc.id});
+                try w.writeAll("{\"id\":");
+                try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
                 try w.print("{f}", .{std.json.fmt(tc.tool, .{})});
                 try w.writeAll(",\"arguments\":");
                 try w.writeAll(tc.args);
-                try w.writeAll("}}}");
+                try w.writeAll("}}");
             }
             try w.writeAll("]");
         }

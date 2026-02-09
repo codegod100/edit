@@ -24,7 +24,6 @@ function getModel() {
     const or = createOpenAI({
       apiKey,
       baseURL: "https://openrouter.ai/api/v1",
-      compatibility: "compatible",
     });
     return or(modelId);
   } else if (providerId === "opencode") {
@@ -138,64 +137,41 @@ function normalizeMessages(messages: any[]): CoreMessage[] {
   const toolCallMap = new Map<string, string>();
 
   return messages.map(m => {
-    let role = m.role;
-    let content = m.content;
+    const role = m.role;
+    const content = m.content || '';
     
-    if (typeof content === 'string') {
-      content = content.replace(/\u001b\[[0-9;]*m/g, '');
-    }
-
     if (role === 'assistant') {
       const toolCalls = m.toolCalls || m.tool_calls;
-      if (toolCalls && Array.isArray(toolCalls)) {
+      if (toolCalls && toolCalls.length > 0) {
         const normalizedToolCalls = toolCalls.map((tc: any) => {
-          const id = tc.toolCallId || tc.id;
-          const name = tc.toolName || (tc.function ? tc.function.name : tc.tool);
+          const id = tc.id || tc.toolCallId;
+          const name = tc.tool || tc.toolName || (tc.function ? tc.function.name : 'unknown');
           let args = tc.args;
           if (typeof args === 'string') {
             try { args = JSON.parse(args); } catch (e) { args = {}; }
-          } else if (tc.function && tc.function.arguments) {
-            if (typeof tc.function.arguments === 'string') {
-              try { args = JSON.parse(tc.function.arguments); } catch (e) { args = {}; }
-            } else {
-              args = tc.function.arguments;
-            }
           }
-          
           if (id && name) toolCallMap.set(id, name);
-          
           return { toolCallId: id, toolName: name, args: args || {} };
         });
-
-        return { role: 'assistant', content: content || '', toolCalls: normalizedToolCalls };
+        return { role: 'assistant', content: content, toolCalls: normalizedToolCalls };
       }
     }
 
     if (role === 'tool') {
-      const toolCallId = m.toolCallId || m.tool_call_id;
-      if (Array.isArray(content)) {
-        return {
-          role: 'tool',
-          content: content.map((p: any) => ({
-            ...p,
-            result: typeof p.result === 'string' ? p.result.replace(/\u001b\[[0-9;]*m/g, '') : p.result
-          }))
-        };
-      } else {
-        const name = m.toolName || m.tool || toolCallMap.get(toolCallId) || 'unknown_tool';
-        return {
-          role: 'tool',
-          content: [{
-            type: 'tool-result',
-            toolCallId: toolCallId,
-            toolName: name,
-            result: content
-          }]
-        };
-      }
+      const toolCallId = m.tool_call_id || m.toolCallId;
+      const name = m.tool || m.toolName || toolCallMap.get(toolCallId) || 'unknown';
+      return {
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: toolCallId,
+          toolName: name,
+          result: content
+        }]
+      };
     }
 
-    return { role, content: content || '' };
+    return { role, content };
   }) as CoreMessage[];
 }
 

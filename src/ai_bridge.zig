@@ -116,9 +116,11 @@ pub const Bridge = struct {
         try w.print(",\"maxSteps\":{d}}}", .{max_steps});
         try w.writeByte('\n');
 
-        logger.info("Sending request: {s}", .{request_buf.items});
+        const request = request_buf.items;
 
-        try stdin_writer.writeAll(request_buf.items);
+        logger.info("Sending request ({d} bytes): {s}", .{ request.len, request });
+
+        try stdin_writer.writeAll(request);
 
         logger.info("Request sent, waiting for response...", .{});
 
