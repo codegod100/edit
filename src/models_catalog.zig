@@ -3,8 +3,25 @@ const pm = @import("provider_manager.zig");
 
 const embedded_models_json = @embedFile("models.dev.json");
 
-pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]pm.ProviderSpec {
-    return parseProviderSpecsFromJson(allocator, embedded_models_json);
+pub fn loadProviderSpecs(allocator: std.mem.Allocator, base_path: []const u8) ![]pm.ProviderSpec {
+    const path = try std.fs.path.join(allocator, &.{ base_path, "models.dev.json" });
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            // Write embedded default
+            var new_file = try std.fs.createFileAbsolute(path, .{});
+            defer new_file.close();
+            try new_file.writeAll(embedded_models_json);
+            return parseProviderSpecsFromJson(allocator, embedded_models_json);
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+    return parseProviderSpecsFromJson(allocator, content);
 }
 
 pub fn freeProviderSpecs(allocator: std.mem.Allocator, specs: []pm.ProviderSpec) void {

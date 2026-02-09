@@ -116,6 +116,76 @@ const HistoryNav = enum {
     down,
 };
 
+const Role = enum {
+    user,
+    assistant,
+};
+
+const ContextTurn = struct {
+    role: Role,
+    content: []u8,
+    tool_calls: usize,
+    error_count: usize,
+    files_touched: ?[]u8,
+
+    fn deinit(self: *ContextTurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        if (self.files_touched) |f| allocator.free(f);
+    }
+};
+
+const TurnMeta = struct {
+    tool_calls: usize = 0,
+    error_count: usize = 0,
+    files_touched: ?[]const u8 = null,
+};
+
+const RunTurnResult = struct {
+    response: []u8,
+    tool_calls: usize,
+    error_count: usize,
+    files_touched: ?[]u8,
+
+    fn deinit(self: *RunTurnResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.response);
+        if (self.files_touched) |f| allocator.free(f);
+    }
+};
+
+const ContextWindow = struct {
+    turns: std.ArrayList(ContextTurn),
+    summary: ?[]u8,
+    max_chars: usize,
+    keep_recent_turns: usize,
+
+    fn init(max_chars: usize, keep_recent_turns: usize) ContextWindow {
+        return .{
+            .turns = .{},
+            .summary = null,
+            .max_chars = max_chars,
+            .keep_recent_turns = keep_recent_turns,
+        };
+    }
+
+    fn deinit(self: *ContextWindow, allocator: std.mem.Allocator) void {
+        for (self.turns.items) |*turn| turn.deinit(allocator);
+        self.turns.deinit(allocator);
+        if (self.summary) |s| allocator.free(s);
+    }
+
+    fn append(self: *ContextWindow, allocator: std.mem.Allocator, role: Role, content: []const u8, meta: TurnMeta) !void {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len == 0) return;
+        try self.turns.append(allocator, .{
+            .role = role,
+            .content = try allocator.dupe(u8, trimmed),
+            .tool_calls = meta.tool_calls,
+            .error_count = meta.error_count,
+            .files_touched = if (meta.files_touched) |f| try allocator.dupe(u8, f) else null,
+        });
+    }
+};
+
 const CommandHistory = struct {
     items: std.ArrayList([]u8),
 
@@ -183,6 +253,253 @@ fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, line: 
     try file.writeAll("\n");
 }
 
+fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, "context.json" });
+}
+
+fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow) !void {
+    const path = try contextPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const text = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(text);
+
+    const TurnJson = struct {
+        role: []const u8,
+        content: []const u8,
+        tool_calls: ?usize = null,
+        error_count: ?usize = null,
+        files_touched: ?[]const u8 = null,
+    };
+    const ContextJson = struct {
+        summary: ?[]const u8 = null,
+        turns: []const TurnJson = &.{},
+    };
+
+    var parsed = std.json.parseFromSlice(ContextJson, allocator, text, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value.summary) |s| {
+        if (window.summary) |existing| allocator.free(existing);
+        window.summary = try allocator.dupe(u8, s);
+    }
+
+    for (parsed.value.turns) |turn| {
+        const role: Role = if (std.mem.eql(u8, turn.role, "assistant")) .assistant else .user;
+        try window.append(allocator, role, turn.content, .{
+            .tool_calls = turn.tool_calls orelse 0,
+            .error_count = turn.error_count orelse 0,
+            .files_touched = turn.files_touched,
+        });
+    }
+}
+
+fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow) !void {
+    const path = try contextPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const TurnJson = struct {
+        role: []const u8,
+        content: []const u8,
+        tool_calls: usize,
+        error_count: usize,
+        files_touched: ?[]const u8,
+    };
+    const ContextJson = struct {
+        summary: ?[]const u8,
+        turns: []TurnJson,
+    };
+
+    var turns = try std.ArrayList(TurnJson).initCapacity(allocator, window.turns.items.len);
+    defer turns.deinit(allocator);
+    for (window.turns.items) |turn| {
+        try turns.append(allocator, .{
+            .role = if (turn.role == .assistant) "assistant" else "user",
+            .content = turn.content,
+            .tool_calls = turn.tool_calls,
+            .error_count = turn.error_count,
+            .files_touched = turn.files_touched,
+        });
+    }
+
+    const payload = ContextJson{ .summary = window.summary, .turns = turns.items };
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
+
+    var file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(out.items);
+}
+
+fn estimateContextChars(window: *const ContextWindow) usize {
+    var total: usize = if (window.summary) |s| s.len else 0;
+    for (window.turns.items) |turn| total += turn.content.len + 20;
+    return total;
+}
+
+fn compactContextWindow(allocator: std.mem.Allocator, window: *ContextWindow, active: ?ActiveModel) !void {
+    if (window.turns.items.len <= window.keep_recent_turns) return;
+    if (estimateContextChars(window) <= window.max_chars) return;
+
+    const compact_count = window.turns.items.len - window.keep_recent_turns;
+    const new_summary = if (active) |a|
+        (summarizeTurnsWithModel(allocator, window, compact_count, a) catch null)
+    else
+        null;
+
+    const fallback_summary = if (new_summary == null)
+        try buildHeuristicSummary(allocator, window, compact_count)
+    else
+        null;
+    const final_summary = if (new_summary) |s| s else fallback_summary.?;
+
+    if (window.summary) |old| allocator.free(old);
+    window.summary = final_summary;
+
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        var first = window.turns.orderedRemove(0);
+        first.deinit(allocator);
+    }
+}
+
+fn buildHeuristicSummary(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize) ![]u8 {
+    var summary_buf = std.ArrayList(u8).empty;
+    defer summary_buf.deinit(allocator);
+
+    if (window.summary) |existing| {
+        try summary_buf.writer(allocator).print("{s}\n", .{existing});
+    }
+    try summary_buf.appendSlice(allocator, "Compacted context notes:\n");
+
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        const turn = window.turns.items[idx];
+        const prefix = if (turn.role == .assistant) "A" else "U";
+        const cap_len = @min(turn.content.len, 220);
+        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null)) {
+            try summary_buf.writer(allocator).print(
+                "- {s}: {s} [tools={d} errors={d}{s}]\n",
+                .{ prefix, turn.content[0..cap_len], turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
+            );
+        } else {
+            try summary_buf.writer(allocator).print("- {s}: {s}\n", .{ prefix, turn.content[0..cap_len] });
+        }
+    }
+    return summary_buf.toOwnedSlice(allocator);
+}
+
+fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize, active: ActiveModel) !?[]u8 {
+    var turns_buf = std.ArrayList(u8).empty;
+    defer turns_buf.deinit(allocator);
+    const w = turns_buf.writer(allocator);
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        const turn = window.turns.items[idx];
+        const role = if (turn.role == .assistant) "assistant" else "user";
+        try w.print("- {s}: {s}", .{ role, turn.content });
+        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
+            try w.print(" [tools={d} errors={d}", .{ turn.tool_calls, turn.error_count });
+            if (turn.files_touched) |f| try w.print(" files={s}", .{f});
+            try w.print("]", .{});
+        }
+        try w.print("\n", .{});
+    }
+
+    const prompt = try std.fmt.allocPrint(
+        allocator,
+        "Summarize these prior chat turns for future coding assistance. Keep it concise (6-10 bullets), include decisions, files touched, errors/fixes, and unresolved tasks.\n\nExisting summary:\n{s}\n\nTurns to compact:\n{s}",
+        .{ if (window.summary) |s| s else "(none)", turns_buf.items },
+    );
+    defer allocator.free(prompt);
+
+    const text = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt) catch return null;
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        allocator.free(text);
+        return null;
+    }
+    return text;
+}
+
+fn buildRelevantTurnIndices(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8, max_turns: usize) ![]usize {
+    const ScoredTurn = struct { idx: usize, score: usize };
+    var scored = std.ArrayList(ScoredTurn).empty;
+    defer scored.deinit(allocator);
+
+    for (window.turns.items, 0..) |turn, idx| {
+        var score: usize = 0;
+        if (containsIgnoreCase(turn.content, user_input)) score += 4;
+        if (containsIgnoreCase(user_input, "file") and turn.files_touched != null) score += 2;
+        if (turn.role == .assistant and turn.tool_calls > 0) score += 1;
+        const recency = window.turns.items.len - idx;
+        if (recency <= 4) score += 3;
+        if (score > 0) try scored.append(allocator, .{ .idx = idx, .score = score });
+    }
+
+    std.mem.sort(ScoredTurn, scored.items, {}, struct {
+        fn lessThan(_: void, a: ScoredTurn, b: ScoredTurn) bool {
+            if (a.score == b.score) return a.idx > b.idx;
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    const take = @min(max_turns, scored.items.len);
+    var selected = std.ArrayList(usize).empty;
+    defer selected.deinit(allocator);
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        try selected.append(allocator, scored.items[i].idx);
+    }
+
+    std.mem.sort(usize, selected.items, {}, std.sort.asc(usize));
+    return selected.toOwnedSlice(allocator);
+}
+
+fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("You are continuing an existing coding conversation. Use prior context when relevant, but prioritize correctness and current repository state.\n", .{});
+    if (window.summary) |s| {
+        try w.print("\nConversation summary:\n{s}\n", .{s});
+    }
+
+    if (window.turns.items.len > 0) {
+        try w.print("\nRelevant turns:\n", .{});
+        const indices = try buildRelevantTurnIndices(allocator, window, user_input, 8);
+        defer allocator.free(indices);
+        for (indices) |idx| {
+            const turn = window.turns.items[idx];
+            const tag = if (turn.role == .assistant) "Assistant" else "User";
+            if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
+                try w.print(
+                    "{s}: {s} [tools={d} errors={d}{s}]\n",
+                    .{ tag, turn.content, turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
+                );
+            } else {
+                try w.print("{s}: {s}\n", .{ tag, turn.content });
+            }
+        }
+    }
+
+    try w.print("\nCurrent user request:\n{s}", .{user_input});
+    return out.toOwnedSlice(allocator);
+}
+
 fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
     if (entries.len == 0) return null;
     return switch (nav) {
@@ -207,6 +524,26 @@ const ModelSelection = struct {
     provider_id: []const u8,
     model_id: []const u8,
 };
+
+fn stdInFile() std.fs.File {
+    if (@hasDecl(std.fs.File, "stdin")) {
+        return std.fs.File.stdin();
+    }
+    if (@hasDecl(std.io, "getStdIn")) {
+        return std.io.getStdIn();
+    }
+    @compileError("No supported stdin API in this Zig version");
+}
+
+fn stdOutFile() std.fs.File {
+    if (@hasDecl(std.fs.File, "stdout")) {
+        return std.fs.File.stdout();
+    }
+    if (@hasDecl(std.io, "getStdOut")) {
+        return std.io.getStdOut();
+    }
+    @compileError("No supported stdout API in this Zig version");
+}
 
 fn parseModelSelection(input: []const u8) ?ModelSelection {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
@@ -253,9 +590,16 @@ fn applyEditKey(
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
-    const stdin_file = std.fs.File.stdin();
-    const stdin = stdin_file.deprecatedReader();
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+    const stdin_file = stdInFile();
+    const stdin = if (@hasDecl(std.fs.File, "deprecatedReader"))
+        stdin_file.deprecatedReader()
+    else
+        stdin_file.reader();
+    const stdout_file = stdOutFile();
+    const stdout = if (@hasDecl(std.fs.File, "deprecatedWriter"))
+        stdout_file.deprecatedWriter()
+    else
+        stdout_file.writer();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
     const prompt_text = if (cwd.len > 0)
@@ -272,7 +616,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const skill_list = try skills.discover(allocator, cwd, home);
     defer skills.freeList(allocator, skill_list);
 
-    const providers_owned = try catalog.loadProviderSpecs(allocator);
+    const providers_owned = try catalog.loadProviderSpecs(allocator, config_dir);
     defer catalog.freeProviderSpecs(allocator, providers_owned);
     const providers = if (providers_owned.len > 0) providers_owned else defaultProviderSpecs();
     var stored_pairs = try store.load(allocator, config_dir);
@@ -284,6 +628,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var history = CommandHistory.init();
     defer history.deinit(allocator);
     try loadHistory(allocator, config_dir, &history);
+
+    var context_window = ContextWindow.init(24 * 1024, 8);
+    defer context_window.deinit(allocator);
+    try loadContextWindow(allocator, config_dir, &context_window);
+    try compactContextWindow(allocator, &context_window, null);
+
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
@@ -502,13 +852,25 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
 
-                const response = runModelTurnWithTools(allocator, stdout, active.?, trimmed) catch |err| {
+                const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
+                defer allocator.free(model_input);
+
+                var turn = runModelTurnWithTools(allocator, stdout, active.?, model_input) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
-                defer allocator.free(response);
+                defer turn.deinit(allocator);
 
-                try stdout.print("{s}\n", .{response});
+                try context_window.append(allocator, .user, trimmed, .{});
+                try context_window.append(allocator, .assistant, turn.response, .{
+                    .tool_calls = turn.tool_calls,
+                    .error_count = turn.error_count,
+                    .files_touched = turn.files_touched,
+                });
+                try compactContextWindow(allocator, &context_window, active.?);
+                try saveContextWindow(allocator, config_dir, &context_window);
+
+                try stdout.print("{s}\n", .{turn.response});
             },
         }
     }
@@ -772,6 +1134,67 @@ test "auto pick single model when only one match" {
     try std.testing.expectEqualStrings("gpt-5.3-codex", picked.?.model_id);
 }
 
+test "context prompt includes summary and turns" {
+    const allocator = std.testing.allocator;
+    var window = ContextWindow.init(1024, 4);
+    defer window.deinit(allocator);
+
+    window.summary = try allocator.dupe(u8, "Earlier summary.");
+    try window.append(allocator, .user, "first question", .{});
+    try window.append(allocator, .assistant, "first answer", .{ .tool_calls = 1, .files_touched = "src/repl.zig" });
+
+    const prompt = try buildContextPrompt(allocator, &window, "new request");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Conversation summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "first question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Current user request") != null);
+}
+
+test "context compaction summarizes and keeps recent turns" {
+    const allocator = std.testing.allocator;
+    var window = ContextWindow.init(120, 2);
+    defer window.deinit(allocator);
+
+    try window.append(allocator, .user, "u1 long enough to push limit", .{});
+    try window.append(allocator, .assistant, "a1 long enough to push limit", .{ .tool_calls = 2 });
+    try window.append(allocator, .user, "u2 keep", .{});
+    try window.append(allocator, .assistant, "a2 keep", .{});
+
+    try compactContextWindow(allocator, &window, null);
+
+    try std.testing.expect(window.summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, window.summary.?, "Compacted context notes") != null);
+    try std.testing.expectEqual(@as(usize, 2), window.turns.items.len);
+    try std.testing.expectEqualStrings("u2 keep", window.turns.items[0].content);
+    try std.testing.expectEqualStrings("a2 keep", window.turns.items[1].content);
+}
+
+test "context window persists across save and load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var out = ContextWindow.init(1024, 4);
+    defer out.deinit(allocator);
+    try out.append(allocator, .user, "hello", .{});
+    try out.append(allocator, .assistant, "world", .{ .tool_calls = 1, .files_touched = "src/main.zig" });
+    out.summary = try allocator.dupe(u8, "sum");
+    try saveContextWindow(allocator, root, &out);
+
+    var loaded = ContextWindow.init(1024, 4);
+    defer loaded.deinit(allocator);
+    try loadContextWindow(allocator, root, &loaded);
+
+    try std.testing.expect(loaded.summary != null);
+    try std.testing.expectEqualStrings("sum", loaded.summary.?);
+    try std.testing.expectEqual(@as(usize, 2), loaded.turns.items.len);
+    try std.testing.expectEqualStrings("hello", loaded.turns.items[0].content);
+}
+
 test "known tool name accepts supported tools" {
     try std.testing.expect(isKnownToolName("bash"));
     try std.testing.expect(isKnownToolName("read_file"));
@@ -779,8 +1202,8 @@ test "known tool name accepts supported tools" {
 }
 
 test "known tool name rejects unknown tools" {
-    try std.testing.expect(!isKnownToolName("read"));
     try std.testing.expect(!isKnownToolName("invalid"));
+    try std.testing.expect(!isKnownToolName("definitely_not_a_tool"));
 }
 
 test "tool routing prompt includes codebase analysis guidance" {
@@ -799,6 +1222,15 @@ test "tool routing prompt preserves original user request" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "explain src/repl.zig flow") != null);
+}
+
+test "strict routing prompt allows modification tools" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildStrictToolRoutingPrompt(allocator, "create a file");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "write_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "edit") != null);
 }
 
 test "strict routing prompt requires at least one read or list" {
@@ -820,6 +1252,61 @@ test "repo specific detector catches codebase questions" {
 test "repo specific detector ignores generic questions" {
     try std.testing.expect(!isLikelyRepoSpecificQuestion("what is a monad"));
     try std.testing.expect(!isLikelyRepoSpecificQuestion("write a haiku"));
+}
+
+test "mutation detector catches file edit requests" {
+    try std.testing.expect(isLikelyFileMutationRequest("create and edit sample file"));
+    try std.testing.expect(isLikelyFileMutationRequest("update src/repl.zig to add a command"));
+}
+
+test "mutation detector ignores non-edit prompts" {
+    try std.testing.expect(!isLikelyFileMutationRequest("explain how this works"));
+    try std.testing.expect(!isLikelyFileMutationRequest("what is zig"));
+}
+
+test "strict mutation routing prompt requires write tools" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildStrictMutationToolRoutingPrompt(allocator, "create and edit sample file");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "must call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "write_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "replace_in_file") != null);
+}
+
+test "fallback tool call parser extracts name and json" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseFallbackToolCallFromText(allocator, "TOOL_CALL write_file {\"path\":\"sample.txt\",\"content\":\"hello\"}");
+    try std.testing.expect(parsed != null);
+    defer {
+        var p = parsed.?;
+        p.deinit(allocator);
+    }
+
+    try std.testing.expectEqualStrings("write_file", parsed.?.tool);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.?.arguments_json, "sample.txt") != null);
+}
+
+test "fallback tool call parser returns null for plain text" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseFallbackToolCallFromText(allocator, "I cannot do that");
+    try std.testing.expect(parsed == null);
+}
+
+test "tool call id is stable per step" {
+    const allocator = std.testing.allocator;
+    const id = try buildToolCallId(allocator, 3);
+    defer allocator.free(id);
+    try std.testing.expectEqualStrings("toolcall-3", id);
+}
+
+test "tool result event line includes status and bytes" {
+    const allocator = std.testing.allocator;
+    const line = try buildToolResultEventLine(allocator, 2, "toolcall-2", "read_file", "ok", 42, 12);
+    defer allocator.free(line);
+    try std.testing.expect(std.mem.indexOf(u8, line, "tool-result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "status=ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "bytes=42") != null);
 }
 
 test "infer tool call spec for system time prompt" {
@@ -1213,7 +1700,7 @@ fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
     return if (options.len == 1) options[0] else null;
 }
 
-fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8) !?llm.ToolRouteCall {
+fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8, force: bool) !?llm.ToolRouteCall {
     var defs = try std.ArrayList(llm.ToolRouteDef).initCapacity(allocator, tools.definitions.len);
     defer defs.deinit(allocator);
 
@@ -1221,10 +1708,49 @@ fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, inp
         try defs.append(allocator, .{ .name = d.name, .description = d.description, .parameters_json = d.parameters_json });
     }
 
-    return llm.inferToolCall(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items) catch |err| switch (err) {
+    return llm.inferToolCall(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items, force) catch |err| switch (err) {
         llm.QueryError.UnsupportedProvider => null,
         else => return err,
     };
+}
+
+fn buildFallbackToolInferencePrompt(allocator: std.mem.Allocator, user_text: []const u8, require_mutation: bool) ![]u8 {
+    var tools_list = std.ArrayList(u8).empty;
+    defer tools_list.deinit(allocator);
+    for (tools.definitions) |d| {
+        try tools_list.writer(allocator).print("- {s}: {s}\n", .{ d.name, d.parameters_json });
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "Return exactly one line in this format and nothing else: TOOL_CALL <tool_name> <arguments_json>. Choose one tool from the list below. Arguments must be valid JSON object. {s}\n\nTools:\n{s}\nUser request:\n{s}",
+        .{ if (require_mutation) "This request requires file mutation; prefer write_file, replace_in_file/edit, or apply_patch." else "", tools_list.items, user_text },
+    );
+}
+
+fn parseFallbackToolCallFromText(allocator: std.mem.Allocator, text: []const u8) !?llm.ToolRouteCall {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) return null;
+
+    const rest = std.mem.trim(u8, trimmed[10..], " \t");
+    const brace = std.mem.indexOfScalar(u8, rest, '{') orelse return null;
+    const name = std.mem.trim(u8, rest[0..brace], " \t");
+    const args = std.mem.trim(u8, rest[brace..], " \t");
+    if (name.len == 0 or args.len < 2) return null;
+
+    return .{
+        .tool = try allocator.dupe(u8, name),
+        .arguments_json = try allocator.dupe(u8, args),
+    };
+}
+
+fn inferToolCallWithTextFallback(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8, require_mutation: bool) !?llm.ToolRouteCall {
+    const prompt = try buildFallbackToolInferencePrompt(allocator, input, require_mutation);
+    defer allocator.free(prompt);
+
+    const raw = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt) catch return null;
+    defer allocator.free(raw);
+    return parseFallbackToolCallFromText(allocator, raw);
 }
 
 fn isKnownToolName(name: []const u8) bool {
@@ -1237,7 +1763,7 @@ fn isKnownToolName(name: []const u8) bool {
 fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "Use local tools when they improve correctness. For repository-specific questions, inspect files first with list_files and read_file before answering. For code changes, prefer read_file before write_file or replace_in_file. Only skip tools when the answer is purely general knowledge.\n\nUser request:\n{s}",
+        "Use local tools when they improve correctness. For repository-specific questions, inspect files first with list_files and read_file. For code changes, you may use read_file, write_file, or replace_in_file/edit directly. Only skip tools when the answer is purely general knowledge.\n\nUser request:\n{s}",
         .{user_text},
     );
 }
@@ -1245,7 +1771,7 @@ fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) !
 fn buildStrictToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "This is a repository-specific question. You must call at least one local inspection tool before giving the final answer. First call list_files or read_file, then answer using concrete file evidence.\n\nUser request:\n{s}",
+        "This is a repository-specific question. You must call at least one local tool before giving the final answer. First call list_files, read_file, write_file, or replace_in_file/edit, then answer using concrete file evidence or action results.\n\nUser request:\n{s}",
         .{user_text},
     );
 }
@@ -1264,28 +1790,136 @@ fn isLikelyRepoSpecificQuestion(input: []const u8) bool {
     return false;
 }
 
-fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, user_input: []const u8) ![]u8 {
+fn isLikelyFileMutationRequest(input: []const u8) bool {
+    const t = std.mem.trim(u8, input, " \t\r\n");
+    if (t.len == 0) return false;
+
+    const mentions_target = containsIgnoreCase(t, "file") or containsIgnoreCase(t, "src/") or containsIgnoreCase(t, ".zig");
+    if (!mentions_target) return false;
+
+    return containsIgnoreCase(t, "create") or
+        containsIgnoreCase(t, "edit") or
+        containsIgnoreCase(t, "write") or
+        containsIgnoreCase(t, "modify") or
+        containsIgnoreCase(t, "update") or
+        containsIgnoreCase(t, "replace") or
+        containsIgnoreCase(t, "refactor") or
+        containsIgnoreCase(t, "add line");
+}
+
+fn buildStrictMutationToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "This request requires actual file mutation. You must call at least one write-capable tool before giving a final answer. Use write_file, replace_in_file/edit, or apply_patch. Do not claim success unless a tool has run successfully.\n\nUser request:\n{s}",
+        .{user_text},
+    );
+}
+
+fn buildToolCallId(allocator: std.mem.Allocator, step: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "toolcall-{d}", .{step});
+}
+
+fn buildToolResultEventLine(
+    allocator: std.mem.Allocator,
+    step: usize,
+    call_id: []const u8,
+    tool_name: []const u8,
+    status: []const u8,
+    bytes: usize,
+    duration_ms: i64,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "event=tool-result step={d} call_id={s} tool={s} status={s} bytes={d} duration_ms={d}",
+        .{ step, call_id, tool_name, status, bytes, duration_ms },
+    );
+}
+
+fn parsePrimaryPathFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) ?[]u8 {
+    const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const p = parsed.value.path orelse parsed.value.filePath orelse return null;
+    return allocator.dupe(u8, p) catch null;
+}
+
+fn containsPath(paths: []const []u8, candidate: []const u8) bool {
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, candidate)) return true;
+    }
+    return false;
+}
+
+fn joinPaths(allocator: std.mem.Allocator, paths: []const []u8) !?[]u8 {
+    if (paths.len == 0) return null;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    for (paths, 0..) |p, idx| {
+        if (idx > 0) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, p);
+    }
+    const value = try out.toOwnedSlice(allocator);
+    return @as(?[]u8, value);
+}
+
+fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, user_input: []const u8) !RunTurnResult {
     const max_tool_steps: usize = 6;
     var context_prompt = try allocator.dupe(u8, user_input);
     defer allocator.free(context_prompt);
     var forced_repo_probe_done = false;
+    var forced_mutation_probe_done = false;
     const repo_specific = isLikelyRepoSpecificQuestion(user_input);
+    const mutation_request = isLikelyFileMutationRequest(user_input);
+    var tool_calls: usize = 0;
+    var paths = std.ArrayList([]u8).empty;
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
 
     var step: usize = 0;
     while (step < max_tool_steps) : (step += 1) {
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
 
-        var routed = try inferToolCallWithModel(allocator, active, route_prompt);
+        var routed = try inferToolCallWithModel(allocator, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
             const strict_prompt = try buildStrictToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_prompt);
-            routed = try inferToolCallWithModel(allocator, active, strict_prompt);
+            routed = try inferToolCallWithModel(allocator, active, strict_prompt, true);
+        }
+
+        if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
+            forced_mutation_probe_done = true;
+            const strict_mutation_prompt = try buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
+            defer allocator.free(strict_mutation_prompt);
+            routed = try inferToolCallWithModel(allocator, active, strict_mutation_prompt, true);
+        }
+
+        if (routed == null and step == 0 and mutation_request) {
+            routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
         if (routed == null) {
-            return llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            if (mutation_request and tool_calls == 0) {
+                return .{
+                    .response = try allocator.dupe(
+                        u8,
+                        "I could not confirm a real file-edit tool call for this edit request. Please retry; I will only report success after write_file, edit/replace_in_file, or apply_patch runs.",
+                    ),
+                    .tool_calls = 0,
+                    .error_count = 1,
+                    .files_touched = null,
+                };
+            }
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            return .{
+                .response = final,
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
         }
         defer {
             var r = routed.?;
@@ -1293,25 +1927,68 @@ fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: 
         }
 
         if (!isKnownToolName(routed.?.tool)) {
-            return llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            return .{
+                .response = final,
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
         }
 
-        try stdout.print("tool[{d}] {s}\n", .{ step + 1, routed.?.tool });
+        tool_calls += 1;
+        if (parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
+            if (!containsPath(paths.items, p)) {
+                try paths.append(allocator, p);
+            } else {
+                allocator.free(p);
+            }
+        }
+
+        const call_id = try buildToolCallId(allocator, step + 1);
+        defer allocator.free(call_id);
+
+        try stdout.print(
+            "event=tool-input-start step={d} call_id={s} tool={s}\n",
+            .{ step + 1, call_id, routed.?.tool },
+        );
+        try stdout.print(
+            "event=tool-call step={d} call_id={s} tool={s}\n",
+            .{ step + 1, call_id, routed.?.tool },
+        );
+
+        const started_ms = std.time.milliTimestamp();
 
         const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json) catch |err| {
-            return std.fmt.allocPrint(
-                allocator,
-                "Tool execution failed at step {d} ({s}): {s}",
-                .{ step + 1, routed.?.tool, @errorName(err) },
-            );
+            const failed_ms = std.time.milliTimestamp();
+            const duration_ms = failed_ms - started_ms;
+            const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms);
+            defer allocator.free(err_line);
+            try stdout.print("{s}\n", .{err_line});
+            return .{
+                .response = try std.fmt.allocPrint(
+                    allocator,
+                    "Tool execution failed at step {d} ({s}): {s}",
+                    .{ step + 1, routed.?.tool, @errorName(err) },
+                ),
+                .tool_calls = tool_calls,
+                .error_count = 1,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
         };
         defer allocator.free(tool_out);
+
+        const finished_ms = std.time.milliTimestamp();
+        const duration_ms = finished_ms - started_ms;
+        const ok_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms);
+        defer allocator.free(ok_line);
+        try stdout.print("{s}\n", .{ok_line});
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
         const next_prompt = try std.fmt.allocPrint(
             allocator,
-            "{s}\n\nTool call {d}: {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",
-            .{ context_prompt, step + 1, routed.?.tool, routed.?.arguments_json, capped },
+            "{s}\n\nTool events:\n- event=tool-input-start step={d} call_id={s} tool={s}\n- event=tool-call step={d} call_id={s} tool={s}\n- {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",
+            .{ context_prompt, step + 1, call_id, routed.?.tool, step + 1, call_id, routed.?.tool, ok_line, routed.?.arguments_json, capped },
         );
         allocator.free(context_prompt);
         context_prompt = next_prompt;
@@ -1323,7 +2000,13 @@ fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: 
         .{ context_prompt, max_tool_steps },
     );
     defer allocator.free(fallback_prompt);
-    return llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt);
+    const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt);
+    return .{
+        .response = final,
+        .tool_calls = tool_calls,
+        .error_count = 0,
+        .files_touched = try joinPaths(allocator, paths.items),
+    };
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

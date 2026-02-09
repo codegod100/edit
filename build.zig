@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const refresh_models = b.addSystemCommand(&.{ "sh", "-c", "curl -fsSL https://models.dev/api.json -o src/models.dev.json || true" });
+    const refresh_models = b.addSystemCommand(&.{ "sh", "-c", "test -f src/models.dev.json || curl -fsSL https://models.dev/api.json -o src/models.dev.json || true" });
 
     const exe = b.addExecutable(.{
         .name = "zagent",

@@ -157,6 +157,7 @@ pub fn inferToolCall(
     model_id: []const u8,
     prompt: []const u8,
     defs: []const ToolRouteDef,
+    force_tool: bool,
 ) !?ToolRouteCall {
     if (!std.mem.eql(u8, provider_id, "openai")) return null;
     const key = api_key orelse return QueryError.MissingApiKey;
@@ -166,7 +167,7 @@ pub fn inferToolCall(
 
     const endpoint = if (isLikelyOAuthToken(key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
     const stream = std.mem.eql(u8, endpoint, OPENAI_CODEX_ENDPOINT);
-    const body = try buildOpenAIToolRouteBody(allocator, model_id, prompt, defs, stream);
+    const body = try buildOpenAIToolRouteBody(allocator, model_id, prompt, defs, stream, force_tool);
     defer allocator.free(body);
 
     const output = try runCommandCapture(allocator, &.{
@@ -185,6 +186,7 @@ fn buildOpenAIToolRouteBody(
     prompt: []const u8,
     defs: []const ToolRouteDef,
     stream: bool,
+    force_tool: bool,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -195,7 +197,7 @@ fn buildOpenAIToolRouteBody(
         if (i > 0) try w.print(",", .{});
         try w.print("{{\"type\":\"function\",\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{s},\"strict\":true}}", .{ d.name, d.description, d.parameters_json });
     }
-    try w.print("],\"tool_choice\":\"auto\",\"store\":false,\"stream\":{s}}}", .{if (stream) "true" else "false"});
+    try w.print("],\"tool_choice\":\"{s}\",\"store\":false,\"stream\":{s}}}", .{ if (force_tool) "required" else "auto", if (stream) "true" else "false" });
     return out.toOwnedSlice(allocator);
 }
 
