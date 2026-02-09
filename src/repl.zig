@@ -2942,15 +2942,16 @@ fn runWithBridge(
         }
 
         // Add assistant message to history
-        try w.writeAll(",{\"role\":\"assistant\",\"content\":\"");
-        try writeJsonString(w, response.text);
-        try w.writeAll("\"");
+        try w.writeAll(",{\"role\":\"assistant\",\"content\":");
+        try w.print("{f}", .{std.json.fmt(response.text, .{})});
 
         if (response.tool_calls.len > 0) {
             try w.writeAll(",\"tool_calls\":[");
             for (response.tool_calls, 0..) |tc, i| {
                 if (i > 0) try w.writeAll(",");
-                try w.print("{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":", .{ tc.id, tc.tool });
+                try w.print("{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":", .{tc.id});
+                try w.print("{f}", .{std.json.fmt(tc.tool, .{})});
+                try w.writeAll(",\"arguments\":");
                 try w.writeAll(tc.args);
                 try w.writeAll("}}}");
             }
@@ -2978,11 +2979,11 @@ fn runWithBridge(
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
                 
-                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":\"");
-                try w.writeAll(tc.id);
-                try w.writeAll("\",\"content\":\"");
-                try writeJsonString(w, err_msg);
-                try w.writeAll("\"}");
+                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.writeAll(",\"content\":");
+                try w.print("{f}", .{std.json.fmt(err_msg, .{})});
+                try w.writeAll("}");
                 continue;
             };
             defer allocator.free(result);
@@ -2990,11 +2991,11 @@ fn runWithBridge(
             try stdout.print("\n{s}\n", .{result});
 
             // Add tool result to history
-            try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":\"");
-            try writeJsonString(w, tc.id);
-            try w.writeAll("\",\"content\":\"");
-            try writeJsonString(w, result);
-            try w.writeAll("\"}");
+            try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+            try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+            try w.writeAll(",\"content\":");
+            try w.print("{f}", .{std.json.fmt(result, .{})});
+            try w.writeAll("}");
 
             // Track paths
             if (parsePrimaryPathFromArgs(allocator, tc.args)) |p| {

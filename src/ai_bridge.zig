@@ -118,12 +118,6 @@ pub const Bridge = struct {
 
         logger.info("Sending request: {s}", .{request_buf.items});
 
-        const debug_file = std.fs.cwd().createFile("debug_payload.json", .{}) catch null;
-        if (debug_file) |f| {
-            f.writeAll(request_buf.items) catch {};
-            f.close();
-        }
-
         try stdin_writer.writeAll(request_buf.items);
 
         logger.info("Request sent, waiting for response...", .{});
@@ -132,6 +126,8 @@ pub const Bridge = struct {
         const line = try stdout_reader.readUntilDelimiterOrEofAlloc(self.allocator, '\n', 10 * 1024 * 1024);
         if (line == null) return error.BridgeClosed;
         defer self.allocator.free(line.?);
+
+        logger.info("Received line from bridge (len={d}): {s}", .{ line.?.len, line.? });
 
         // Parse JSON response
         const Response = struct {
