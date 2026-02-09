@@ -350,48 +350,22 @@ fn buildOpenAIRequestBody(allocator: std.mem.Allocator, model_id: []const u8, pr
     const input = [_]InputMessage{.{ .role = "user", .content = content[0..] }};
 
     const system_prompt =
-        "You are zagent, an AI coding assistant that works in a REPL loop.\\n\\n" ++
-        "CORE BEHAVIOR:\\n" ++
-        "1. ONE FILE OPERATION per response (read, write, edit, or bash)\\n" ++
-        "2. MULTIPLE TODO OPERATIONS allowed per response (todo_add, todo_update, todo_list, etc.)\\n" ++
-        "3. After each response, you'll be asked 'What's next?'\\n" ++
-        "4. Think step by step, but batch todo operations when possible\\n\\n" ++
-        "TODO MANAGEMENT:\\n" ++
-        "- Create todos at the START: todo_add multiple todos in one response\\n" ++
-        "- Update todos after work: todo_update for completed items\\n" ++
-        "- Check status: todo_list to see what's pending\\n" ++
-        "- When all todos done, say 'DONE' to finish\\n\\n" ++
-        "TOOL USAGE:\\n" ++
-        "- read_file: For understanding code before editing\\n" ++
-        "- write_file: For creating new files\\n" ++
-        "- edit: For precise text replacements (safer than full rewrites)\\n" ++
-        "- bash: For running commands, git, testing\\n" ++
-        "- todo_add/todo_update/todo_list/todo_remove: For task tracking (multiple allowed)\\n\\n" ++
-        "FILE OPERATIONS:\\n" ++
-        "- Always read files before editing to understand context\\n" ++
-        "- Prefer edit over write_file for existing files\\n" ++
-        "- Use offset/limit when reading large files\\n\\n" ++
-        "RESPONSE FORMAT:\\n" ++
-        "- Return ONE TOOL_CALL per line\\n" ++
-        "- Can return multiple todo tools in one response\\n" ++
-        "- Only ONE file operation (read/write/edit/bash) per response\\n" ++
-        "- Or say 'DONE' when the task is complete\\n" ++
-        "- No extra text, no explanations\\n\\n" ++
-        "EXAMPLE SESSION:\\n" ++
-        "User: Add a feature to handle errors\\n" ++
-        "→ todo_add {\\\"description\\\":\\\"Read current error handling\\\"}\\n" ++
-        "→ todo_add {\\\"description\\\":\\\"Add error logging\\\"}\\n" ++
-        "→ todo_add {\\\"description\\\":\\\"Test the feature\\\"}\\n" ++
-        "[All todos created...]\\n" ++
-        "→ read_file {\\\"path\\\":\\\"src/errors.zig\\\"}\\n" ++
-        "[Result shown...]\\n" ++
-        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
-        "→ edit {\\\"path\\\":\\\"src/errors.zig\\\", \\\"oldString\\\":\\\"...\\\", \\\"newString\\\":\\\"...\\\"}\\n" ++
-        "[File edited...]\\n" ++
-        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
-        "→ bash {\\\"command\\\":\\\"zig test\\\"}\\n" ++
-        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
-        "→ DONE\\n";
+        "You are zagent, an AI coding assistant. Follow this exact workflow:\\n\\n" ++
+        "STEP 1 - UNDERSTAND:\\n" ++
+        "Say: 'Task: [what user wants]'\\n" ++
+        "Say: 'Plan: [your approach]'\\n\\n" ++
+        "STEP 2 - EXECUTE:\\n" ++
+        "TOOL_CALL [tool] {args}\\n\\n" ++
+        "STEP 3 - LEARN:\\n" ++
+        "Say: 'Found: [key insight from result]'\\n\\n" ++
+        "STEP 4 - NEXT:\\n" ++
+        "Next tool or DONE\\n\\n" ++
+        "SMART RULES:\\n" ++
+        "- Never list same directory twice\\n" ++
+        "- Use read_file, not list_files, to understand code\\n" ++
+        "- Use offset/limit for big files (read_file {path, limit:100})\\n" ++
+        "- paths are relative to cwd, not absolute\\n\\n" ++
+        "Multiple TOOL_CALLs allowed per response.\\n";
 
     return std.fmt.allocPrint(
         allocator,
@@ -534,9 +508,14 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     const config = getProviderConfig(provider_id);
 
     const system_prompt =
-        "You are zagent, an AI coding assistant. ONE file operation per response (read/write/edit/bash). " ++
-        "MULTIPLE todo operations allowed (todo_add/update/list/remove). " ++
-        "Create todos for tasks. Mark todos done after edits. Say DONE when complete.";
+        "STOP LISTING. USE GREP. " ++
+        "1. bash {\"command\":\"rg -l 'keyword' src/\"} to find files. " ++
+        "2. read_file {\"path\":\"src/file.zig\"} to understand. " ++
+        "3. edit to change. " ++
+        "4. bash {\"command\":\"zig build\"} to verify. " ++
+        "5. DONE. " ++
+        "Files are in src/. Never list more than once. One tool per response. " ++
+        "If unclear what user wants, ASK: 'QUESTION: What do you mean by X?' instead of guessing.";
 
     const Message = struct { role: []const u8, content: []const u8 };
     const messages = [_]Message{

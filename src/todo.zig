@@ -158,6 +158,16 @@ pub const TodoList = struct {
         return false;
     }
 
+    pub fn hasInProgressOnly(self: *const TodoList) bool {
+        // Returns true if there are in_progress todos but no pending ones
+        var has_in_progress = false;
+        for (self.items.items) |item| {
+            if (item.status == .pending) return false; // Has pending, not in_progress only
+            if (item.status == .in_progress) has_in_progress = true;
+        }
+        return has_in_progress;
+    }
+
     pub fn markTodosForPath(self: *TodoList, path: ?[]const u8) void {
         const p = path orelse return;
         for (self.items.items) |*item| {

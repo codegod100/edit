@@ -76,7 +76,13 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
         const offset = p.value.offset orelse 0;
         const limit = p.value.limit orelse 8192;
-        return readFileAtPathWithOffset(allocator, path, offset, limit);
+        return readFileAtPathWithOffset(allocator, path, offset, limit) catch |err| {
+            // Return snarky error to guide model back on track
+            if (err == NamedToolError.InvalidArguments) {
+                return std.fmt.allocPrint(allocator, "WTF? '{s}' is outside the workspace! Stay in the current project directory.", .{path});
+            }
+            return std.fmt.allocPrint(allocator, "Bruh, file '{s}' doesn't exist. Did you forget src/ prefix? Error: {s}", .{ path, @errorName(err) });
+        };
     }
 
     if (std.mem.eql(u8, name, "list_files") or std.mem.eql(u8, name, "list")) {
