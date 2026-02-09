@@ -2530,6 +2530,8 @@ fn runModelTurnWithTools(
         // On step 6+, check todos and ask model if we should continue
         if (step >= soft_limit) {
             const todo_summary = todo_list.summary();
+            try stdout.print("{s}[step {d}] Checking if more work needed... (todos: {s}){s}\n", .{ C_DIM, step, todo_summary, C_RESET });
+
             const continue_prompt = try std.fmt.allocPrint(
                 allocator,
                 "{s}\n\n[SYSTEM] You have completed {d} tool steps. Todo status: {s}.\n\nDo you need more steps to complete the task? If yes, make another tool call. If no, provide the final answer.",
@@ -2542,6 +2544,7 @@ fn runModelTurnWithTools(
 
             // If model returns TOOL_CALL, continue the loop
             if (std.mem.startsWith(u8, check_response, "TOOL_CALL ")) {
+                try stdout.print("{s}[step {d}] Model requests more steps{s}\n", .{ C_CYAN, step, C_RESET });
                 allocator.free(context_prompt);
                 context_prompt = try allocator.dupe(u8, check_response);
                 allocator.free(check_response);
@@ -2549,6 +2552,7 @@ fn runModelTurnWithTools(
             }
 
             // Model gave final answer, return it
+            try stdout.print("{s}[step {d}] Model provides final answer{s}\n", .{ C_GREEN, step, C_RESET });
             allocator.free(context_prompt);
             return .{
                 .response = check_response,
@@ -2557,6 +2561,8 @@ fn runModelTurnWithTools(
                 .files_touched = try joinPaths(allocator, paths.items),
             };
         }
+
+        try stdout.print("{s}[step {d}] Routing...{s} ", .{ C_DIM, step, C_RESET });
 
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
@@ -2605,6 +2611,8 @@ fn runModelTurnWithTools(
         }
 
         if (routed == null) {
+            try stdout.print("{s}no tool selected{s}\n", .{ C_YELLOW, C_RESET });
+
             if (mutation_request and tool_calls == 0) {
                 return .{
                     .response = try allocator.dupe(
@@ -2656,6 +2664,7 @@ fn runModelTurnWithTools(
             } else if (step < soft_limit) {
                 // Model returned text but we haven't hit max steps yet
                 // Add response to context and continue the loop
+                try stdout.print("{s}...continuing{s}\n", .{ C_DIM, C_RESET });
                 const next_prompt = try std.fmt.allocPrint(
                     allocator,
                     "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
@@ -2697,6 +2706,7 @@ fn runModelTurnWithTools(
             } else if (step < soft_limit) {
                 // Model returned text but we haven't hit max steps yet
                 // Add response to context and continue the loop
+                try stdout.print("{s}...continuing{s}\n", .{ C_DIM, C_RESET });
                 const next_prompt = try std.fmt.allocPrint(
                     allocator,
                     "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
@@ -2725,6 +2735,7 @@ fn runModelTurnWithTools(
             };
         }
 
+        try stdout.print("{s}→ {s}{s}\n", .{ C_GREEN, routed.?.tool, C_RESET });
         tool_calls += 1;
         if (parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
             if (!containsPath(paths.items, p)) {
