@@ -2515,7 +2515,10 @@ fn runModelTurnWithTools(
         paths.deinit(allocator);
     }
 
-    while (true) {
+    const max_iterations: usize = 20; // Safety limit to prevent infinite loops
+    var iteration: usize = 0;
+
+    while (iteration < max_iterations) : (iteration += 1) {
         // Check for cancellation
         if (isCancelled()) {
             allocator.free(context_prompt);
@@ -2597,6 +2600,15 @@ fn runModelTurnWithTools(
             context_prompt = next_prompt;
         }
     }
+
+    // Hit max iterations - return what we have
+    allocator.free(context_prompt);
+    return .{
+        .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
+        .tool_calls = tool_calls,
+        .error_count = 0,
+        .files_touched = try joinPaths(allocator, paths.items),
+    };
 }
 
 fn executeSingleToolCall(allocator: std.mem.Allocator, stdout: anytype, line: []const u8, todo_list: *todo.TodoList, paths: *std.ArrayList([]u8)) !?[]u8 {

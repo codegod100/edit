@@ -34,6 +34,13 @@ pub const TodoList = struct {
     }
 
     pub fn add(self: *TodoList, description: []const u8) ![]const u8 {
+        // Check for duplicates
+        for (self.items.items) |item| {
+            if (std.mem.eql(u8, item.description, description) and item.status != .done) {
+                return item.id; // Return existing todo ID
+            }
+        }
+
         const timestamp = std.time.milliTimestamp();
         const id = try std.fmt.allocPrint(self.allocator, "{d}", .{timestamp});
 
