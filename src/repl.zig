@@ -2891,7 +2891,7 @@ fn runWithBridge(
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent. Use tools to help. Say DONE when finished.");
+    try writeJsonString(w, "You are zagent, an AI coding assistant. Use tools to help. Use 'read_file' with 'offset' and 'limit' for large files to avoid huge payloads. Say DONE when finished.");
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");

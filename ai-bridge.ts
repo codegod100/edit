@@ -80,9 +80,11 @@ const tools = {
     }),
   },
   read: {
-    description: "Read a file and return its contents.",
+    description: "Read a file and return its contents. Supports partial reads with offset/limit.",
     parameters: z.object({
       filePath: z.string().describe("The path to the file"),
+      offset: z.number().int().optional().describe("Byte offset to start reading from"),
+      limit: z.number().int().optional().describe("Maximum bytes to read"),
     }),
   },
   list: {
