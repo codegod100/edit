@@ -1474,14 +1474,25 @@ fn envPairsForProviders(
     errdefer out.deinit(allocator);
 
     for (providers) |provider| {
+        // Always include opencode even without API key (free tier uses "public")
+        const is_opencode = std.mem.eql(u8, provider.id, "opencode");
+        var found_any = false;
+
         for (provider.env_vars) |name| {
             for (stored) |pair| {
                 if (std.mem.eql(u8, pair.name, name)) {
                     try out.append(allocator, .{ .name = pair.name, .value = pair.value });
+                    found_any = true;
                 }
             }
             const value = std.posix.getenv(name) orelse continue;
             try out.append(allocator, .{ .name = name, .value = value });
+            found_any = true;
+        }
+
+        // For opencode, add a placeholder if no key found so it passes through
+        if (is_opencode and !found_any and provider.env_vars.len > 0) {
+            try out.append(allocator, .{ .name = provider.env_vars[0], .value = "" });
         }
     }
 

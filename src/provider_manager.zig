@@ -43,9 +43,9 @@ pub const ProviderManager = struct {
         for (specs) |spec| {
             if (!isAllowed(spec.id, options)) continue;
 
-            const found_value = findEnvValue(spec.env_vars, env);
             // Allow opencode without API key for free tier models
             const is_opencode = std.mem.eql(u8, spec.id, "opencode");
+            const found_value = findEnvValue(spec.env_vars, env, is_opencode);
             if (found_value == null and !is_opencode) continue;
 
             const single_key = if (spec.env_vars.len == 1) found_value else null;
@@ -103,10 +103,13 @@ fn containsString(list: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn findEnvValue(names: []const []const u8, env: []const EnvPair) ?[]const u8 {
+fn findEnvValue(names: []const []const u8, env: []const EnvPair, is_opencode: bool) ?[]const u8 {
     for (names) |name| {
         for (env) |pair| {
-            if (std.mem.eql(u8, pair.name, name) and pair.value.len > 0) return pair.value;
+            if (std.mem.eql(u8, pair.name, name)) {
+                // For opencode, allow empty value (free tier uses "public" key)
+                if (is_opencode or pair.value.len > 0) return pair.value;
+            }
         }
     }
     return null;
