@@ -70,10 +70,10 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     }
 
     if (std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read")) {
-        const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null, offset: ?usize = null, limit: ?usize = null };
+        const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null, file_path: ?[]const u8 = null, file_name: ?[]const u8 = null, offset: ?usize = null, limit: ?usize = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
-        const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
+        const path = p.value.path orelse p.value.filePath orelse p.value.file_path orelse p.value.file_name orelse return NamedToolError.InvalidArguments;
         const offset = p.value.offset orelse 0;
         const limit = p.value.limit orelse 4096;
         return readFileAtPathWithOffset(allocator, path, offset, limit) catch |err| {
