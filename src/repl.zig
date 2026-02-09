@@ -2507,7 +2507,7 @@ fn runModelTurnWithTools(
     todo_list: *todo.TodoList,
 ) !RunTurnResult {
     var context_prompt = try allocator.dupe(u8, user_input);
-    defer allocator.free(context_prompt);
+    // We'll manually free context_prompt before each reassignment and at function exit
     var forced_repo_probe_done = false;
     var forced_mutation_probe_done = false;
     var forced_completion_probe_done = false;
@@ -2527,6 +2527,7 @@ fn runModelTurnWithTools(
     while (true) : (step += 1) {
         // Check for cancellation at start of each iteration
         if (isCancelled()) {
+            allocator.free(context_prompt);
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
                 .tool_calls = tool_calls,
@@ -2626,6 +2627,7 @@ fn runModelTurnWithTools(
             try stdout.print("{s}no tool selected{s}\n", .{ C_YELLOW, C_RESET });
 
             if (mutation_request and tool_calls == 0) {
+                allocator.free(context_prompt);
                 return .{
                     .response = try allocator.dupe(
                         u8,
@@ -2642,6 +2644,7 @@ fn runModelTurnWithTools(
                 defer touched.deinit(allocator);
                 for (paths.items) |p| try touched.append(allocator, p);
                 if (hasUnmetRequiredEdits(raw_user_request, touched.items) or (multi_step_mutation and tool_calls < 2)) {
+                    allocator.free(context_prompt);
                     return .{
                         .response = try allocator.dupe(
                             u8,
@@ -2687,6 +2690,7 @@ fn runModelTurnWithTools(
                 continue;
             }
 
+            allocator.free(context_prompt);
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2708,6 +2712,7 @@ fn runModelTurnWithTools(
                 allocator.free(final);
                 if (tool_result) |result| {
                     allocator.free(result);
+                    allocator.free(context_prompt);
                     return .{
                         .response = try allocator.dupe(u8, "Executed tool from model response."),
                         .tool_calls = tool_calls,
@@ -2729,6 +2734,7 @@ fn runModelTurnWithTools(
                 continue;
             }
 
+            allocator.free(context_prompt);
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2739,6 +2745,7 @@ fn runModelTurnWithTools(
 
         // Check for cancellation before executing tool
         if (isCancelled()) {
+            allocator.free(context_prompt);
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user during tool execution."),
                 .tool_calls = tool_calls,
@@ -2775,6 +2782,7 @@ fn runModelTurnWithTools(
             defer allocator.free(err_line);
             if (file_path) |fp| allocator.free(fp);
             try stdout.print("{s}\n", .{err_line});
+            allocator.free(context_prompt);
             return .{
                 .response = try std.fmt.allocPrint(
                     allocator,
