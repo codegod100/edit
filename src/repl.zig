@@ -2991,7 +2991,7 @@ fn runWithBridge(
 
             // Add tool result to history
             try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":\"");
-            try w.writeAll(tc.id);
+            try writeJsonString(w, tc.id);
             try w.writeAll("\",\"content\":\"");
             try writeJsonString(w, result);
             try w.writeAll("\"}");

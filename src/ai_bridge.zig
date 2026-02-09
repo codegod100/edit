@@ -76,24 +76,20 @@ pub const Bridge = struct {
     }
 
     fn readStderr(stderr_file: std.fs.File) void {
-        var buf: [1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
+        const allocator = std.heap.page_allocator;
         const stderr_reader = if (@hasDecl(std.fs.File, "deprecatedReader"))
             stderr_file.deprecatedReader()
         else
             stderr_file.reader();
 
         while (true) {
-            const byte = stderr_reader.readByte() catch break;
-            if (byte == '\n') {
-                const line = fbs.getWritten();
-                if (line.len > 0) {
-                    logger.info("Bridge: {s}", .{line});
+            const line = stderr_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 1024 * 1024) catch break;
+            if (line) |l| {
+                defer allocator.free(l);
+                if (l.len > 0) {
+                    logger.info("Bridge: {s}", .{l});
                 }
-                fbs.reset();
-            } else {
-                fbs.writer().writeByte(byte) catch break;
-            }
+            } else break;
         }
     }
 
@@ -112,12 +108,23 @@ pub const Bridge = struct {
             stdout_file.reader();
 
         // Send request
-        const request = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"chat\",\"messages\":{s},\"maxSteps\":{d}}}\n", .{ messages, max_steps });
-        defer self.allocator.free(request);
+        var request_buf = std.ArrayListUnmanaged(u8).empty;
+        defer request_buf.deinit(self.allocator);
+        const w = request_buf.writer(self.allocator);
+        try w.writeAll("{\"type\":\"chat\",\"messages\":");
+        try w.writeAll(messages);
+        try w.print(",\"maxSteps\":{d}}}", .{max_steps});
+        try w.writeByte('\n');
 
-        logger.info("Sending request: {s}", .{request});
+        logger.info("Sending request: {s}", .{request_buf.items});
 
-        try stdin_writer.writeAll(request);
+        const debug_file = std.fs.cwd().createFile("debug_payload.json", .{}) catch null;
+        if (debug_file) |f| {
+            f.writeAll(request_buf.items) catch {};
+            f.close();
+        }
+
+        try stdin_writer.writeAll(request_buf.items);
 
         logger.info("Request sent, waiting for response...", .{});
 

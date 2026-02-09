@@ -155,7 +155,11 @@ function normalizeMessages(messages: any[]): CoreMessage[] {
           if (typeof args === 'string') {
             try { args = JSON.parse(args); } catch (e) { args = {}; }
           } else if (tc.function && tc.function.arguments) {
-            try { args = JSON.parse(tc.function.arguments); } catch (e) { args = {}; }
+            if (typeof tc.function.arguments === 'string') {
+              try { args = JSON.parse(tc.function.arguments); } catch (e) { args = {}; }
+            } else {
+              args = tc.function.arguments;
+            }
           }
           
           if (id && name) toolCallMap.set(id, name);
@@ -260,6 +264,7 @@ const rl = readline.createInterface({
 
 rl.on('line', async (line) => {
   if (!line.trim()) return;
+  console.error(`Received payload: ${line.length} bytes`);
   try {
     const request = JSON.parse(line);
     if (request.type === "chat") {
@@ -267,7 +272,7 @@ rl.on('line', async (line) => {
       console.log(JSON.stringify(response));
     }
   } catch (e: any) {
-    console.error(`Parse Error: ${e.message} (line: ${line})`);
+    console.error(`Parse Error: ${e.message} (line length: ${line.length})`);
     console.log(JSON.stringify({ type: "error", err: e.message }));
   }
 });
