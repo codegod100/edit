@@ -1,0 +1,16 @@
+{
+  "name": "zagent-ai-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/amazon-bedrock": "^4.0.52",
+    "@ai-sdk/anthropic": "^3.0.39",
+    "@ai-sdk/google": "^3.0.22",
+    "@ai-sdk/openai": "^3.0.26",
+    "@ai-sdk/openai-compatible": "^2.0.28",
+    "@opencode-ai/sdk": "^1.1.53",
+    "ai": "^6.0.77",
+    "openai": "^6.18.0",
+    "zod": "^3.25.76"
+  }
+}

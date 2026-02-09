@@ -8,6 +8,7 @@ const llm = @import("llm.zig");
 const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
 const todo = @import("todo.zig");
+const ai_bridge = @import("ai_bridge.zig");
 
 // Global cancellation flag for interrupting work
 var g_cancel_requested: bool = false;
@@ -753,9 +754,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const skill_list = try skills.discover(allocator, cwd, home);
     defer skills.freeList(allocator, skill_list);
 
-    const providers_owned = try catalog.loadProviderSpecs(allocator, config_dir);
-    defer catalog.freeProviderSpecs(allocator, providers_owned);
-    const providers = if (providers_owned.len > 0) providers_owned else defaultProviderSpecs();
+    const providers = defaultProviderSpecs();
     var stored_pairs = try store.load(allocator, config_dir);
     defer store.free(allocator, stored_pairs);
 
@@ -1037,7 +1036,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runModelTurnWithTools(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
+                var turn = runWithBridge(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -1714,6 +1713,23 @@ fn defaultProviderSpecs() []const pm.ProviderSpec {
             .models = &.{
                 .{ .id = "gemini-2.5-pro", .display_name = "Gemini 2.5 Pro" },
                 .{ .id = "gemini-2.5-flash", .display_name = "Gemini 2.5 Flash" },
+            },
+        },
+        .{
+            .id = "openrouter",
+            .display_name = "OpenRouter",
+            .env_vars = &.{"OPENROUTER_API_KEY"},
+            .models = &.{
+                .{ .id = "anthropic/claude-3.5-sonnet", .display_name = "Claude 3.5 Sonnet" },
+                .{ .id = "google/gemini-2.0-flash-001", .display_name = "Gemini 2.0 Flash" },
+            },
+        },
+        .{
+            .id = "opencode",
+            .display_name = "OpenCode",
+            .env_vars = &.{"OPENCODE_API_KEY"},
+            .models = &.{
+                .{ .id = "kimi-k2.5", .display_name = "Kimi K2.5" },
             },
         },
     };
@@ -2486,6 +2502,25 @@ fn containsPath(paths: []const []u8, candidate: []const u8) bool {
     return false;
 }
 
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '\"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (ch < 32) {
+                    try w.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try w.writeByte(ch);
+                }
+            },
+        }
+    }
+}
+
 fn joinPaths(allocator: std.mem.Allocator, paths: []const []u8) !?[]u8 {
     if (paths.len == 0) return null;
     var out = std.ArrayList(u8).empty;
@@ -2824,6 +2859,160 @@ fn runModelTurnWithTools(
         allocator.free(context_prompt);
         context_prompt = next_prompt;
     }
+}
+
+// Simplified bridge-based tool loop - uses Bun AI SDK
+fn runWithBridge(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    active: ActiveModel,
+    raw_user_request: []const u8,
+    user_input: []const u8,
+    todo_list: *todo.TodoList,
+) !RunTurnResult {
+    _ = raw_user_request;
+
+    // Check API key
+    const api_key = active.api_key orelse {
+        return .{
+            .response = try allocator.dupe(u8, "No API key configured. Run /providers to connect."),
+            .tool_calls = 0,
+            .error_count = 1,
+            .files_touched = null,
+        };
+    };
+
+    // Spawn the Bun AI bridge
+    var bridge = try ai_bridge.Bridge.spawn(allocator, api_key, active.model_id, active.provider_id);
+    defer bridge.deinit();
+
+    // Build initial messages
+    var messages = std.ArrayList(u8).empty;
+    defer messages.deinit(allocator);
+    const w = messages.writer(allocator);
+    try w.writeAll("[{\"role\":\"system\",\"content\":\"");
+    try writeJsonString(w, "You are zagent. Use tools to help. Say DONE when finished.");
+    try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
+    try writeJsonString(w, user_input);
+    try w.writeAll("\"}");
+
+    var tool_calls: usize = 0;
+    var paths = std.ArrayList([]u8).empty;
+    defer {
+        for (paths.items) |p| allocator.free(p);
+        paths.deinit(allocator);
+    }
+
+    const max_iterations: usize = 15;
+    var iteration: usize = 0;
+
+    while (iteration < max_iterations) : (iteration += 1) {
+        // Check for cancellation
+        if (isCancelled()) {
+            return .{
+                .response = try allocator.dupe(u8, "Operation cancelled by user."),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
+        }
+
+        try stdout.print("{s}[step {d}]{s} ", .{ C_DIM, iteration, C_RESET });
+
+        // Send current messages (add closing bracket)
+        const messages_json = try std.fmt.allocPrint(allocator, "{s}]", .{messages.items});
+        defer allocator.free(messages_json);
+
+        // Call the bridge
+        const response = try bridge.chat(messages_json, max_iterations - iteration);
+        defer {
+            allocator.free(response.text);
+            allocator.free(response.finish_reason);
+            for (response.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.tool);
+                allocator.free(tc.args);
+            }
+            allocator.free(response.tool_calls);
+        }
+
+        // Show model text
+        if (response.text.len > 0) {
+            try stdout.print("{s}\n", .{response.text});
+        }
+
+        // Add assistant message to history
+        try w.writeAll(",{\"role\":\"assistant\",\"content\":\"");
+        try writeJsonString(w, response.text);
+        try w.writeAll("\"");
+
+        if (response.tool_calls.len > 0) {
+            try w.writeAll(",\"tool_calls\":[");
+            for (response.tool_calls, 0..) |tc, i| {
+                if (i > 0) try w.writeAll(",");
+                try w.print("{{\"id\":\"{s}\",\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"arguments\":", .{ tc.id, tc.tool });
+                try w.writeAll(tc.args);
+                try w.writeAll("}}}");
+            }
+            try w.writeAll("]");
+        }
+        try w.writeAll("}");
+
+        // Execute all tool calls
+        if (response.tool_calls.len == 0) {
+            // No tools - we're done
+            return .{
+                .response = try allocator.dupe(u8, response.text),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
+        }
+
+        for (response.tool_calls) |tc| {
+            tool_calls += 1;
+            try stdout.print("{s}→ {s}{s}", .{ C_GREEN, tc.tool, C_RESET });
+
+            const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
+                try stdout.print(" error: {s}\n", .{@errorName(err)});
+                const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
+                defer allocator.free(err_msg);
+                
+                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":\"");
+                try w.writeAll(tc.id);
+                try w.writeAll("\",\"content\":\"");
+                try writeJsonString(w, err_msg);
+                try w.writeAll("\"}");
+                continue;
+            };
+            defer allocator.free(result);
+
+            try stdout.print("\n{s}\n", .{result});
+
+            // Add tool result to history
+            try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":\"");
+            try w.writeAll(tc.id);
+            try w.writeAll("\",\"content\":\"");
+            try writeJsonString(w, result);
+            try w.writeAll("\"}");
+
+            // Track paths
+            if (parsePrimaryPathFromArgs(allocator, tc.args)) |p| {
+                if (!containsPath(paths.items, p)) {
+                    try paths.append(allocator, p);
+                } else {
+                    allocator.free(p);
+                }
+            }
+        }
+    }
+
+    return .{
+        .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
+        .tool_calls = tool_calls,
+        .error_count = 0,
+        .files_touched = try joinPaths(allocator, paths.items),
+    };
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {

@@ -249,7 +249,12 @@ fn readFileAtPathWithOffset(allocator: std.mem.Allocator, path: []const u8, offs
     const bytes_to_read = @min(limit, bytes_remaining);
 
     // Read the content
-    const content = try file.readToEndAlloc(allocator, bytes_to_read);
+    const content = try allocator.alloc(u8, bytes_to_read);
+    const len = try file.readAll(content);
+    if (len < bytes_to_read) {
+        const trimmed = try allocator.realloc(content, len);
+        return trimmed;
+    }
 
     // If we only read part of the file, add a note
     if (offset > 0 or content.len < bytes_remaining) {

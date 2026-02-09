@@ -32,4 +32,5 @@ test {
     _ = @import("provider_manager.zig");
     _ = @import("provider_store.zig");
     _ = @import("logger.zig");
+    _ = @import("ai_bridge.zig");
 }
