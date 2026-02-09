@@ -15,8 +15,8 @@ pub fn free(allocator: std.mem.Allocator, pairs: []StoredPair) void {
     allocator.free(pairs);
 }
 
-pub fn load(allocator: std.mem.Allocator, cwd: []const u8) ![]StoredPair {
-    const path = try storePathAlloc(allocator, cwd);
+pub fn load(allocator: std.mem.Allocator, base_path: []const u8) ![]StoredPair {
+    const path = try storePathAlloc(allocator, base_path);
     defer allocator.free(path);
 
     const content = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -31,8 +31,8 @@ pub fn load(allocator: std.mem.Allocator, cwd: []const u8) ![]StoredPair {
     return parseContent(allocator, data);
 }
 
-pub fn upsertFile(allocator: std.mem.Allocator, cwd: []const u8, name: []const u8, value: []const u8) !void {
-    var pairs = try load(allocator, cwd);
+pub fn upsertFile(allocator: std.mem.Allocator, base_path: []const u8, name: []const u8, value: []const u8) !void {
+    var pairs = try load(allocator, base_path);
     defer free(allocator, pairs);
 
     var found = false;
@@ -53,7 +53,7 @@ pub fn upsertFile(allocator: std.mem.Allocator, cwd: []const u8, name: []const u
         };
     }
 
-    const path = try storePathAlloc(allocator, cwd);
+    const path = try storePathAlloc(allocator, base_path);
     defer allocator.free(path);
 
     const dir_path = std.fs.path.dirname(path) orelse return;
@@ -98,8 +98,8 @@ fn parseContent(allocator: std.mem.Allocator, content: []const u8) ![]StoredPair
     return out.toOwnedSlice(allocator);
 }
 
-fn storePathAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ cwd, ".zagent", "providers.env" });
+fn storePathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, "providers.env" });
 }
 
 test "upsert file stores and updates provider key" {

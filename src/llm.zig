@@ -6,6 +6,22 @@ pub const QueryError = error{
     EmptyModelResponse,
 };
 
+pub const ToolRouteDef = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
+};
+
+pub const ToolRouteCall = struct {
+    tool: []u8,
+    arguments_json: []u8,
+
+    pub fn deinit(self: ToolRouteCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool);
+        allocator.free(self.arguments_json);
+    }
+};
+
 const OPENAI_API_ENDPOINT = "https://api.openai.com/v1/responses";
 const OPENAI_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
 
@@ -132,6 +148,120 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
         return std.fmt.allocPrint(allocator, "No text found in model response: {s}", .{output[0..cap]});
     }
     return QueryError.EmptyModelResponse;
+}
+
+pub fn inferToolCall(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    api_key: ?[]const u8,
+    model_id: []const u8,
+    prompt: []const u8,
+    defs: []const ToolRouteDef,
+) !?ToolRouteCall {
+    if (!std.mem.eql(u8, provider_id, "openai")) return null;
+    const key = api_key orelse return QueryError.MissingApiKey;
+
+    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
+    defer allocator.free(auth);
+
+    const endpoint = if (isLikelyOAuthToken(key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
+    const stream = std.mem.eql(u8, endpoint, OPENAI_CODEX_ENDPOINT);
+    const body = try buildOpenAIToolRouteBody(allocator, model_id, prompt, defs, stream);
+    defer allocator.free(body);
+
+    const output = try runCommandCapture(allocator, &.{
+        "curl",               "-sS",                            "-X", "POST", endpoint,
+        "-H",                 "Content-Type: application/json", "-H", auth,   "-H",
+        "originator: zagent", "-d",                             body,
+    });
+    defer allocator.free(output);
+
+    return parseOpenAIFunctionCall(allocator, output);
+}
+
+fn buildOpenAIToolRouteBody(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    prompt: []const u8,
+    defs: []const ToolRouteDef,
+    stream: bool,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("{{\"model\":\"{s}\",\"instructions\":\"You are a tool router. If a local tool should be used, emit a function call. Otherwise answer normally.\",\"input\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"{s}\"}}]}}],\"tools\":[", .{ model_id, prompt });
+    for (defs, 0..) |d, i| {
+        if (i > 0) try w.print(",", .{});
+        try w.print("{{\"type\":\"function\",\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{s},\"strict\":true}}", .{ d.name, d.description, d.parameters_json });
+    }
+    try w.print("],\"tool_choice\":\"auto\",\"store\":false,\"stream\":{s}}}", .{if (stream) "true" else "false"});
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn parseOpenAIFunctionCall(allocator: std.mem.Allocator, raw: []const u8) !?ToolRouteCall {
+    const OutputItem = struct {
+        type: ?[]const u8 = null,
+        name: ?[]const u8 = null,
+        arguments: ?[]const u8 = null,
+    };
+    const Resp = struct { output: ?[]const OutputItem = null };
+
+    if (std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value.output) |items| {
+            for (items) |item| {
+                if (item.type != null and std.mem.eql(u8, item.type.?, "function_call") and item.name != null and item.arguments != null) {
+                    return .{
+                        .tool = try allocator.dupe(u8, item.name.?),
+                        .arguments_json = try allocator.dupe(u8, item.arguments.?),
+                    };
+                }
+            }
+        }
+    } else |_| {}
+
+    var current_name: ?[]u8 = null;
+    defer if (current_name) |n| allocator.free(n);
+    var args = std.ArrayList(u8).empty;
+    defer args.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "data:")) continue;
+        const payload = std.mem.trim(u8, line[5..], " \t");
+        if (payload.len == 0 or std.mem.eql(u8, payload, "[DONE]")) continue;
+
+        const SSEEvent = struct {
+            type: ?[]const u8 = null,
+            delta: ?[]const u8 = null,
+            item: ?OutputItem = null,
+        };
+        var ev = std.json.parseFromSlice(SSEEvent, allocator, payload, .{ .ignore_unknown_fields = true }) catch continue;
+        defer ev.deinit();
+
+        if (ev.value.item) |item| {
+            if (item.type != null and std.mem.eql(u8, item.type.?, "function_call")) {
+                if (current_name) |n| allocator.free(n);
+                current_name = if (item.name) |n| try allocator.dupe(u8, n) else null;
+                if (item.arguments) |a| try args.appendSlice(allocator, a);
+            }
+        }
+        if (ev.value.type) |t| {
+            if (std.mem.endsWith(u8, t, "function_call_arguments.delta")) {
+                if (ev.value.delta) |d| try args.appendSlice(allocator, d);
+            }
+        }
+    }
+
+    if (current_name != null and args.items.len > 0) {
+        return .{
+            .tool = try allocator.dupe(u8, current_name.?),
+            .arguments_json = try allocator.dupe(u8, args.items),
+        };
+    }
+    return null;
 }
 
 fn buildOpenAIRequestBody(allocator: std.mem.Allocator, model_id: []const u8, prompt: []const u8, stream: bool) ![]u8 {
@@ -413,6 +543,34 @@ test "extract stream text from sse data lines" {
     const out = try extractOpenAIStreamText(allocator, raw);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "parse function call from json output" {
+    const allocator = std.testing.allocator;
+    const raw = "{\"output\":[{\"type\":\"function_call\",\"name\":\"bash\",\"arguments\":\"{\\\"input\\\":\\\"ls\\\"}\"}]}";
+    const call = try parseOpenAIFunctionCall(allocator, raw);
+    try std.testing.expect(call != null);
+    defer {
+        var c = call.?;
+        c.deinit(allocator);
+    }
+    try std.testing.expectEqualStrings("bash", call.?.tool);
+    try std.testing.expect(std.mem.indexOf(u8, call.?.arguments_json, "\"input\":\"ls\"") != null);
+}
+
+test "parse function call from sse deltas" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "data: {\"item\":{\"type\":\"function_call\",\"name\":\"read\",\"arguments\":\"{\\\"input\\\":\\\"src/\"}}\n" ++
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"main.zig\\\"}\"}\n";
+    const call = try parseOpenAIFunctionCall(allocator, raw);
+    try std.testing.expect(call != null);
+    defer {
+        var c = call.?;
+        c.deinit(allocator);
+    }
+    try std.testing.expectEqualStrings("read", call.?.tool);
+    try std.testing.expect(std.mem.indexOf(u8, call.?.arguments_json, "src/main.zig") != null);
 }
 
 test "extract stream text from event plus data lines" {

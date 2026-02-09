@@ -120,7 +120,7 @@ const CommandHistory = struct {
     items: std.ArrayList([]u8),
 
     fn init() CommandHistory {
-        return .{ .items = std.ArrayList([]u8).empty };
+        return .{ .items = .{} };
     }
 
     fn deinit(self: *CommandHistory, allocator: std.mem.Allocator) void {
@@ -135,6 +135,53 @@ const CommandHistory = struct {
         try self.items.append(allocator, try allocator.dupe(u8, trimmed));
     }
 };
+
+fn historyPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, "history" });
+}
+
+fn loadHistory(allocator: std.mem.Allocator, base_path: []const u8, history: *CommandHistory) !void {
+    const path = try historyPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const text = try file.readToEndAlloc(allocator, 2 * 1024 * 1024);
+    defer allocator.free(text);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try history.append(allocator, line);
+    }
+}
+
+fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, line: []const u8) !void {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    const path = try historyPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => try std.fs.createFileAbsolute(path, .{}),
+        else => return err,
+    };
+    defer file.close();
+
+    try file.seekFromEnd(0);
+    try file.writeAll(trimmed);
+    try file.writeAll("\n");
+}
 
 fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
     if (entries.len == 0) return null;
@@ -211,21 +258,24 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-    const project_name = std.fs.path.basename(cwd);
-    const prompt_text = if (project_name.len > 0)
-        try std.fmt.allocPrint(allocator, "{s}> ", .{project_name})
+    const prompt_text = if (cwd.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}> ", .{cwd})
     else
         try allocator.dupe(u8, "> ");
     defer allocator.free(prompt_text);
 
     const home = std.posix.getenv("HOME") orelse "";
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
+    defer allocator.free(config_dir);
+    try std.fs.cwd().makePath(config_dir);
+
     const skill_list = try skills.discover(allocator, cwd, home);
     defer skills.freeList(allocator, skill_list);
 
     const providers_owned = try catalog.loadProviderSpecs(allocator);
     defer catalog.freeProviderSpecs(allocator, providers_owned);
     const providers = if (providers_owned.len > 0) providers_owned else defaultProviderSpecs();
-    var stored_pairs = try store.load(allocator, cwd);
+    var stored_pairs = try store.load(allocator, config_dir);
     defer store.free(allocator, stored_pairs);
 
     var provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
@@ -233,10 +283,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     var history = CommandHistory.init();
     defer history.deinit(allocator);
+    try loadHistory(allocator, config_dir, &history);
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
-    const persisted_model = try config_store.loadSelectedModel(allocator, cwd);
+    const persisted_model = try config_store.loadSelectedModel(allocator, config_dir);
     if (persisted_model) |persisted| {
         selected_model = .{
             .provider_id = persisted.provider_id,
@@ -258,7 +309,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const line = line_opt.?;
         defer allocator.free(line);
 
+        const prev_history_len = history.items.items.len;
         try history.append(allocator, line);
+        if (history.items.items.len > prev_history_len) {
+            try appendHistoryLine(allocator, config_dir, line);
+        }
 
         const normalized = autocompleteCommand(line);
         if (!std.mem.eql(u8, normalized, std.mem.trim(u8, line, " \t\r\n"))) {
@@ -373,11 +428,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     key_slice = key;
                 }
 
-                try store.upsertFile(allocator, cwd, env_name, key_slice);
-                try stdout.print("Stored {s} in .zagent/providers.env\n", .{env_name});
+                try store.upsertFile(allocator, config_dir, env_name, key_slice);
+                try stdout.print("Stored {s} in {s}/providers.env\n", .{ env_name, config_dir });
 
                 store.free(allocator, stored_pairs);
-                stored_pairs = try store.load(allocator, cwd);
+                stored_pairs = try store.load(allocator, config_dir);
 
                 pm.ProviderManager.freeResolved(allocator, provider_states);
                 provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
@@ -399,7 +454,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                         .provider_id = try allocator.dupe(u8, picked.?.provider_id),
                         .model_id = try allocator.dupe(u8, picked.?.model_id),
                     };
-                    try config_store.saveSelectedModel(allocator, cwd, .{
+                    try config_store.saveSelectedModel(allocator, config_dir, .{
                         .provider_id = picked.?.provider_id,
                         .model_id = picked.?.model_id,
                     });
@@ -426,7 +481,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     .provider_id = try allocator.dupe(u8, p.provider_id),
                     .model_id = try allocator.dupe(u8, p.model_id),
                 };
-                try config_store.saveSelectedModel(allocator, cwd, .{
+                try config_store.saveSelectedModel(allocator, config_dir, .{
                     .provider_id = p.provider_id,
                     .model_id = p.model_id,
                 });
@@ -442,36 +497,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
                 const active = chooseActiveModel(providers, provider_states, selected_model);
 
-                const auto_tool = if (active) |a|
-                    try inferToolCallSpecWithModel(allocator, a, trimmed)
-                else
-                    null;
-                if (auto_tool) |spec| {
-                    defer allocator.free(spec);
-                    const output = tools.execute(allocator, spec) catch |err| {
-                        try stdout.print("Tool failed: {s}\n", .{@errorName(err)});
-                        continue;
-                    };
-                    defer allocator.free(output);
-                    if (output.len == 0) {
-                        try stdout.print("(no output)\n", .{});
-                    } else {
-                        try stdout.print("{s}\n", .{output});
-                    }
-                    continue;
-                }
                 if (active == null) {
                     try stdout.print("No connected providers. Run /providers then /connect <provider-id>.\n", .{});
                     continue;
                 }
 
-                const response = llm.query(
-                    allocator,
-                    active.?.provider_id,
-                    active.?.api_key,
-                    active.?.model_id,
-                    trimmed,
-                ) catch |err| {
+                const response = runModelTurnWithTools(allocator, stdout, active.?, trimmed) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -741,37 +772,67 @@ test "auto pick single model when only one match" {
     try std.testing.expectEqualStrings("gpt-5.3-codex", picked.?.model_id);
 }
 
-test "infer tool call spec for list files prompt" {
-    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":true,\"tool\":\"bash\",\"input\":\"ls -la .\"}");
-    try std.testing.expect(decision != null);
-    defer if (decision) |d| d.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("bash", decision.?.tool.?);
+test "known tool name accepts supported tools" {
+    try std.testing.expect(isKnownToolName("bash"));
+    try std.testing.expect(isKnownToolName("read_file"));
+    try std.testing.expect(isKnownToolName("replace_in_file"));
 }
 
-test "infer tool call spec includes explicit path" {
-    const decision = try parseToolDecisionJson(std.testing.allocator, "```json\n{\"call\":true,\"tool\":\"read\",\"input\":\"src/main.zig\"}\n```");
-    try std.testing.expect(decision != null);
-    defer if (decision) |d| d.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("read", decision.?.tool.?);
+test "known tool name rejects unknown tools" {
+    try std.testing.expect(!isKnownToolName("read"));
+    try std.testing.expect(!isKnownToolName("invalid"));
 }
 
-test "infer tool call spec returns null for normal chat" {
-    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":false}");
-    try std.testing.expect(decision != null);
-    defer if (decision) |d| d.deinit(std.testing.allocator);
-    try std.testing.expect(!decision.?.call);
+test "tool routing prompt includes codebase analysis guidance" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildToolRoutingPrompt(allocator, "how does the new file edit harness work?");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Use local tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "list_files") != null);
+}
+
+test "tool routing prompt preserves original user request" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildToolRoutingPrompt(allocator, "explain src/repl.zig flow");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "explain src/repl.zig flow") != null);
+}
+
+test "strict routing prompt requires at least one read or list" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildStrictToolRoutingPrompt(allocator, "how does the harness work?");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "must call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "list_files") != null);
+}
+
+test "repo specific detector catches codebase questions" {
+    try std.testing.expect(isLikelyRepoSpecificQuestion("how does the new file edit harness work?"));
+    try std.testing.expect(isLikelyRepoSpecificQuestion("explain src/repl.zig"));
+    try std.testing.expect(isLikelyRepoSpecificQuestion("what does function runModelTurnWithTools do"));
+}
+
+test "repo specific detector ignores generic questions" {
+    try std.testing.expect(!isLikelyRepoSpecificQuestion("what is a monad"));
+    try std.testing.expect(!isLikelyRepoSpecificQuestion("write a haiku"));
 }
 
 test "infer tool call spec for system time prompt" {
-    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":true,\"tool\":\"bash\",\"input\":\"date +%T\"}");
-    try std.testing.expect(decision != null);
-    defer if (decision) |d| d.deinit(std.testing.allocator);
-    try std.testing.expect(decision.?.call);
+    const sample = "{\"output\":[{\"type\":\"function_call\",\"name\":\"bash\",\"arguments\":\"{\\\"input\\\":\\\"date +%T\\\"}\"}]}";
+    const parsed = try llm.parseOpenAIFunctionCall(std.testing.allocator, sample);
+    try std.testing.expect(parsed != null);
+    defer if (parsed) |p| p.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("bash", parsed.?.tool);
 }
 
 test "infer tool call spec for time not date followup" {
-    const decision = try parseToolDecisionJson(std.testing.allocator, "hello");
-    try std.testing.expect(decision == null);
+    const parsed = try llm.parseOpenAIFunctionCall(std.testing.allocator, "hello");
+    try std.testing.expect(parsed == null);
 }
 
 test "history navigation moves through entries with up and down" {
@@ -788,6 +849,42 @@ test "history navigation moves through entries with up and down" {
 
     const to_current = historyNextIndex(&entries, down, .down);
     try std.testing.expectEqual(@as(?usize, null), to_current);
+}
+
+test "history persistence loads prior session entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try appendHistoryLine(allocator, root, "/providers");
+    try appendHistoryLine(allocator, root, "/tools");
+
+    var history = CommandHistory.init();
+    defer history.deinit(allocator);
+    try loadHistory(allocator, root, &history);
+
+    try std.testing.expectEqual(@as(usize, 2), history.items.items.len);
+    try std.testing.expectEqualStrings("/providers", history.items.items[0]);
+    try std.testing.expectEqualStrings("/tools", history.items.items[1]);
+}
+
+test "history append ignores empty lines" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try appendHistoryLine(allocator, root, "   \n");
+
+    var history = CommandHistory.init();
+    defer history.deinit(allocator);
+    try loadHistory(allocator, root, &history);
+    try std.testing.expectEqual(@as(usize, 0), history.items.items.len);
 }
 
 fn commandNames() []const []const u8 {
@@ -1116,66 +1213,121 @@ fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
     return if (options.len == 1) options[0] else null;
 }
 
-const ToolDecision = struct {
-    call: bool,
-    tool: ?[]u8 = null,
-    input: ?[]u8 = null,
+fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8) !?llm.ToolRouteCall {
+    var defs = try std.ArrayList(llm.ToolRouteDef).initCapacity(allocator, tools.definitions.len);
+    defer defs.deinit(allocator);
 
-    fn deinit(self: ToolDecision, allocator: std.mem.Allocator) void {
-        if (self.tool) |t| allocator.free(t);
-        if (self.input) |i| allocator.free(i);
+    for (tools.definitions) |d| {
+        try defs.append(allocator, .{ .name = d.name, .description = d.description, .parameters_json = d.parameters_json });
     }
-};
 
-fn inferToolCallSpecWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8) !?[]u8 {
-    const route_prompt = try std.fmt.allocPrint(
-        allocator,
-        "Decide whether to execute a local tool. Available tools:\n- bash: run shell command\n- read: read file content\nReturn STRICT JSON ONLY with one object: {{\"call\":false}} OR {{\"call\":true,\"tool\":\"bash|read\",\"input\":\"...\"}}.\nUser request: {s}",
-        .{input},
-    );
-    defer allocator.free(route_prompt);
-
-    const raw = llm.query(allocator, active.provider_id, active.api_key, active.model_id, route_prompt) catch return null;
-    defer allocator.free(raw);
-
-    const parsed = (try parseToolDecisionJson(allocator, raw)) orelse return null;
-    defer {
-        var owned = parsed;
-        owned.deinit(allocator);
-    }
-    if (!parsed.call) return null;
-    const tool_name = parsed.tool orelse return null;
-    const tool_input = parsed.input orelse return null;
-    if (!(std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "read"))) return null;
-    return try std.fmt.allocPrint(allocator, "{s} {s}", .{ tool_name, tool_input });
+    return llm.inferToolCall(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items) catch |err| switch (err) {
+        llm.QueryError.UnsupportedProvider => null,
+        else => return err,
+    };
 }
 
-fn parseToolDecisionJson(allocator: std.mem.Allocator, text: []const u8) !?ToolDecision {
-    const Parsed = struct {
-        call: ?bool = null,
-        tool: ?[]const u8 = null,
-        input: ?[]const u8 = null,
-    };
+fn isKnownToolName(name: []const u8) bool {
+    for (tools.definitions) |d| {
+        if (std.mem.eql(u8, name, d.name)) return true;
+    }
+    return false;
+}
 
-    const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    const json_slice = if (std.mem.startsWith(u8, trimmed, "```")) blk: {
-        const first = std.mem.indexOfScalar(u8, trimmed, '{') orelse break :blk trimmed;
-        const last = std.mem.lastIndexOfScalar(u8, trimmed, '}') orelse break :blk trimmed;
-        if (last <= first) break :blk trimmed;
-        break :blk trimmed[first .. last + 1];
-    } else trimmed;
+fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "Use local tools when they improve correctness. For repository-specific questions, inspect files first with list_files and read_file before answering. For code changes, prefer read_file before write_file or replace_in_file. Only skip tools when the answer is purely general knowledge.\n\nUser request:\n{s}",
+        .{user_text},
+    );
+}
 
-    var parsed = std.json.parseFromSlice(Parsed, allocator, json_slice, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    return ToolDecision{
-        .call = parsed.value.call orelse false,
-        .tool = if (parsed.value.tool) |t| try allocator.dupe(u8, t) else null,
-        .input = if (parsed.value.input) |i| try allocator.dupe(u8, i) else null,
-    };
+fn buildStrictToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "This is a repository-specific question. You must call at least one local inspection tool before giving the final answer. First call list_files or read_file, then answer using concrete file evidence.\n\nUser request:\n{s}",
+        .{user_text},
+    );
+}
+
+fn isLikelyRepoSpecificQuestion(input: []const u8) bool {
+    const t = std.mem.trim(u8, input, " \t\r\n");
+    if (t.len == 0) return false;
+
+    if (std.mem.indexOf(u8, t, "/") != null) return true;
+    if (containsIgnoreCase(t, "repo") or containsIgnoreCase(t, "codebase")) return true;
+    if (containsIgnoreCase(t, "src/")) return true;
+    if (containsIgnoreCase(t, ".zig")) return true;
+    if (containsIgnoreCase(t, "function") or containsIgnoreCase(t, "file") or containsIgnoreCase(t, "harness")) return true;
+    if (containsIgnoreCase(t, "how does") or containsIgnoreCase(t, "where is") or containsIgnoreCase(t, "explain")) return true;
+
+    return false;
+}
+
+fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, user_input: []const u8) ![]u8 {
+    const max_tool_steps: usize = 6;
+    var context_prompt = try allocator.dupe(u8, user_input);
+    defer allocator.free(context_prompt);
+    var forced_repo_probe_done = false;
+    const repo_specific = isLikelyRepoSpecificQuestion(user_input);
+
+    var step: usize = 0;
+    while (step < max_tool_steps) : (step += 1) {
+        const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
+        defer allocator.free(route_prompt);
+
+        var routed = try inferToolCallWithModel(allocator, active, route_prompt);
+        if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
+            forced_repo_probe_done = true;
+            const strict_prompt = try buildStrictToolRoutingPrompt(allocator, context_prompt);
+            defer allocator.free(strict_prompt);
+            routed = try inferToolCallWithModel(allocator, active, strict_prompt);
+        }
+
+        if (routed == null) {
+            return llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+        }
+        defer {
+            var r = routed.?;
+            r.deinit(allocator);
+        }
+
+        if (!isKnownToolName(routed.?.tool)) {
+            return llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+        }
+
+        try stdout.print("tool[{d}] {s}\n", .{ step + 1, routed.?.tool });
+
+        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json) catch |err| {
+            return std.fmt.allocPrint(
+                allocator,
+                "Tool execution failed at step {d} ({s}): {s}",
+                .{ step + 1, routed.?.tool, @errorName(err) },
+            );
+        };
+        defer allocator.free(tool_out);
+
+        const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
+        const next_prompt = try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\nTool call {d}: {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",
+            .{ context_prompt, step + 1, routed.?.tool, routed.?.arguments_json, capped },
+        );
+        allocator.free(context_prompt);
+        context_prompt = next_prompt;
+    }
+
+    const fallback_prompt = try std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nTool loop limit reached ({d}). Return the best final answer based on available context.",
+        .{ context_prompt, max_tool_steps },
+    );
+    defer allocator.free(fallback_prompt);
+    return llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt);
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer out.deinit(allocator);
     try out.append(allocator, '\'');
     for (text) |ch| {
@@ -1263,7 +1415,7 @@ fn buildFilterPreviewBlock(allocator: std.mem.Allocator, options: []const ModelO
     const filtered = try filterModelOptions(allocator, options, query);
     defer allocator.free(filtered);
 
-    var out = std.ArrayList(u8).empty;
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -1283,7 +1435,7 @@ fn buildFilterPreviewLine(allocator: std.mem.Allocator, options: []const ModelOp
     const filtered = try filterModelOptions(allocator, options, query);
     defer allocator.free(filtered);
 
-    var out = std.ArrayList(u8).empty;
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -1317,7 +1469,7 @@ fn formatProvidersOutput(
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
 ) ![]u8 {
-    var out = std.ArrayList(u8).empty;
+    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer out.deinit(allocator);
 
     const w = out.writer(allocator);

@@ -15,8 +15,8 @@ pub const ModelRef = struct {
     model_id: []const u8,
 };
 
-pub fn loadSelectedModel(allocator: std.mem.Allocator, cwd: []const u8) !?SelectedModel {
-    const path = try configPathAlloc(allocator, cwd);
+pub fn loadSelectedModel(allocator: std.mem.Allocator, base_path: []const u8) !?SelectedModel {
+    const path = try configPathAlloc(allocator, base_path);
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -46,8 +46,8 @@ pub fn loadSelectedModel(allocator: std.mem.Allocator, cwd: []const u8) !?Select
     };
 }
 
-pub fn saveSelectedModel(allocator: std.mem.Allocator, cwd: []const u8, model: ?ModelRef) !void {
-    const path = try configPathAlloc(allocator, cwd);
+pub fn saveSelectedModel(allocator: std.mem.Allocator, base_path: []const u8, model: ?ModelRef) !void {
+    const path = try configPathAlloc(allocator, base_path);
     defer allocator.free(path);
 
     const dir_path = std.fs.path.dirname(path) orelse return;
@@ -78,8 +78,8 @@ pub fn saveSelectedModel(allocator: std.mem.Allocator, cwd: []const u8, model: ?
     try file.writeAll(buf.items);
 }
 
-fn configPathAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ cwd, ".zagent", "config.json" });
+fn configPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, "config.json" });
 }
 
 test "save and load selected model" {
