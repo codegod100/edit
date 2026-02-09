@@ -593,7 +593,10 @@ fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
         text: ?[]const u8 = null,
         content: ?[]const OutputContent = null,
     };
-    const Msg = struct { content: ?[]const u8 = null };
+    const Msg = struct {
+        content: ?[]const u8 = null,
+        reasoning_content: ?[]const u8 = null,
+    };
     const Choice = struct { message: Msg };
     const ApiError = struct { message: ?[]const u8 = null };
     const Resp = struct {
@@ -658,8 +661,26 @@ fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
     }
     if (resp.choices) |choices| {
         if (choices.len > 0) {
-            if (choices[0].message.content) |text| {
-                if (text.len > 0) return try allocator.dupe(u8, text);
+            const message = choices[0].message;
+            const has_reasoning = message.reasoning_content != null and message.reasoning_content.?.len > 0;
+            const has_content = message.content != null and message.content.?.len > 0;
+
+            if (has_reasoning or has_content) {
+                var result = std.ArrayList(u8).empty;
+                defer result.deinit(allocator);
+                const w = result.writer(allocator);
+
+                // Add reasoning content first if present
+                if (has_reasoning) {
+                    try w.print("[thinking]\n{s}\n\n", .{message.reasoning_content.?});
+                }
+
+                // Add main content
+                if (has_content) {
+                    try w.print("{s}", .{message.content.?});
+                }
+
+                return @as(?[]u8, try result.toOwnedSlice(allocator));
             }
         }
     }
