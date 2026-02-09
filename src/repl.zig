@@ -3,6 +3,7 @@ const skills = @import("skills.zig");
 const tools = @import("tools.zig");
 const pm = @import("provider_manager.zig");
 const store = @import("provider_store.zig");
+const llm = @import("llm.zig");
 
 pub const CommandTag = enum {
     none,
@@ -14,6 +15,7 @@ pub const CommandTag = enum {
     list_providers,
     default_model,
     connect_provider,
+    set_model,
 };
 
 pub const Command = struct {
@@ -58,8 +60,15 @@ pub fn parseCommand(line: []const u8) Command {
             return .{ .tag = .default_model, .arg = rest };
         }
     }
-    if (std.mem.eql(u8, trimmed, "/connect")) {
-        return .{ .tag = .connect_provider, .arg = "" };
+    if (std.mem.startsWith(u8, trimmed, "/connect")) {
+        var rest = trimmed[8..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .connect_provider, .arg = rest };
+    }
+    if (std.mem.startsWith(u8, trimmed, "/model")) {
+        var rest = trimmed[6..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .set_model, .arg = rest };
     }
 
     return .{ .tag = .none, .arg = "" };
@@ -92,19 +101,105 @@ const EditKey = enum {
     character,
 };
 
+const AuthMethod = enum {
+    api,
+    subscription,
+};
+
+const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_ISSUER = "https://auth.openai.com";
+
+const HistoryNav = enum {
+    up,
+    down,
+};
+
+const CommandHistory = struct {
+    items: std.ArrayList([]u8),
+
+    fn init() CommandHistory {
+        return .{ .items = std.ArrayList([]u8).empty };
+    }
+
+    fn deinit(self: *CommandHistory, allocator: std.mem.Allocator) void {
+        for (self.items.items) |entry| allocator.free(entry);
+        self.items.deinit(allocator);
+    }
+
+    fn append(self: *CommandHistory, allocator: std.mem.Allocator, line: []const u8) !void {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (self.items.items.len > 0 and std.mem.eql(u8, self.items.items[self.items.items.len - 1], trimmed)) return;
+        try self.items.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+};
+
+fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
+    if (entries.len == 0) return null;
+    return switch (nav) {
+        .up => if (current) |idx| if (idx > 0) idx - 1 else 0 else entries.len - 1,
+        .down => if (current) |idx| if (idx + 1 < entries.len) idx + 1 else null else null,
+    };
+}
+
+const ActiveModel = struct {
+    provider_id: []const u8,
+    model_id: []const u8,
+    api_key: ?[]const u8,
+};
+
+const ModelSelection = struct {
+    provider_id: []const u8,
+    model_id: []const u8,
+};
+
+fn parseModelSelection(input: []const u8) ?ModelSelection {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= trimmed.len) return null;
+    return .{
+        .provider_id = trimmed[0..slash],
+        .model_id = trimmed[slash + 1 ..],
+    };
+}
+
+const OwnedModelSelection = struct {
+    provider_id: []u8,
+    model_id: []u8,
+
+    fn deinit(self: *OwnedModelSelection, allocator: std.mem.Allocator) void {
+        allocator.free(self.provider_id);
+        allocator.free(self.model_id);
+    }
+};
+
 fn applyEditKey(
     allocator: std.mem.Allocator,
     current: []const u8,
     key: EditKey,
     character: u8,
 ) ![]u8 {
-    _ = key;
-    _ = character;
-    return allocator.dupe(u8, current);
+    return switch (key) {
+        .tab => allocator.dupe(u8, autocompleteCommand(current)),
+        .backspace => {
+            if (current.len == 0) return allocator.dupe(u8, current);
+            return allocator.dupe(u8, current[0 .. current.len - 1]);
+        },
+        .character => {
+            if (character < 32 or character == 127) return allocator.dupe(u8, current);
+            var out = try allocator.alloc(u8, current.len + 1);
+            @memcpy(out[0..current.len], current);
+            out[current.len] = character;
+            return out;
+        },
+        .enter => allocator.dupe(u8, current),
+    };
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
-    const stdin = std.fs.File.stdin().deprecatedReader();
+    const stdin_file = std.fs.File.stdin();
+    const stdin = stdin_file.deprecatedReader();
     const stdout = std.fs.File.stdout().deprecatedWriter();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
@@ -120,13 +215,17 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
     defer pm.ProviderManager.freeResolved(allocator, provider_states);
 
+    var history = CommandHistory.init();
+    defer history.deinit(allocator);
+    var selected_model: ?OwnedModelSelection = null;
+    defer if (selected_model) |*sel| sel.deinit(allocator);
+
     try stdout.print(
-        "zagent MVP. Commands: /skills, /skill <name>, /tools, /tool <spec>, /providers, /default-model <provider>, /connect, /quit\n",
+        "zagent MVP. Commands: /skills, /skill <name>, /tools, /tool <spec>, /providers, /default-model <provider>, /model <provider/model>, /connect, /quit\n",
         .{},
     );
     while (true) {
-        try stdout.print("> ", .{});
-        const line_opt = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+        const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, "> ", &history);
         if (line_opt == null) {
             try stdout.print("\n", .{});
             break;
@@ -134,6 +233,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         const line = line_opt.?;
         defer allocator.free(line);
+
+        try history.append(allocator, line);
 
         const normalized = autocompleteCommand(line);
         if (!std.mem.eql(u8, normalized, std.mem.trim(u8, line, " \t\r\n"))) {
@@ -175,13 +276,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try stdout.print("{s}\n", .{output});
             },
             .list_providers => {
-                if (provider_states.len == 0) {
-                    try stdout.print("No connected providers found from env vars.\n", .{});
-                    continue;
-                }
-                for (provider_states) |p| {
-                    try stdout.print("- {s} ({s}) models={d}\n", .{ p.id, p.display_name, p.models.len });
-                }
+                const view = try formatProvidersOutput(allocator, providers, provider_states);
+                defer allocator.free(view);
+                try stdout.print("{s}", .{view});
             },
             .default_model => {
                 var found: ?pm.ProviderState = null;
@@ -204,8 +301,16 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 }
             },
             .connect_provider => {
-                const chosen = try chooseProvider(allocator, stdin, stdout, providers, provider_states);
-                if (chosen == null) continue;
+                const chosen = if (command.arg.len > 0)
+                    findProviderSpecByID(providers, command.arg)
+                else
+                    try chooseProvider(allocator, stdin, stdout, providers, provider_states);
+                if (chosen == null) {
+                    if (command.arg.len > 0) {
+                        try stdout.print("Unknown provider: {s}\n", .{command.arg});
+                    }
+                    continue;
+                }
 
                 const provider = chosen.?;
                 if (provider.env_vars.len == 0) {
@@ -213,17 +318,38 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
 
-                const env_name = provider.env_vars[0];
-                const key_opt = try promptLine(allocator, stdin, stdout, "API key: ");
-                if (key_opt == null) continue;
-                defer allocator.free(key_opt.?);
-                const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
-                if (key.len == 0) {
-                    try stdout.print("Cancelled: empty key.\n", .{});
-                    continue;
+                var method: AuthMethod = .api;
+                if (supportsSubscription(provider.id)) {
+                    const method_opt = try promptLine(allocator, stdin, stdout, "Auth method [api/subscription] (default api): ");
+                    if (method_opt) |raw| {
+                        defer allocator.free(raw);
+                        method = chooseAuthMethod(std.mem.trim(u8, raw, " \t\r\n"), true);
+                    }
                 }
 
-                try store.upsertFile(allocator, cwd, env_name, key);
+                const env_name = provider.env_vars[0];
+                var key_slice: []const u8 = "";
+                var owned_key: ?[]u8 = null;
+                defer if (owned_key) |k| allocator.free(k);
+
+                if (method == .subscription) {
+                    const sub_key = try connectSubscription(allocator, stdin, stdout, provider.id);
+                    if (sub_key == null) continue;
+                    owned_key = sub_key.?;
+                    key_slice = owned_key.?;
+                } else {
+                    const key_opt = try promptLine(allocator, stdin, stdout, "API key: ");
+                    if (key_opt == null) continue;
+                    defer allocator.free(key_opt.?);
+                    const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
+                    if (key.len == 0) {
+                        try stdout.print("Cancelled: empty key.\n", .{});
+                        continue;
+                    }
+                    key_slice = key;
+                }
+
+                try store.upsertFile(allocator, cwd, env_name, key_slice);
                 try stdout.print("Stored {s} in .zagent/providers.env\n", .{env_name});
 
                 store.free(allocator, stored_pairs);
@@ -232,6 +358,48 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 pm.ProviderManager.freeResolved(allocator, provider_states);
                 provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
             },
+            .set_model => {
+                if (command.arg.len == 0) {
+                    if (selected_model) |sel| {
+                        try stdout.print("Current model: {s}/{s}\n", .{ sel.provider_id, sel.model_id });
+                        continue;
+                    }
+
+                    const picked = try interactiveModelSelect(allocator, stdin, stdout, providers, provider_states);
+                    if (picked == null) {
+                        try stdout.print("No explicit model set. Using default connected provider model.\n", .{});
+                        continue;
+                    }
+                    if (selected_model) |*old| old.deinit(allocator);
+                    selected_model = .{
+                        .provider_id = try allocator.dupe(u8, picked.?.provider_id),
+                        .model_id = try allocator.dupe(u8, picked.?.model_id),
+                    };
+                    try stdout.print("Active model set to {s}/{s}\n", .{ picked.?.provider_id, picked.?.model_id });
+                    continue;
+                }
+                const parsed = parseModelSelection(command.arg);
+                if (parsed == null) {
+                    try stdout.print("Model must be in format provider/model\n", .{});
+                    continue;
+                }
+                const p = parsed.?;
+                if (findConnectedProvider(provider_states, p.provider_id) == null) {
+                    try stdout.print("Provider not connected: {s}\n", .{p.provider_id});
+                    continue;
+                }
+                if (!providerHasModel(providers, p.provider_id, p.model_id)) {
+                    try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
+                    continue;
+                }
+
+                if (selected_model) |*old| old.deinit(allocator);
+                selected_model = .{
+                    .provider_id = try allocator.dupe(u8, p.provider_id),
+                    .model_id = try allocator.dupe(u8, p.model_id),
+                };
+                try stdout.print("Active model set to {s}/{s}\n", .{ p.provider_id, p.model_id });
+            },
             .none => {
                 const trimmed = std.mem.trim(u8, normalized, " \t\r\n");
                 if (trimmed.len == 0) continue;
@@ -239,9 +407,111 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     try stdout.print("Unknown command: {s}\n", .{trimmed});
                     continue;
                 }
-                try stdout.print("MVP: LLM loop not wired yet. Use /skills and /skill.\n", .{});
+
+                const active = chooseActiveModel(providers, provider_states, selected_model);
+                if (active == null) {
+                    try stdout.print("No connected providers. Run /providers then /connect <provider-id>.\n", .{});
+                    continue;
+                }
+
+                const response = llm.query(
+                    allocator,
+                    active.?.provider_id,
+                    active.?.api_key,
+                    active.?.model_id,
+                    trimmed,
+                ) catch |err| {
+                    try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                defer allocator.free(response);
+
+                try stdout.print("{s}\n", .{response});
             },
         }
+    }
+}
+
+fn readPromptLine(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    stdin_reader: anytype,
+    stdout: anytype,
+    prompt: []const u8,
+    history: *CommandHistory,
+) !?[]u8 {
+    if (!stdin_file.isTty()) {
+        try stdout.print("{s}", .{prompt});
+        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    }
+
+    const original = std.posix.tcgetattr(stdin_file.handle) catch {
+        try stdout.print("{s}", .{prompt});
+        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    };
+    var raw = original;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    try std.posix.tcsetattr(stdin_file.handle, .NOW, raw);
+    defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
+
+    var line = try allocator.alloc(u8, 0);
+    defer allocator.free(line);
+    var history_index: ?usize = null;
+
+    try stdout.print("{s}", .{prompt});
+
+    var byte_buf: [3]u8 = undefined;
+    while (true) {
+        const n = try stdin_file.read(byte_buf[0..1]);
+        if (n == 0) {
+            if (line.len == 0) return null;
+            return try allocator.dupe(u8, line);
+        }
+
+        const ch = byte_buf[0];
+        if (ch == 27) {
+            const n1 = try stdin_file.read(byte_buf[1..2]);
+            if (n1 == 0) continue;
+            if (byte_buf[1] != '[') continue;
+
+            const n2 = try stdin_file.read(byte_buf[2..3]);
+            if (n2 == 0) continue;
+            const nav: ?HistoryNav = switch (byte_buf[2]) {
+                'A' => .up,
+                'B' => .down,
+                else => null,
+            };
+            if (nav == null) continue;
+
+            const next_index = historyNextIndex(history.items.items, history_index, nav.?);
+            history_index = next_index;
+
+            const entry = if (history_index) |idx| history.items.items[idx] else "";
+            line = try allocator.realloc(line, entry.len);
+            @memcpy(line, entry);
+            try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
+            continue;
+        }
+
+        if (ch == '\n' or ch == '\r') {
+            try stdout.print("\n", .{});
+            return try allocator.dupe(u8, line);
+        }
+
+        history_index = null;
+
+        const next = blk: {
+            if (ch == 9) break :blk try applyEditKey(allocator, line, .tab, 0);
+            if (ch == 127 or ch == 8) break :blk try applyEditKey(allocator, line, .backspace, 0);
+            break :blk try applyEditKey(allocator, line, .character, ch);
+        };
+        defer allocator.free(next);
+
+        line = try allocator.realloc(line, next.len);
+        @memcpy(line, next);
+
+        try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
     }
 }
 
@@ -272,6 +542,14 @@ test "parse command recognizes slash commands" {
 
     const connect = parseCommand("/connect");
     try std.testing.expectEqual(CommandTag.connect_provider, connect.tag);
+
+    const connect_with_arg = parseCommand("/connect openai");
+    try std.testing.expectEqual(CommandTag.connect_provider, connect_with_arg.tag);
+    try std.testing.expectEqualStrings("openai", connect_with_arg.arg);
+
+    const model = parseCommand("/model openai/gpt-5");
+    try std.testing.expectEqual(CommandTag.set_model, model.tag);
+    try std.testing.expectEqualStrings("openai/gpt-5", model.arg);
 }
 
 test "parse command trims /skill argument" {
@@ -304,6 +582,79 @@ test "apply edit key backspace removes last character" {
     try std.testing.expectEqualStrings("/too", next);
 }
 
+test "providers output includes available providers when none connected" {
+    const allocator = std.testing.allocator;
+    const providers = defaultProviderSpecs();
+    const text = try formatProvidersOutput(allocator, providers, &.{});
+    defer allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Available providers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "anthropic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "/connect") != null);
+}
+
+test "choose auth method parses subscription and defaults to api" {
+    try std.testing.expectEqual(AuthMethod.subscription, chooseAuthMethod("subscription", true));
+    try std.testing.expectEqual(AuthMethod.subscription, chooseAuthMethod("sub", true));
+    try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("", true));
+    try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("api", true));
+    try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("subscription", false));
+}
+
+test "parse model selection supports provider/model format" {
+    const selection = parseModelSelection("openai/gpt-5");
+    try std.testing.expect(selection != null);
+    try std.testing.expectEqualStrings("openai", selection.?.provider_id);
+    try std.testing.expectEqualStrings("gpt-5", selection.?.model_id);
+}
+
+test "default model prefers non-nano for openai oauth tokens" {
+    const providers = defaultProviderSpecs();
+    const connected = [_]pm.ProviderState{.{
+        .id = "openai",
+        .display_name = "OpenAI",
+        .key = "a.b.c",
+        .connected = true,
+        .models = providers[1].models,
+    }};
+
+    const active = chooseActiveModel(providers, &connected, null);
+    try std.testing.expect(active != null);
+    try std.testing.expectEqualStrings("gpt-5", active.?.model_id);
+}
+
+test "resolve model pick accepts index and id" {
+    const options = [_]pm.Model{
+        .{ .id = "gpt-5", .display_name = "GPT-5" },
+        .{ .id = "gpt-5-nano", .display_name = "GPT-5 Nano" },
+    };
+
+    const by_index = resolveModelPick(options[0..], "2");
+    try std.testing.expect(by_index != null);
+    try std.testing.expectEqualStrings("gpt-5-nano", by_index.?.id);
+
+    const by_id = resolveModelPick(options[0..], "gpt-5");
+    try std.testing.expect(by_id != null);
+    try std.testing.expectEqualStrings("gpt-5", by_id.?.id);
+}
+
+test "history navigation moves through entries with up and down" {
+    const entries = [_][]const u8{ "/providers", "/connect openai", "/tools" };
+
+    const first_up = historyNextIndex(&entries, null, .up);
+    try std.testing.expectEqual(@as(?usize, 2), first_up);
+
+    const second_up = historyNextIndex(&entries, first_up, .up);
+    try std.testing.expectEqual(@as(?usize, 1), second_up);
+
+    const down = historyNextIndex(&entries, second_up, .down);
+    try std.testing.expectEqual(@as(?usize, 2), down);
+
+    const to_current = historyNextIndex(&entries, down, .down);
+    try std.testing.expectEqual(@as(?usize, null), to_current);
+}
+
 fn commandNames() []const []const u8 {
     return &.{
         "/quit",
@@ -314,6 +665,7 @@ fn commandNames() []const []const u8 {
         "/providers",
         "/default-model",
         "/connect",
+        "/model",
     };
 }
 
@@ -430,4 +782,313 @@ fn isConnected(provider_id: []const u8, connected: []const pm.ProviderState) boo
         if (std.mem.eql(u8, item.id, provider_id)) return true;
     }
     return false;
+}
+
+fn findProviderSpecByID(providers: []const pm.ProviderSpec, provider_id: []const u8) ?pm.ProviderSpec {
+    for (providers) |provider| {
+        if (std.mem.eql(u8, provider.id, provider_id)) return provider;
+    }
+    return null;
+}
+
+fn findConnectedProvider(connected: []const pm.ProviderState, provider_id: []const u8) ?pm.ProviderState {
+    for (connected) |provider| {
+        if (std.mem.eql(u8, provider.id, provider_id)) return provider;
+    }
+    return null;
+}
+
+fn providerHasModel(providers: []const pm.ProviderSpec, provider_id: []const u8, model_id: []const u8) bool {
+    const provider = findProviderSpecByID(providers, provider_id) orelse return false;
+    for (provider.models) |model| {
+        if (std.mem.eql(u8, model.id, model_id)) return true;
+    }
+    return false;
+}
+
+fn chooseActiveModel(
+    providers: []const pm.ProviderSpec,
+    connected: []const pm.ProviderState,
+    selected: ?OwnedModelSelection,
+) ?ActiveModel {
+    if (selected) |sel| {
+        const provider = findConnectedProvider(connected, sel.provider_id) orelse return null;
+        if (!providerHasModel(providers, sel.provider_id, sel.model_id)) return null;
+        return .{ .provider_id = sel.provider_id, .model_id = sel.model_id, .api_key = provider.key };
+    }
+
+    if (connected.len == 0) return null;
+    const provider = connected[0];
+    const default_model = chooseDefaultModelForConnected(provider) orelse return null;
+    return .{ .provider_id = provider.id, .model_id = default_model, .api_key = provider.key };
+}
+
+fn chooseDefaultModelForConnected(provider: pm.ProviderState) ?[]const u8 {
+    if (std.mem.eql(u8, provider.id, "openai") and provider.key != null and isLikelyOAuthToken(provider.key.?)) {
+        for (provider.models) |m| {
+            if (std.mem.indexOf(u8, m.id, "nano") == null and std.mem.indexOf(u8, m.id, "mini") == null) {
+                return m.id;
+            }
+        }
+    }
+    return pm.ProviderManager.defaultModelIDForProvider(provider.id, provider.models);
+}
+
+fn isLikelyOAuthToken(token: []const u8) bool {
+    if (std.mem.startsWith(u8, token, "sk-")) return false;
+    return std.mem.count(u8, token, ".") >= 2;
+}
+
+fn interactiveModelSelect(
+    allocator: std.mem.Allocator,
+    stdin: anytype,
+    stdout: anytype,
+    providers: []const pm.ProviderSpec,
+    connected: []const pm.ProviderState,
+) !?ModelSelection {
+    if (connected.len == 0) {
+        try stdout.print("No connected providers. Run /connect first.\n", .{});
+        return null;
+    }
+
+    try stdout.print("Select provider:\n", .{});
+    for (connected, 0..) |p, i| {
+        try stdout.print("  {d}) {s}\n", .{ i + 1, p.id });
+    }
+
+    const provider_pick_opt = try promptLine(allocator, stdin, stdout, "Provider number or id: ");
+    if (provider_pick_opt == null) return null;
+    defer allocator.free(provider_pick_opt.?);
+    const provider_pick = std.mem.trim(u8, provider_pick_opt.?, " \t\r\n");
+    if (provider_pick.len == 0) return null;
+
+    const provider_state = resolveProviderPick(connected, provider_pick) orelse {
+        try stdout.print("Unknown connected provider: {s}\n", .{provider_pick});
+        return null;
+    };
+    const provider_spec = findProviderSpecByID(providers, provider_state.id) orelse {
+        try stdout.print("Provider metadata unavailable: {s}\n", .{provider_state.id});
+        return null;
+    };
+
+    try stdout.print("Select model for {s}:\n", .{provider_state.id});
+    for (provider_spec.models, 0..) |m, i| {
+        try stdout.print("  {d}) {s} ({s})\n", .{ i + 1, m.id, m.display_name });
+    }
+    const model_pick_opt = try promptLine(allocator, stdin, stdout, "Model number or id: ");
+    if (model_pick_opt == null) return null;
+    defer allocator.free(model_pick_opt.?);
+    const model_pick = std.mem.trim(u8, model_pick_opt.?, " \t\r\n");
+    if (model_pick.len == 0) return null;
+
+    const model = resolveModelPick(provider_spec.models, model_pick) orelse {
+        try stdout.print("Unknown model: {s}\n", .{model_pick});
+        return null;
+    };
+
+    return .{ .provider_id = provider_state.id, .model_id = model.id };
+}
+
+fn resolveProviderPick(connected: []const pm.ProviderState, pick: []const u8) ?pm.ProviderState {
+    const n = std.fmt.parseInt(usize, pick, 10) catch null;
+    if (n) |idx| {
+        if (idx > 0 and idx <= connected.len) return connected[idx - 1];
+    }
+    return findConnectedProvider(connected, pick);
+}
+
+fn resolveModelPick(models: []const pm.Model, pick: []const u8) ?pm.Model {
+    const n = std.fmt.parseInt(usize, pick, 10) catch null;
+    if (n) |idx| {
+        if (idx > 0 and idx <= models.len) return models[idx - 1];
+    }
+    for (models) |m| {
+        if (std.mem.eql(u8, m.id, pick)) return m;
+    }
+    return null;
+}
+
+fn supportsSubscription(provider_id: []const u8) bool {
+    return std.mem.eql(u8, provider_id, "openai");
+}
+
+fn chooseAuthMethod(input: []const u8, allow_subscription: bool) AuthMethod {
+    if (!allow_subscription) return .api;
+    if (std.mem.eql(u8, input, "subscription") or std.mem.eql(u8, input, "sub") or std.mem.eql(u8, input, "oauth")) {
+        return .subscription;
+    }
+    return .api;
+}
+
+fn formatProvidersOutput(
+    allocator: std.mem.Allocator,
+    providers: []const pm.ProviderSpec,
+    connected: []const pm.ProviderState,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    const w = out.writer(allocator);
+    try w.print("Available providers:\n", .{});
+    for (providers) |provider| {
+        const status = if (isConnected(provider.id, connected)) "connected" else "not connected";
+        const methods = if (supportsSubscription(provider.id)) "api|subscription" else "api";
+        try w.print("- {s} ({s}) [{s}] methods={s}\n", .{ provider.id, provider.display_name, status, methods });
+    }
+    try w.print("Use /connect or /connect <provider-id> to set up a provider.\n", .{});
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn connectSubscription(
+    allocator: std.mem.Allocator,
+    stdin: anytype,
+    stdout: anytype,
+    provider_id: []const u8,
+) !?[]u8 {
+    if (!std.mem.eql(u8, provider_id, "openai")) {
+        try stdout.print("Subscription flow is currently supported only for openai.\n", .{});
+        return null;
+    }
+
+    const start = try openaiDeviceStart(allocator);
+    defer allocator.free(start.device_auth_id);
+    defer allocator.free(start.user_code);
+
+    try stdout.print("Open this URL in your browser: {s}/codex/device\n", .{OPENAI_ISSUER});
+    try stdout.print("Enter code: {s}\n", .{start.user_code});
+    const open_result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "sh", "-c", "xdg-open https://auth.openai.com/codex/device >/dev/null 2>&1 || true" },
+    });
+    allocator.free(open_result.stdout);
+    allocator.free(open_result.stderr);
+
+    const proceed = try promptLine(allocator, stdin, stdout, "Press Enter after authorization (or type cancel): ");
+    if (proceed) |p| {
+        defer allocator.free(p);
+        const t = std.mem.trim(u8, p, " \t\r\n");
+        if (std.mem.eql(u8, t, "cancel")) return null;
+    }
+
+    const token = try openaiPollAndExchange(allocator, stdout, start.device_auth_id, start.user_code, start.interval_sec);
+    if (token == null) {
+        try stdout.print("Subscription login failed.\n", .{});
+        return null;
+    }
+    return token;
+}
+
+const OpenAIDeviceStart = struct {
+    device_auth_id: []u8,
+    user_code: []u8,
+    interval_sec: u64,
+};
+
+fn openaiDeviceStart(allocator: std.mem.Allocator) !OpenAIDeviceStart {
+    const body = try std.fmt.allocPrint(allocator, "{{\"client_id\":\"{s}\"}}", .{OPENAI_CLIENT_ID});
+    defer allocator.free(body);
+
+    const out = try runCommandCapture(allocator, &.{
+        "curl",                                               "-sS", "-X",                             "POST",
+        OPENAI_ISSUER ++ "/api/accounts/deviceauth/usercode", "-H",  "Content-Type: application/json", "-H",
+        "User-Agent: zagent/0.1",                             "-d",  body,
+    });
+    defer allocator.free(out);
+
+    const StartResp = struct {
+        device_auth_id: []const u8,
+        user_code: []const u8,
+        interval: ?[]const u8 = null,
+    };
+    var parsed = try std.json.parseFromSlice(StartResp, allocator, out, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const interval = if (parsed.value.interval) |s| std.fmt.parseInt(u64, s, 10) catch 5 else 5;
+    return .{
+        .device_auth_id = try allocator.dupe(u8, parsed.value.device_auth_id),
+        .user_code = try allocator.dupe(u8, parsed.value.user_code),
+        .interval_sec = if (interval == 0) 5 else interval,
+    };
+}
+
+fn openaiPollAndExchange(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    device_auth_id: []const u8,
+    user_code: []const u8,
+    interval_sec: u64,
+) !?[]u8 {
+    var tries: usize = 0;
+    while (tries < 120) : (tries += 1) {
+        const poll_body = try std.fmt.allocPrint(
+            allocator,
+            "{{\"device_auth_id\":\"{s}\",\"user_code\":\"{s}\"}}",
+            .{ device_auth_id, user_code },
+        );
+        defer allocator.free(poll_body);
+
+        const poll = try runCommandCapture(allocator, &.{
+            "curl",                                            "-sS", "-X",                             "POST",
+            OPENAI_ISSUER ++ "/api/accounts/deviceauth/token", "-H",  "Content-Type: application/json", "-H",
+            "User-Agent: zagent/0.1",                          "-d",  poll_body,
+        });
+        defer allocator.free(poll);
+
+        const PollResp = struct {
+            authorization_code: ?[]const u8 = null,
+            code_verifier: ?[]const u8 = null,
+        };
+        var parsed = std.json.parseFromSlice(PollResp, allocator, poll, .{ .ignore_unknown_fields = true }) catch {
+            std.Thread.sleep(interval_sec * std.time.ns_per_s);
+            continue;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.authorization_code == null or parsed.value.code_verifier == null) {
+            std.Thread.sleep(interval_sec * std.time.ns_per_s);
+            continue;
+        }
+
+        const form = try std.fmt.allocPrint(
+            allocator,
+            "grant_type=authorization_code&code={s}&redirect_uri={s}/deviceauth/callback&client_id={s}&code_verifier={s}",
+            .{ parsed.value.authorization_code.?, OPENAI_ISSUER, OPENAI_CLIENT_ID, parsed.value.code_verifier.? },
+        );
+        defer allocator.free(form);
+
+        const token = try runCommandCapture(allocator, &.{
+            "curl",                          "-sS", "-X",                                              "POST",
+            OPENAI_ISSUER ++ "/oauth/token", "-H",  "Content-Type: application/x-www-form-urlencoded", "-d",
+            form,
+        });
+        defer allocator.free(token);
+
+        const TokenResp = struct {
+            access_token: ?[]const u8 = null,
+            refresh_token: ?[]const u8 = null,
+        };
+        var tok = std.json.parseFromSlice(TokenResp, allocator, token, .{ .ignore_unknown_fields = true }) catch {
+            return null;
+        };
+        defer tok.deinit();
+
+        if (tok.value.access_token) |access| {
+            try stdout.print("Subscription authorized successfully.\n", .{});
+            return try allocator.dupe(u8, access);
+        }
+        return null;
+    }
+
+    return null;
+}
+
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 512 * 1024,
+    });
+    defer allocator.free(result.stderr);
+    return result.stdout;
 }

@@ -1,0 +1,340 @@
+const std = @import("std");
+
+pub const QueryError = error{
+    MissingApiKey,
+    UnsupportedProvider,
+    EmptyModelResponse,
+};
+
+const OPENAI_API_ENDPOINT = "https://api.openai.com/v1/responses";
+const OPENAI_CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+
+const OpenAIResponseMeta = struct {
+    id: ?[]const u8,
+    status: ?[]const u8,
+};
+
+fn parseOpenAIResponseMeta(allocator: std.mem.Allocator, json: []const u8) !OpenAIResponseMeta {
+    const Meta = struct {
+        id: ?[]const u8 = null,
+        status: ?[]const u8 = null,
+    };
+    var parsed = std.json.parseFromSlice(Meta, allocator, json, .{ .ignore_unknown_fields = true }) catch {
+        return .{ .id = null, .status = null };
+    };
+    defer parsed.deinit();
+    return .{
+        .id = if (parsed.value.id) |id| try allocator.dupe(u8, id) else null,
+        .status = if (parsed.value.status) |status| try allocator.dupe(u8, status) else null,
+    };
+}
+
+pub fn query(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    api_key: ?[]const u8,
+    model_id: []const u8,
+    prompt: []const u8,
+) ![]u8 {
+    const key = api_key orelse return QueryError.MissingApiKey;
+
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return queryOpenAI(allocator, key, model_id, prompt);
+    }
+    if (std.mem.eql(u8, provider_id, "anthropic")) {
+        return queryAnthropic(allocator, key, model_id, prompt);
+    }
+    return QueryError.UnsupportedProvider;
+}
+
+fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{f}",
+        .{std.json.fmt(.{ .model = model_id, .input = prompt }, .{})},
+    );
+    defer allocator.free(body);
+
+    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth);
+
+    const endpoint = if (isLikelyOAuthToken(api_key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
+
+    const output = try runCommandCapture(allocator, &.{
+        "curl",
+        "-sS",
+        "-X",
+        "POST",
+        endpoint,
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        auth,
+        "-H",
+        "originator: zagent",
+        "-d",
+        body,
+    });
+    defer allocator.free(output);
+
+    const first = extractOpenAIText(allocator, output) catch |err| switch (err) {
+        QueryError.EmptyModelResponse => null,
+        else => return err,
+    };
+    if (first) |text| return text;
+
+    if (std.mem.eql(u8, endpoint, OPENAI_API_ENDPOINT)) {
+        const meta = try parseOpenAIResponseMeta(allocator, output);
+        defer {
+            if (meta.id) |id| allocator.free(id);
+            if (meta.status) |status| allocator.free(status);
+        }
+        if (meta.id != null and meta.status != null and std.mem.eql(u8, meta.status.?, "in_progress")) {
+            const follow_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ OPENAI_API_ENDPOINT, meta.id.? });
+            defer allocator.free(follow_url);
+
+            var attempt: usize = 0;
+            while (attempt < 15) : (attempt += 1) {
+                std.Thread.sleep(400 * std.time.ns_per_ms);
+                const polled = try runCommandCapture(allocator, &.{
+                    "curl",
+                    "-sS",
+                    "-X",
+                    "GET",
+                    follow_url,
+                    "-H",
+                    auth,
+                    "-H",
+                    "originator: zagent",
+                });
+                defer allocator.free(polled);
+
+                const parsed = extractOpenAIText(allocator, polled) catch |poll_err| switch (poll_err) {
+                    QueryError.EmptyModelResponse => null,
+                    else => return poll_err,
+                };
+                if (parsed) |text| return text;
+
+                const step = try parseOpenAIResponseMeta(allocator, polled);
+                defer {
+                    if (step.id) |id| allocator.free(id);
+                    if (step.status) |status| allocator.free(status);
+                }
+                if (step.status == null or !std.mem.eql(u8, step.status.?, "in_progress")) break;
+            }
+        }
+    }
+
+    if (output.len > 0) {
+        const cap = @min(output.len, 1000);
+        return std.fmt.allocPrint(allocator, "No text found in model response: {s}", .{output[0..cap]});
+    }
+    return QueryError.EmptyModelResponse;
+}
+
+fn isLikelyOAuthToken(token: []const u8) bool {
+    if (std.mem.startsWith(u8, token, "sk-")) return false;
+    return std.mem.count(u8, token, ".") >= 2;
+}
+
+fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+    const Message = struct { role: []const u8, content: []const u8 };
+    const messages = [_]Message{.{ .role = "user", .content = prompt }};
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{f}",
+        .{std.json.fmt(.{
+            .model = model_id,
+            .max_tokens = 1024,
+            .messages = messages[0..],
+        }, .{})},
+    );
+    defer allocator.free(body);
+
+    const key_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{api_key});
+    defer allocator.free(key_header);
+
+    const output = try runCommandCapture(allocator, &.{
+        "curl",
+        "-sS",
+        "-X",
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        "anthropic-version: 2023-06-01",
+        "-H",
+        key_header,
+        "-d",
+        body,
+    });
+    defer allocator.free(output);
+
+    return extractAnthropicText(allocator, output);
+}
+
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 2 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+    return result.stdout;
+}
+
+fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    const OutputContent = struct { text: ?[]const u8 = null };
+    const OutputItem = struct {
+        text: ?[]const u8 = null,
+        content: ?[]const OutputContent = null,
+    };
+    const Msg = struct { content: ?[]const u8 = null };
+    const Choice = struct { message: Msg };
+    const ApiError = struct { message: ?[]const u8 = null };
+    const Resp = struct {
+        output_text: ?[]const u8 = null,
+        output: ?[]const OutputItem = null,
+        choices: ?[]const Choice = null,
+        @"error": ?ApiError = null,
+    };
+
+    const Wrapper = struct {
+        response: ?Resp = null,
+        result: ?Resp = null,
+        data: ?Resp = null,
+    };
+
+    var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch {
+        return allocator.dupe(u8, json);
+    };
+    defer parsed.deinit();
+
+    if (try extractFromResp(allocator, parsed.value)) |text| return text;
+
+    var wrapped = std.json.parseFromSlice(Wrapper, allocator, json, .{ .ignore_unknown_fields = true }) catch {
+        return QueryError.EmptyModelResponse;
+    };
+    defer wrapped.deinit();
+
+    if (wrapped.value.response) |r| {
+        if (try extractFromResp(allocator, r)) |text| return text;
+    }
+    if (wrapped.value.result) |r| {
+        if (try extractFromResp(allocator, r)) |text| return text;
+    }
+    if (wrapped.value.data) |r| {
+        if (try extractFromResp(allocator, r)) |text| return text;
+    }
+
+    return QueryError.EmptyModelResponse;
+}
+
+fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
+    if (resp.output_text) |text| {
+        if (text.len > 0) return try allocator.dupe(u8, text);
+    }
+    if (resp.output) |items| {
+        for (items) |item| {
+            if (item.text) |text| {
+                if (text.len > 0) return try allocator.dupe(u8, text);
+            }
+            if (item.content) |parts| {
+                for (parts) |part| {
+                    if (part.text) |text| {
+                        if (text.len > 0) return try allocator.dupe(u8, text);
+                    }
+                }
+            }
+        }
+    }
+    if (resp.choices) |choices| {
+        if (choices.len > 0) {
+            if (choices[0].message.content) |text| {
+                if (text.len > 0) return try allocator.dupe(u8, text);
+            }
+        }
+    }
+
+    if (resp.@"error") |err| {
+        if (err.message) |msg| {
+            if (msg.len > 0) return try std.fmt.allocPrint(allocator, "API error: {s}", .{msg});
+        }
+    }
+
+    return null;
+}
+
+fn extractAnthropicText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
+    const Content = struct { text: ?[]const u8 = null };
+    const Resp = struct { content: ?[]const Content = null };
+
+    var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch {
+        return allocator.dupe(u8, json);
+    };
+    defer parsed.deinit();
+
+    if (parsed.value.content) |content| {
+        for (content) |part| {
+            if (part.text) |text| {
+                if (text.len > 0) return allocator.dupe(u8, text);
+            }
+        }
+    }
+    return QueryError.EmptyModelResponse;
+}
+
+test "extract openai output_text" {
+    const allocator = std.testing.allocator;
+    const out = try extractOpenAIText(allocator, "{\"output_text\":\"hello\"}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("hello", out);
+}
+
+test "extract anthropic text" {
+    const allocator = std.testing.allocator;
+    const out = try extractAnthropicText(allocator, "{\"content\":[{\"text\":\"hi there\"}]}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("hi there", out);
+}
+
+test "extract openai nested output content" {
+    const allocator = std.testing.allocator;
+    const out = try extractOpenAIText(allocator, "{\"output\":[{\"content\":[{\"text\":\"nested hello\"}]}]}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("nested hello", out);
+}
+
+test "extract openai error message" {
+    const allocator = std.testing.allocator;
+    const out = try extractOpenAIText(allocator, "{\"error\":{\"message\":\"invalid api key\"}}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("API error: invalid api key", out);
+}
+
+test "oauth token detector" {
+    try std.testing.expect(!isLikelyOAuthToken("sk-test-key"));
+    try std.testing.expect(isLikelyOAuthToken("a.b.c"));
+}
+
+test "extract openai wrapped response object" {
+    const allocator = std.testing.allocator;
+    const out = try extractOpenAIText(allocator, "{\"response\":{\"output_text\":\"wrapped\"}}");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("wrapped", out);
+}
+
+test "parse openai response meta" {
+    const allocator = std.testing.allocator;
+    const meta = try parseOpenAIResponseMeta(allocator, "{\"id\":\"resp_123\",\"status\":\"in_progress\"}");
+    defer {
+        if (meta.id) |id| allocator.free(id);
+        if (meta.status) |status| allocator.free(status);
+    }
+    try std.testing.expect(meta.id != null);
+    try std.testing.expect(meta.status != null);
+    try std.testing.expectEqualStrings("resp_123", meta.id.?);
+    try std.testing.expectEqualStrings("in_progress", meta.status.?);
+}

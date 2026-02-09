@@ -1,6 +1,7 @@
+.zagent
 
 # Zig
-zig-cache/
+.zig-cache/
 zig-out/
 build
 

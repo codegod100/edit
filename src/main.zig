@@ -10,6 +10,7 @@ pub fn main() !void {
 }
 
 test {
+    _ = @import("llm.zig");
     _ = @import("skills.zig");
     _ = @import("repl.zig");
     _ = @import("provider_manager.zig");
