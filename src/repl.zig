@@ -2621,6 +2621,17 @@ fn runModelTurnWithTools(
                     context_prompt = next_prompt;
                     continue;
                 }
+            } else if (step + 1 < max_tool_steps) {
+                // Model returned text but we haven't hit max steps yet
+                // Add response to context and continue the loop
+                const next_prompt = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
+                    .{ context_prompt, final },
+                );
+                allocator.free(final);
+                context_prompt = next_prompt;
+                continue;
             }
 
             return .{
@@ -2651,6 +2662,17 @@ fn runModelTurnWithTools(
                         .files_touched = try joinPaths(allocator, paths.items),
                     };
                 }
+            } else if (step + 1 < max_tool_steps) {
+                // Model returned text but we haven't hit max steps yet
+                // Add response to context and continue the loop
+                const next_prompt = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
+                    .{ context_prompt, final },
+                );
+                allocator.free(final);
+                context_prompt = next_prompt;
+                continue;
             }
 
             return .{
