@@ -44,7 +44,9 @@ pub const ProviderManager = struct {
             if (!isAllowed(spec.id, options)) continue;
 
             const found_value = findEnvValue(spec.env_vars, env);
-            if (found_value == null) continue;
+            // Allow opencode without API key for free tier models
+            const is_opencode = std.mem.eql(u8, spec.id, "opencode");
+            if (found_value == null and !is_opencode) continue;
 
             const single_key = if (spec.env_vars.len == 1) found_value else null;
             try out.append(allocator, .{
