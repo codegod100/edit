@@ -2124,6 +2124,11 @@ fn executeInlineToolCalls(
         };
         defer allocator.free(tool_out);
 
+        // For mutating tools, print diff to stdout for user visibility
+        if (isMutatingToolName(tool_name)) {
+            try stdout.print("{s}\n", .{tool_out});
+        }
+
         try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, tool_out });
     }
 
