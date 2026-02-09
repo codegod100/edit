@@ -537,14 +537,6 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     const output = try runCommandCapture(allocator, argv.items);
     defer allocator.free(output);
 
-    // Debug: Log raw output if it contains thinking/reasoning keywords
-    if (std.mem.indexOf(u8, output, "reasoning") != null or
-        std.mem.indexOf(u8, output, "thinking") != null or
-        std.mem.indexOf(u8, output, "thought") != null)
-    {
-        logger.info("API response contains thinking fields: {s}", .{output});
-    }
-
     return extractOpenAIText(allocator, output);
 }
 
