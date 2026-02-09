@@ -2523,8 +2523,12 @@ fn runModelTurnWithTools(
 
     var step: usize = 0;
     const soft_limit: usize = 6; // After this, check todos and ask model if we should continue
+    var just_received_tool_call: bool = false; // Track if we got TOOL_CALL at soft limit
 
     while (true) : (step += 1) {
+        // Reset flag at start of iteration
+        just_received_tool_call = false;
+
         // Check for cancellation at start of each iteration
         if (isCancelled()) {
             allocator.free(context_prompt);
@@ -2537,7 +2541,8 @@ fn runModelTurnWithTools(
         }
 
         // On step 6+, check todos and ask model if we should continue
-        if (step >= soft_limit) {
+        // Skip this check if we just received a TOOL_CALL (model wants to continue)
+        if (step >= soft_limit and !just_received_tool_call) {
             const todo_summary = todo_list.summary();
             try stdout.print("{s}[step {d}] Checking if more work needed... (todos: {s}){s}\n", .{ C_DIM, step, todo_summary, C_RESET });
 
@@ -2557,6 +2562,7 @@ fn runModelTurnWithTools(
                 allocator.free(context_prompt);
                 context_prompt = try allocator.dupe(u8, check_response);
                 allocator.free(check_response);
+                just_received_tool_call = true; // Mark that we got a TOOL_CALL
                 continue;
             }
 
