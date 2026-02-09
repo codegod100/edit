@@ -765,6 +765,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
 
+    // Load persisted todos
+    const todos_file = try std.fs.path.join(allocator, &.{ config_dir, "todos.json" });
+    defer allocator.free(todos_file);
+    try todo_list.loadFromFile(allocator, todos_file);
+
+    // Helper to save todos (called after modifications)
+    const saveTodos = struct {
+        fn call(tl: *todo.TodoList, alloc: std.mem.Allocator, path: []const u8) void {
+            tl.saveToFile(alloc, path) catch |e| {
+                logger.info("Failed to save todos: {s}\n", .{@errorName(e)});
+            };
+        }
+    }.call;
+
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
@@ -1016,6 +1030,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 };
                 defer turn.deinit(allocator);
+
+                // Save todos after model turn completes
+                saveTodos(&todo_list, allocator, todos_file);
 
                 try context_window.append(allocator, .user, trimmed, .{});
                 try context_window.append(allocator, .assistant, turn.response, .{

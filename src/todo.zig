@@ -94,7 +94,7 @@ pub const TodoList = struct {
             self.allocator.free(item.id);
             self.allocator.free(item.description);
         }
-        self.items.clearRetainingCapacity(self.allocator);
+        self.items.clearRetainingCapacity();
     }
 
     pub fn list(self: *const TodoList, allocator: std.mem.Allocator) ![]u8 {
@@ -141,6 +141,73 @@ pub const TodoList = struct {
             return "all done";
         } else {
             return "in progress";
+        }
+    }
+
+    // Persistence - save todos to JSON file
+    pub fn saveToFile(self: *const TodoList, allocator: std.mem.Allocator, file_path: []const u8) !void {
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+        const w = json.writer(allocator);
+
+        try w.print("[\n", .{});
+        for (self.items.items, 0..) |item, i| {
+            if (i > 0) try w.print(",\n", .{});
+            const status_str = switch (item.status) {
+                .pending => "pending",
+                .in_progress => "in_progress",
+                .done => "done",
+            };
+            try w.print("  {{\"id\":\"{s}\",\"description\":\"{s}\",\"status\":\"{s}\",\"created_at\":{d}}}", .{ item.id, item.description, status_str, item.created_at });
+        }
+        try w.print("\n]", .{});
+
+        // Ensure directory exists
+        const dir = std.fs.path.dirname(file_path) orelse return;
+        try std.fs.cwd().makePath(dir);
+
+        // Write to temp file then rename for atomicity
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
+        defer allocator.free(tmp_path);
+
+        try std.fs.cwd().writeFile(.{ .sub_path = tmp_path, .data = json.items });
+        try std.fs.cwd().rename(tmp_path, file_path);
+    }
+
+    // Persistence - load todos from JSON file
+    pub fn loadFromFile(self: *TodoList, allocator: std.mem.Allocator, file_path: []const u8) !void {
+        // Clear existing items first
+        self.clearAll();
+
+        const data = std.fs.cwd().readFileAlloc(allocator, file_path, 1024 * 1024) catch |err| {
+            if (err == error.FileNotFound) return; // No existing file is OK
+            return err;
+        };
+        defer allocator.free(data);
+
+        const ItemJson = struct {
+            id: []const u8,
+            description: []const u8,
+            status: []const u8,
+            created_at: i64,
+        };
+
+        var parsed = std.json.parseFromSlice([]ItemJson, allocator, data, .{}) catch return;
+        defer parsed.deinit();
+
+        for (parsed.value) |item_json| {
+            const status = std.meta.stringToEnum(TodoStatus, item_json.status) orelse .pending;
+            const id = try self.allocator.dupe(u8, item_json.id);
+            const desc = try self.allocator.dupe(u8, item_json.description);
+
+            const item = TodoItem{
+                .id = id,
+                .description = desc,
+                .status = status,
+                .created_at = item_json.created_at,
+                .completed_at = if (status == .done) std.time.milliTimestamp() else null,
+            };
+            try self.items.append(self.allocator, item);
         }
     }
 };
