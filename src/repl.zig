@@ -9,10 +9,25 @@ const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
 const todo = @import("todo.zig");
 
+// Global cancellation flag for interrupting work
+var g_cancel_requested: bool = false;
+
 // Helper to convert tools.ToolDef slice to llm.ToolRouteDef slice
 fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
     // Safety: ToolDef and ToolRouteDef have identical layout
     return @ptrCast(defs);
+}
+
+fn isCancelled() bool {
+    return g_cancel_requested;
+}
+
+fn setCancelled() void {
+    g_cancel_requested = true;
+}
+
+fn resetCancelled() void {
+    g_cancel_requested = false;
 }
 
 pub const CommandTag = enum {
@@ -766,6 +781,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         .{},
     );
     while (true) {
+        // Reset cancellation flag at start of each iteration
+        resetCancelled();
+
         // Build prompt dynamically with current model info
         const prompt_text = try buildPrompt(allocator, cwd, selected_model);
         defer allocator.free(prompt_text);
@@ -778,6 +796,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         const line = line_opt.?;
         defer allocator.free(line);
+
+        // Check if user cancelled with ESC
+        if (line.len == 0 and isCancelled()) {
+            continue; // Skip processing if cancelled
+        }
 
         const prev_history_len = history.items.items.len;
         try history.append(allocator, line);
@@ -1063,10 +1086,15 @@ fn readPromptLineFallback(
 
         const ch = byte_buf[0];
 
-        // Escape sequences (arrow keys, etc.)
+        // Escape sequences (arrow keys, etc.) or bare ESC for cancellation
         if (ch == 27) {
             const n1 = try stdin_file.read(byte_buf[1..2]);
-            if (n1 == 0) continue;
+            if (n1 == 0) {
+                // Bare ESC key pressed - signal cancellation
+                setCancelled();
+                try stdout.print("\n^C (cancelled)\n", .{});
+                return try allocator.dupe(u8, ""); // Return empty line to indicate cancellation
+            }
 
             if (byte_buf[1] == '[') {
                 const n2 = try stdin_file.read(byte_buf[2..3]);
@@ -2459,6 +2487,16 @@ fn runModelTurnWithTools(
 
     var step: usize = 0;
     while (step < max_tool_steps) : (step += 1) {
+        // Check for cancellation at start of each iteration
+        if (isCancelled()) {
+            return .{
+                .response = try allocator.dupe(u8, "Operation cancelled by user."),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
+        }
+
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
 
@@ -2594,26 +2632,10 @@ fn runModelTurnWithTools(
             };
         }
 
-        if (!mutation_request and isMutatingToolName(routed.?.tool)) {
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
-
-            // Check for inline tool calls
-            if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
-                allocator.free(final);
-                if (tool_result) |result| {
-                    allocator.free(result);
-                    return .{
-                        .response = try allocator.dupe(u8, "Executed tool from model response."),
-                        .tool_calls = tool_calls,
-                        .error_count = 0,
-                        .files_touched = try joinPaths(allocator, paths.items),
-                    };
-                }
-            }
-
+        // Check for cancellation before executing tool
+        if (isCancelled()) {
             return .{
-                .response = final,
+                .response = try allocator.dupe(u8, "Operation cancelled by user during tool execution."),
                 .tool_calls = tool_calls,
                 .error_count = 0,
                 .files_touched = try joinPaths(allocator, paths.items),
