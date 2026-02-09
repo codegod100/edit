@@ -2034,6 +2034,7 @@ fn buildToolResultEventLine(
     status: []const u8,
     bytes: usize,
     duration_ms: i64,
+    file_path: ?[]const u8,
 ) ![]u8 {
     // Colorize status
     const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
@@ -2047,6 +2048,9 @@ fn buildToolResultEventLine(
     try w.print("{s}step={d}{s} ", .{ C_CYAN, step, C_RESET });
     try w.print("{s}call_id={s}{s} ", .{ C_DIM, call_id, C_RESET });
     try w.print("{s}tool={s}{s} ", .{ C_YELLOW, tool_name, C_RESET });
+    if (file_path) |fp| {
+        try w.print("{s}file={s}{s} ", .{ C_CYAN, fp, C_RESET });
+    }
     try w.print("{s}status={s}{s} ", .{ status_color, status, C_RESET });
     try w.print("{s}bytes={d}{s} ", .{ C_DIM, bytes, C_RESET });
     try w.print("{s}duration_ms={d}{s}", .{ C_DIM, duration_ms, C_RESET });
@@ -2358,11 +2362,15 @@ fn runModelTurnWithTools(
 
         const started_ms = std.time.milliTimestamp();
 
+        // Extract file path for file-related tools
+        const file_path = parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
+
         const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json) catch |err| {
             const failed_ms = std.time.milliTimestamp();
             const duration_ms = failed_ms - started_ms;
-            const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms);
+            const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);
             defer allocator.free(err_line);
+            if (file_path) |fp| allocator.free(fp);
             try stdout.print("{s}\n", .{err_line});
             return .{
                 .response = try std.fmt.allocPrint(
@@ -2379,14 +2387,15 @@ fn runModelTurnWithTools(
 
         const finished_ms = std.time.milliTimestamp();
         const duration_ms = finished_ms - started_ms;
-        const ok_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms);
+        const ok_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms, file_path);
         defer allocator.free(ok_line);
+        if (file_path) |fp| allocator.free(fp);
         try stdout.print("{s}\n", .{ok_line});
 
         if (isMutatingToolName(routed.?.tool)) {
-            const meta = if (tool_out.len > 2200) tool_out[0..2200] else tool_out;
+            // For mutating tools, show the full output including the colored diff
             try printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
-            try stdout.print("{s}\n", .{meta});
+            try stdout.print("{s}\n", .{tool_out});
         }
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
