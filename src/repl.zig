@@ -7,6 +7,7 @@ const config_store = @import("config_store.zig");
 const llm = @import("llm.zig");
 const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
+const todo = @import("todo.zig");
 
 // Helper to convert tools.ToolDef slice to llm.ToolRouteDef slice
 fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
@@ -745,6 +746,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
     try loadContextWindow(allocator, config_dir, &context_window);
     try compactContextWindow(allocator, &context_window, null);
 
+    // Initialize todo list for tracking progress
+    var todo_list = todo.TodoList.init(allocator);
+    defer todo_list.deinit();
+
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
@@ -983,7 +988,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runModelTurnWithTools(allocator, stdout, active.?, trimmed, model_input) catch |err| {
+                var turn = runModelTurnWithTools(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -2284,6 +2289,7 @@ fn executeInlineToolCalls(
     response: []const u8,
     paths: *std.ArrayList([]u8),
     tool_calls: *usize,
+    todo_list: *todo.TodoList,
 ) !?[]u8 {
     var result_buf = std.ArrayList(u8).empty;
     defer result_buf.deinit(allocator);
@@ -2354,7 +2360,7 @@ fn executeInlineToolCalls(
         }
         try stdout.print("\n", .{});
 
-        const tool_out = tools.executeNamed(allocator, tool_name, args) catch |err| {
+        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
             continue;
         };
@@ -2433,6 +2439,7 @@ fn runModelTurnWithTools(
     active: ActiveModel,
     raw_user_request: []const u8,
     user_input: []const u8,
+    todo_list: *todo.TodoList,
 ) !RunTurnResult {
     const max_tool_steps: usize = 6;
     var context_prompt = try allocator.dupe(u8, user_input);
@@ -2533,7 +2540,7 @@ fn runModelTurnWithTools(
             // Check if response contains inline tool calls (TOOL_CALL format)
             if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
                 // Execute inline tool calls from model response
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
                 allocator.free(final);
 
                 if (tool_result) |result| {
@@ -2566,7 +2573,7 @@ fn runModelTurnWithTools(
 
             // Check for inline tool calls
             if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
                 allocator.free(final);
                 if (tool_result) |result| {
                     allocator.free(result);
@@ -2592,7 +2599,7 @@ fn runModelTurnWithTools(
 
             // Check for inline tool calls
             if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls);
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
                 allocator.free(final);
                 if (tool_result) |result| {
                     allocator.free(result);
@@ -2633,7 +2640,7 @@ fn runModelTurnWithTools(
         // Extract file path for file-related tools
         const file_path = parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
 
-        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json) catch |err| {
+        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
             const failed_ms = std.time.milliTimestamp();
             const duration_ms = failed_ms - started_ms;
             const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);

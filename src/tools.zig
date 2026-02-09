@@ -1,4 +1,5 @@
 const std = @import("std");
+const todo = @import("todo.zig");
 
 pub const ToolError = error{InvalidToolCommand};
 pub const NamedToolError = error{ InvalidToolName, InvalidArguments, IoError };
@@ -21,6 +22,12 @@ pub const definitions = [_]ToolDef{
     .{ .name = "write", .description = "Write full content to a file path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"filePath\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "edit", .description = "Replace oldString with newString in one file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
     .{ .name = "apply_patch", .description = "Apply a structured patch with add/update/delete operations.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"patchText\":{\"type\":\"string\"}},\"required\":[\"patchText\"],\"additionalProperties\":false}" },
+    // Todo tools for tracking progress
+    .{ .name = "todo_add", .description = "Add a new task to the todo list to track progress.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"description\":{\"type\":\"string\",\"description\":\"Task description\"}},\"required\":[\"description\"],\"additionalProperties\":false}" },
+    .{ .name = "todo_update", .description = "Update the status of a todo item (pending/in_progress/done).", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID\"},\"status\":{\"type\":\"string\",\"description\":\"New status: pending, in_progress, or done\"}},\"required\":[\"id\",\"status\"],\"additionalProperties\":false}" },
+    .{ .name = "todo_list", .description = "List all todo items with their current status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
+    .{ .name = "todo_remove", .description = "Remove a todo item by ID.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID to remove\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
+    .{ .name = "todo_clear_done", .description = "Clear all completed todo items.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
 };
 
 pub fn list() []const []const u8 {
@@ -54,7 +61,7 @@ pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     return ToolError.InvalidToolCommand;
 }
 
-pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8) ![]u8 {
+pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList) ![]u8 {
     if (std.mem.eql(u8, name, "bash")) {
         const A = struct { command: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
@@ -149,6 +156,57 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
             return std.fmt.allocPrint(allocator, "{s}{s}", .{ out, d });
         }
         return out;
+    }
+
+    // Todo tools
+    if (std.mem.eql(u8, name, "todo_add")) {
+        const A = struct { description: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const desc = p.value.description orelse return NamedToolError.InvalidArguments;
+
+        const id = try todo_list.add(desc);
+        return std.fmt.allocPrint(allocator, "Added todo {s}: {s}", .{ id, desc });
+    }
+
+    if (std.mem.eql(u8, name, "todo_list")) {
+        return todo_list.list(allocator);
+    }
+
+    if (std.mem.eql(u8, name, "todo_update")) {
+        const A = struct { id: ?[]const u8 = null, status: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const id = p.value.id orelse return NamedToolError.InvalidArguments;
+        const status_str = p.value.status orelse return NamedToolError.InvalidArguments;
+
+        const status = std.meta.stringToEnum(todo.TodoStatus, status_str) orelse return NamedToolError.InvalidArguments;
+
+        const success = try todo_list.update(id, status);
+        if (success) {
+            return std.fmt.allocPrint(allocator, "Updated todo {s} to {s}", .{ id, status_str });
+        } else {
+            return std.fmt.allocPrint(allocator, "Todo {s} not found", .{id});
+        }
+    }
+
+    if (std.mem.eql(u8, name, "todo_remove")) {
+        const A = struct { id: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const id = p.value.id orelse return NamedToolError.InvalidArguments;
+
+        const success = try todo_list.remove(id);
+        if (success) {
+            return std.fmt.allocPrint(allocator, "Removed todo {s}", .{id});
+        } else {
+            return std.fmt.allocPrint(allocator, "Todo {s} not found", .{id});
+        }
+    }
+
+    if (std.mem.eql(u8, name, "todo_clear_done")) {
+        todo_list.clearDone();
+        return std.fmt.allocPrint(allocator, "Cleared all completed todos", .{});
     }
 
     return NamedToolError.InvalidToolName;
@@ -680,20 +738,26 @@ test "edit fails on ambiguous single replace" {
     );
     defer allocator.free(args);
 
-    const out = executeNamed(allocator, "edit", args);
+    var todo_list = todo.TodoList.init(allocator);
+    defer todo_list.deinit();
+    const out = executeNamed(allocator, "edit", args, &todo_list);
     try std.testing.expectError(NamedToolError.InvalidArguments, out);
 }
 
 test "apply_patch rejects empty patch" {
     const allocator = std.testing.allocator;
-    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}");
+    var todo_list2 = todo.TodoList.init(allocator);
+    defer todo_list2.deinit();
+    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}", &todo_list2);
     defer allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "empty patch") != null);
 }
 
 test "path guard rejects parent traversal" {
     const allocator = std.testing.allocator;
-    const out = executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}");
+    var todo_list3 = todo.TodoList.init(allocator);
+    defer todo_list3.deinit();
+    const out = executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3);
     try std.testing.expectError(NamedToolError.InvalidArguments, out);
 }
 
