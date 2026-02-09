@@ -8,6 +8,12 @@ const llm = @import("llm.zig");
 const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
 
+// Helper to convert tools.ToolDef slice to llm.ToolRouteDef slice
+fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
+    // Safety: ToolDef and ToolRouteDef have identical layout
+    return @ptrCast(defs);
+}
+
 pub const CommandTag = enum {
     none,
     quit,
@@ -427,7 +433,7 @@ fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextW
     );
     defer allocator.free(prompt);
 
-    const text = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt) catch return null;
+    const text = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt, toolDefsToLlm(tools.definitions[0..])) catch return null;
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
         allocator.free(text);
         return null;
@@ -770,60 +776,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     if (sub_key == null) continue;
                     owned_key = sub_key.?;
                     key_slice = owned_key.?;
-                } else if (std.mem.eql(u8, provider.id, "opencode")) {
-                    // Check if opencode has free tier models
-                    var has_free_models = false;
-                    for (provider.models) |model| {
-                        if (std.mem.indexOf(u8, model.id, "free") != null) {
-                            has_free_models = true;
-                            break;
-                        }
-                    }
-
-                    if (has_free_models) {
-                        const use_free_opt = try promptLine(allocator, stdin, stdout, "Use free tier models? [Y/n]: ");
-                        if (use_free_opt) |uf| {
-                            defer allocator.free(uf);
-                            const trimmed = std.mem.trim(u8, uf, " \t\r\n");
-                            if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y")) {
-                                // Use public key for free tier
-                                owned_key = try allocator.dupe(u8, "public");
-                                key_slice = owned_key.?;
-                                try stdout.print("Using free tier (public key)\n", .{});
-                            } else {
-                                // Prompt for real API key
-                                const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
-                                if (key_opt == null) continue;
-                                const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
-                                if (key.len == 0) {
-                                    allocator.free(key_opt.?);
-                                    try stdout.print("Cancelled: empty key.\n", .{});
-                                    continue;
-                                }
-                                owned_key = try allocator.dupe(u8, key);
-                                allocator.free(key_opt.?);
-                                key_slice = owned_key.?;
-                            }
-                        } else {
-                            // Default to free tier if user just hits enter
-                            owned_key = try allocator.dupe(u8, "public");
-                            key_slice = owned_key.?;
-                            try stdout.print("Using free tier (public key)\n", .{});
-                        }
-                    } else {
-                        // No free models, prompt for API key normally
-                        const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
-                        if (key_opt == null) continue;
-                        const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
-                        if (key.len == 0) {
-                            allocator.free(key_opt.?);
-                            try stdout.print("Cancelled: empty key.\n", .{});
-                            continue;
-                        }
-                        owned_key = try allocator.dupe(u8, key);
-                        allocator.free(key_opt.?);
-                        key_slice = owned_key.?;
-                    }
                 } else {
                     const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
                     if (key_opt == null) continue;
@@ -1882,7 +1834,7 @@ fn inferToolCallWithTextFallback(allocator: std.mem.Allocator, active: ActiveMod
     const prompt = try buildFallbackToolInferencePrompt(allocator, input, require_mutation);
     defer allocator.free(prompt);
 
-    const raw = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt) catch return null;
+    const raw = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt, toolDefsToLlm(tools.definitions[0..])) catch return null;
     defer allocator.free(raw);
     return parseFallbackToolCallFromText(allocator, raw);
 }
@@ -2209,7 +2161,7 @@ fn runModelTurnWithTools(
                 }
             }
 
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2223,7 +2175,7 @@ fn runModelTurnWithTools(
         }
 
         if (!isKnownToolName(routed.?.tool)) {
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2233,7 +2185,7 @@ fn runModelTurnWithTools(
         }
 
         if (!mutation_request and isMutatingToolName(routed.?.tool)) {
-            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt, toolDefsToLlm(tools.definitions[0..]));
             return .{
                 .response = final,
                 .tool_calls = tool_calls,
@@ -2311,7 +2263,7 @@ fn runModelTurnWithTools(
         .{ context_prompt, max_tool_steps },
     );
     defer allocator.free(fallback_prompt);
-    const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt);
+    const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt, toolDefsToLlm(tools.definitions[0..]));
     return .{
         .response = final,
         .tool_calls = tool_calls,

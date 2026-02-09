@@ -52,21 +52,30 @@ pub fn query(
     api_key: ?[]const u8,
     model_id: []const u8,
     prompt: []const u8,
+    tool_defs: ?[]const ToolRouteDef,
 ) ![]u8 {
-    const key = api_key orelse {
-        logger.err("API key missing for provider: {s}", .{provider_id});
-        return QueryError.MissingApiKey;
-    };
+    // Auto-use "public" key for opencode free tier models
+    const is_opencode_free = std.mem.eql(u8, provider_id, "opencode") and
+        std.mem.indexOf(u8, model_id, "free") != null;
 
-    logger.logModelRequest(provider_id, model_id, prompt.len, false);
+    const key = if (is_opencode_free)
+        // For opencode free models, use "public" if no real key provided
+        api_key orelse "public"
+    else
+        api_key orelse {
+            logger.err("API key missing for provider: {s}", .{provider_id});
+            return QueryError.MissingApiKey;
+        };
+
+    logger.logModelRequest(provider_id, model_id, prompt.len, tool_defs != null and tool_defs.?.len > 0);
 
     const start_time = std.time.milliTimestamp();
     const result = if (std.mem.eql(u8, provider_id, "openai"))
-        queryOpenAI(allocator, key, model_id, prompt)
+        queryOpenAI(allocator, key, model_id, prompt, tool_defs)
     else if (std.mem.eql(u8, provider_id, "anthropic"))
-        queryAnthropic(allocator, key, model_id, prompt)
+        queryAnthropic(allocator, key, model_id, prompt, tool_defs)
     else if (std.mem.eql(u8, provider_id, "opencode"))
-        queryOpenCodeZen(allocator, key, model_id, prompt)
+        queryOpenCodeZen(allocator, key, model_id, prompt, tool_defs)
     else
         error.UnsupportedProvider;
 
@@ -77,7 +86,8 @@ pub fn query(
     };
 }
 
-fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, _tool_defs: ?[]const ToolRouteDef) ![]u8 {
+    _ = _tool_defs;
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth);
 
@@ -344,7 +354,8 @@ fn isLikelyOAuthToken(token: []const u8) bool {
     return std.mem.count(u8, token, ".") >= 2;
 }
 
-fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, _tool_defs: ?[]const ToolRouteDef) ![]u8 {
+    _ = _tool_defs;
     const Message = struct { role: []const u8, content: []const u8 };
     const messages = [_]Message{.{ .role = "user", .content = prompt }};
 
@@ -382,21 +393,70 @@ fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: [
     return extractAnthropicText(allocator, output);
 }
 
-fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, tool_defs: ?[]const ToolRouteDef) ![]u8 {
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth);
 
     const Message = struct { role: []const u8, content: []const u8 };
     const messages = [_]Message{.{ .role = "user", .content = prompt }};
 
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{f}",
-        .{std.json.fmt(.{
-            .model = model_id,
-            .messages = messages[0..],
-        }, .{})},
-    );
+    // Build tools array if provided
+    var tools_json: ?[]u8 = null;
+    defer if (tools_json) |tj| allocator.free(tj);
+
+    if (tool_defs) |defs| {
+        var tools_arr = std.ArrayList(u8).empty;
+        defer tools_arr.deinit(allocator);
+
+        try tools_arr.appendSlice(allocator, "[");
+        for (defs, 0..) |def, i| {
+            if (i > 0) try tools_arr.appendSlice(allocator, ",");
+            // Build tool JSON manually
+            try tools_arr.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":\"");
+            try tools_arr.appendSlice(allocator, def.name);
+            try tools_arr.appendSlice(allocator, "\",\"description\":\"");
+            try tools_arr.appendSlice(allocator, def.description);
+            try tools_arr.appendSlice(allocator, "\",\"parameters\":");
+            try tools_arr.appendSlice(allocator, def.parameters_json);
+            try tools_arr.appendSlice(allocator, "}}");
+        }
+        try tools_arr.appendSlice(allocator, "]");
+        tools_json = try tools_arr.toOwnedSlice(allocator);
+    }
+
+    var body: []u8 = undefined;
+    if (tools_json) |tj| {
+        // Build body with tools
+        var body_arr = std.ArrayList(u8).empty;
+        defer body_arr.deinit(allocator);
+        const w = body_arr.writer(allocator);
+
+        try w.print("{{\"model\":\"{s}\",\"messages\":", .{model_id});
+        // Serialize messages manually
+        try w.print("[{{\"role\":\"user\",\"content\":\"", .{});
+        // Escape the prompt
+        for (prompt) |ch| {
+            switch (ch) {
+                '\\' => try w.print("\\\\", .{}),
+                '"' => try w.print("\\\"", .{}),
+                '\n' => try w.print("\\n", .{}),
+                '\r' => try w.print("\\r", .{}),
+                '\t' => try w.print("\\t", .{}),
+                else => try w.print("{c}", .{ch}),
+            }
+        }
+        try w.print("\"}}],\"tools\":{s}}}", .{tj});
+        body = try body_arr.toOwnedSlice(allocator);
+    } else {
+        body = try std.fmt.allocPrint(
+            allocator,
+            "{f}",
+            .{std.json.fmt(.{
+                .model = model_id,
+                .messages = messages[0..],
+            }, .{})},
+        );
+    }
     defer allocator.free(body);
 
     const output = try runCommandCapture(allocator, &.{
