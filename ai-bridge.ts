@@ -133,25 +133,78 @@ const tools = {
   },
 };
 
-async function handleChat(request: any) {
-  const messages = request.messages as CoreMessage[];
-  const cleanedMessages = messages.map(m => {
-    if (typeof m.content === 'string') {
-      return { ...m, content: m.content.replace(/\u001b\[[0-9;]*m/g, '') };
-    }
-    return m;
-  });
+function normalizeMessages(messages: any[]): CoreMessage[] {
+  const toolCallMap = new Map<string, string>();
 
-  console.error(`Chat request with ${cleanedMessages.length} messages. Provider: ${providerId}, Model: ${modelId}`);
+  return messages.map(m => {
+    let role = m.role;
+    let content = m.content;
+    
+    if (typeof content === 'string') {
+      content = content.replace(/\u001b\[[0-9;]*m/g, '');
+    }
+
+    if (role === 'assistant') {
+      const toolCalls = m.toolCalls || m.tool_calls;
+      if (toolCalls && Array.isArray(toolCalls)) {
+        const normalizedToolCalls = toolCalls.map((tc: any) => {
+          const id = tc.toolCallId || tc.id;
+          const name = tc.toolName || (tc.function ? tc.function.name : tc.tool);
+          let args = tc.args;
+          if (typeof args === 'string') {
+            try { args = JSON.parse(args); } catch (e) { args = {}; }
+          } else if (tc.function && tc.function.arguments) {
+            try { args = JSON.parse(tc.function.arguments); } catch (e) { args = {}; }
+          }
+          
+          if (id && name) toolCallMap.set(id, name);
+          
+          return { toolCallId: id, toolName: name, args: args || {} };
+        });
+
+        return { role: 'assistant', content: content || '', toolCalls: normalizedToolCalls };
+      }
+    }
+
+    if (role === 'tool') {
+      const toolCallId = m.toolCallId || m.tool_call_id;
+      if (Array.isArray(content)) {
+        return {
+          role: 'tool',
+          content: content.map((p: any) => ({
+            ...p,
+            result: typeof p.result === 'string' ? p.result.replace(/\u001b\[[0-9;]*m/g, '') : p.result
+          }))
+        };
+      } else {
+        return {
+          role: 'tool',
+          content: [{
+            type: 'tool-result',
+            toolCallId: toolCallId,
+            toolName: m.toolName || m.tool || toolCallMap.get(toolCallId) || 'unknown',
+            result: content
+          }]
+        };
+      }
+    }
+
+    return { role, content: content || '' };
+  }) as CoreMessage[];
+}
+
+async function handleChat(request: any) {
+  const messages = normalizeMessages(request.messages || []);
+
+  console.error(`Chat request with ${messages.length} messages. Provider: ${providerId}, Model: ${modelId}`);
   
   try {
     const result = await generateText({
       model: getModel(),
-      messages: cleanedMessages,
+      messages: messages,
       tools: tools,
     });
     
-    // Attempt to recover args from steps if toolCalls has empty args
     const fallbackArgs = new Map<string, any>();
     if (result.steps) {
        for (const step of result.steps) {
@@ -168,18 +221,14 @@ async function handleChat(request: any) {
       text: result.text,
       toolCalls: result.toolCalls.map(tc => {
         let args = tc.args;
-        // If args is empty object, try fallback
         if (!args || (typeof args === 'object' && Object.keys(args).length === 0)) {
             const fb = fallbackArgs.get(tc.toolCallId);
             if (fb && Object.keys(fb).length > 0) {
                 console.error(`Recovered args for ${tc.toolCallId} from steps`);
                 args = fb;
-            } else {
-               // Last ditch: check if 'input' exists on tc (undocumented)
-               if ((tc as any).input) {
-                   console.error(`Using raw input for ${tc.toolCallId}`);
-                   args = (tc as any).input;
-               }
+            } else if ((tc as any).input) {
+                console.error(`Using raw input for ${tc.toolCallId}`);
+                args = (tc as any).input;
             }
         }
         
@@ -191,7 +240,6 @@ async function handleChat(request: any) {
       }),
       finishReason: result.finishReason,
     };
-    // console.error(`Response payload: ${JSON.stringify(response)}`);
     return response;
   } catch (e: any) {
     console.error(`AI SDK Error: ${e.name} - ${e.message}`);
