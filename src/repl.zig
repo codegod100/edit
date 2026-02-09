@@ -2498,7 +2498,6 @@ fn runModelTurnWithTools(
     user_input: []const u8,
     todo_list: *todo.TodoList,
 ) !RunTurnResult {
-    const max_tool_steps: usize = 6;
     var context_prompt = try allocator.dupe(u8, user_input);
     defer allocator.free(context_prompt);
     var forced_repo_probe_done = false;
@@ -2581,7 +2580,7 @@ fn runModelTurnWithTools(
             routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
-        if (routed == null and mutation_request and !forced_completion_probe_done and step + 1 < max_tool_steps) {
+        if (routed == null and mutation_request and !forced_completion_probe_done and step < soft_limit) {
             var touched = std.ArrayList([]const u8).empty;
             defer touched.deinit(allocator);
             for (paths.items) |p| try touched.append(allocator, p);
@@ -2654,7 +2653,7 @@ fn runModelTurnWithTools(
                     context_prompt = next_prompt;
                     continue;
                 }
-            } else if (step + 1 < max_tool_steps) {
+            } else if (step < soft_limit) {
                 // Model returned text but we haven't hit max steps yet
                 // Add response to context and continue the loop
                 const next_prompt = try std.fmt.allocPrint(
@@ -2695,7 +2694,7 @@ fn runModelTurnWithTools(
                         .files_touched = try joinPaths(allocator, paths.items),
                     };
                 }
-            } else if (step + 1 < max_tool_steps) {
+            } else if (step < soft_limit) {
                 // Model returned text but we haven't hit max steps yet
                 // Add response to context and continue the loop
                 const next_prompt = try std.fmt.allocPrint(
