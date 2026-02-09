@@ -2526,9 +2526,6 @@ fn runModelTurnWithTools(
     var just_received_tool_call: bool = false; // Track if we got TOOL_CALL at soft limit
 
     while (true) : (step += 1) {
-        // Reset flag at start of iteration
-        just_received_tool_call = false;
-
         // Check for cancellation at start of each iteration
         if (isCancelled()) {
             allocator.free(context_prompt);
@@ -2823,6 +2820,9 @@ fn runModelTurnWithTools(
         );
         allocator.free(context_prompt);
         context_prompt = next_prompt;
+
+        // Reset the flag after we've processed any TOOL_CALL from soft limit
+        just_received_tool_call = false;
     }
 }
 
