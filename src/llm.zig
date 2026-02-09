@@ -1,4 +1,5 @@
 const std = @import("std");
+const logger = @import("logger.zig");
 
 pub const QueryError = error{
     MissingApiKey,
@@ -52,15 +53,28 @@ pub fn query(
     model_id: []const u8,
     prompt: []const u8,
 ) ![]u8 {
-    const key = api_key orelse return QueryError.MissingApiKey;
+    const key = api_key orelse {
+        logger.err("API key missing for provider: {s}", .{provider_id});
+        return QueryError.MissingApiKey;
+    };
 
-    if (std.mem.eql(u8, provider_id, "openai")) {
-        return queryOpenAI(allocator, key, model_id, prompt);
-    }
-    if (std.mem.eql(u8, provider_id, "anthropic")) {
-        return queryAnthropic(allocator, key, model_id, prompt);
-    }
-    return QueryError.UnsupportedProvider;
+    logger.logModelRequest(provider_id, model_id, prompt.len, false);
+
+    const start_time = std.time.milliTimestamp();
+    const result = if (std.mem.eql(u8, provider_id, "openai"))
+        queryOpenAI(allocator, key, model_id, prompt)
+    else if (std.mem.eql(u8, provider_id, "anthropic"))
+        queryAnthropic(allocator, key, model_id, prompt)
+    else if (std.mem.eql(u8, provider_id, "opencode"))
+        queryOpenCodeZen(allocator, key, model_id, prompt)
+    else
+        error.UnsupportedProvider;
+
+    return result catch |err| {
+        _ = start_time;
+        logger.logApiError(provider_id, "query", null, null, err);
+        return err;
+    };
 }
 
 fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
@@ -89,17 +103,13 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
     });
     defer allocator.free(output);
 
-    const first = extractOpenAIText(allocator, output) catch |err| switch (err) {
-        QueryError.EmptyModelResponse => null,
-        else => return err,
-    };
-    if (first) |text| return text;
+    const first = try extractOpenAIText(allocator, output);
+    if (first.len > 0) return first;
+    defer allocator.free(first);
 
-    const stream_text = extractOpenAIStreamText(allocator, output) catch |err| switch (err) {
-        QueryError.EmptyModelResponse => null,
-        else => return err,
-    };
-    if (stream_text) |text| return text;
+    const stream_text = try extractOpenAIStreamText(allocator, output);
+    if (stream_text.len > 0) return stream_text;
+    defer allocator.free(stream_text);
 
     if (std.mem.eql(u8, endpoint, OPENAI_API_ENDPOINT)) {
         const meta = try parseOpenAIResponseMeta(allocator, output);
@@ -127,11 +137,11 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
                 });
                 defer allocator.free(polled);
 
-                const parsed = extractOpenAIText(allocator, polled) catch |poll_err| switch (poll_err) {
-                    QueryError.EmptyModelResponse => null,
-                    else => return poll_err,
-                };
-                if (parsed) |text| return text;
+                const parsed = try extractOpenAIText(allocator, polled);
+                if (parsed.len > 0 and !std.mem.startsWith(u8, parsed, "Could not extract") and !std.mem.startsWith(u8, parsed, "JSON parse error") and !std.mem.startsWith(u8, parsed, "Wrapper parse error")) {
+                    return parsed;
+                }
+                defer allocator.free(parsed);
 
                 const step = try parseOpenAIResponseMeta(allocator, polled);
                 defer {
@@ -147,7 +157,7 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
         const cap = @min(output.len, 1000);
         return std.fmt.allocPrint(allocator, "No text found in model response: {s}", .{output[0..cap]});
     }
-    return QueryError.EmptyModelResponse;
+    return std.fmt.allocPrint(allocator, "Empty response from API (0 bytes)", .{});
 }
 
 pub fn inferToolCall(
@@ -322,7 +332,10 @@ fn extractOpenAIStreamText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 
         try out.appendSlice(allocator, piece);
     }
 
-    if (out.items.len == 0) return QueryError.EmptyModelResponse;
+    if (out.items.len == 0) {
+        const preview_len = @min(raw.len, 800);
+        return std.fmt.allocPrint(allocator, "No text in stream response ({d} bytes):\n{s}", .{ raw.len, raw[0..preview_len] });
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -369,6 +382,41 @@ fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: [
     return extractAnthropicText(allocator, output);
 }
 
+fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
+    const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth);
+
+    const Message = struct { role: []const u8, content: []const u8 };
+    const messages = [_]Message{.{ .role = "user", .content = prompt }};
+
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "{f}",
+        .{std.json.fmt(.{
+            .model = model_id,
+            .messages = messages[0..],
+        }, .{})},
+    );
+    defer allocator.free(body);
+
+    const output = try runCommandCapture(allocator, &.{
+        "curl",
+        "-sS",
+        "-X",
+        "POST",
+        "https://opencode.ai/zen/v1/chat/completions",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        auth,
+        "-d",
+        body,
+    });
+    defer allocator.free(output);
+
+    return extractOpenAIText(allocator, output);
+}
+
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -401,14 +449,18 @@ fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
         data: ?Resp = null,
     };
 
-    var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch {
-        return QueryError.EmptyModelResponse;
+    var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch |parse_err| {
+        const preview_len = @min(json.len, 800);
+        return std.fmt.allocPrint(allocator, "JSON parse error ({s}) for response ({d} bytes):\n{s}", .{ @errorName(parse_err), json.len, json[0..preview_len] });
     };
     defer parsed.deinit();
 
     if (try extractFromResp(allocator, parsed.value)) |text| return text;
 
-    var wrapped = std.json.parseFromSlice(Wrapper, allocator, json, .{ .ignore_unknown_fields = true }) catch return QueryError.EmptyModelResponse;
+    var wrapped = std.json.parseFromSlice(Wrapper, allocator, json, .{ .ignore_unknown_fields = true }) catch |wrap_err| {
+        const preview_len = @min(json.len, 800);
+        return std.fmt.allocPrint(allocator, "Wrapper parse error ({s}) for response ({d} bytes):\n{s}", .{ @errorName(wrap_err), json.len, json[0..preview_len] });
+    };
     defer wrapped.deinit();
 
     if (wrapped.value.response) |r| {
@@ -421,7 +473,9 @@ fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
         if (try extractFromResp(allocator, r)) |text| return text;
     }
 
-    return QueryError.EmptyModelResponse;
+    // Return the raw API response as the error message so users can see what went wrong
+    const preview_len = @min(json.len, 800);
+    return std.fmt.allocPrint(allocator, "Could not extract text from API response ({d} bytes):\n{s}", .{ json.len, json[0..preview_len] });
 }
 
 fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
@@ -475,7 +529,8 @@ fn extractAnthropicText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
             }
         }
     }
-    return QueryError.EmptyModelResponse;
+    const preview_len = @min(json.len, 800);
+    return std.fmt.allocPrint(allocator, "No text in Anthropic response ({d} bytes):\n{s}", .{ json.len, json[0..preview_len] });
 }
 
 test "extract openai output_text" {
@@ -601,9 +656,11 @@ test "stream parser ignores done payload to avoid duplicate text" {
     try std.testing.expectEqualStrings("Hi", out);
 }
 
-test "non-json response does not dump raw stream" {
+test "non-json response returns formatted error" {
     const allocator = std.testing.allocator;
-    try std.testing.expectError(QueryError.EmptyModelResponse, extractOpenAIText(allocator, "event: x\\ndata: y"));
+    const out = try extractOpenAIText(allocator, "event: x\ndata: y");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "JSON parse error"));
 }
 
 test "extract openai wrapped response object" {

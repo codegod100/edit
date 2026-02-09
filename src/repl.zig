@@ -6,6 +6,7 @@ const store = @import("provider_store.zig");
 const config_store = @import("config_store.zig");
 const llm = @import("llm.zig");
 const catalog = @import("models_catalog.zig");
+const logger = @import("logger.zig");
 
 pub const CommandTag = enum {
     none,
@@ -696,12 +697,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 }
             },
             .run_tool => {
+                logger.info("Executing tool: {s}", .{command.arg});
                 const output = tools.execute(allocator, command.arg) catch |err| {
+                    logger.logErrorWithContext(@src(), err, "Tool execution failed", command.arg);
                     try stdout.print("Tool failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
                 defer allocator.free(output);
 
+                logger.info("Tool succeeded: {s}", .{command.arg});
                 try stdout.print("{s}\n", .{output});
             },
             .list_providers => {
@@ -767,18 +771,27 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     owned_key = sub_key.?;
                     key_slice = owned_key.?;
                 } else {
-                    const key_opt = try promptLine(allocator, stdin, stdout, "API key: ");
+                    const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
                     if (key_opt == null) continue;
-                    defer allocator.free(key_opt.?);
                     const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
                     if (key.len == 0) {
+                        allocator.free(key_opt.?);
                         try stdout.print("Cancelled: empty key.\n", .{});
                         continue;
                     }
-                    key_slice = key;
+                    // Copy the key before freeing key_opt
+                    owned_key = try allocator.dupe(u8, key);
+                    allocator.free(key_opt.?);
+                    key_slice = owned_key.?;
                 }
 
-                try store.upsertFile(allocator, config_dir, env_name, key_slice);
+                logger.info("Storing API key for provider: {s}", .{provider.id});
+                store.upsertFile(allocator, config_dir, env_name, key_slice) catch |err| {
+                    logger.logErrorWithContext(@src(), err, "Failed to store API key", provider.id);
+                    try stdout.print("Failed to store API key: {s}\n", .{@errorName(err)});
+                    continue;
+                };
+                logger.info("Successfully stored API key for: {s}", .{provider.id});
                 try stdout.print("Stored {s} in {s}/providers.env\n", .{ env_name, config_dir });
 
                 store.free(allocator, stored_pairs);
@@ -791,7 +804,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 if (command.arg.len == 0) {
                     if (selected_model) |sel| {
                         try stdout.print("Current model: {s}/{s}\n", .{ sel.provider_id, sel.model_id });
-                        continue;
+                    } else {
+                        try stdout.print("No model currently set.\n", .{});
                     }
 
                     const picked = try interactiveModelSelect(allocator, stdin, stdout, stdin_file, providers, provider_states);
@@ -855,7 +869,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runModelTurnWithTools(allocator, stdout, active.?, model_input) catch |err| {
+                var turn = runModelTurnWithTools(allocator, stdout, active.?, trimmed, model_input) catch |err| {
                     try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
                     continue;
                 };
@@ -1206,6 +1220,12 @@ test "known tool name rejects unknown tools" {
     try std.testing.expect(!isKnownToolName("definitely_not_a_tool"));
 }
 
+test "mutating tool detector recognizes write tools" {
+    try std.testing.expect(isMutatingToolName("write_file"));
+    try std.testing.expect(isMutatingToolName("apply_patch"));
+    try std.testing.expect(!isMutatingToolName("read_file"));
+}
+
 test "tool routing prompt includes codebase analysis guidance" {
     const allocator = std.testing.allocator;
     const prompt = try buildToolRoutingPrompt(allocator, "how does the new file edit harness work?");
@@ -1274,6 +1294,16 @@ test "strict mutation routing prompt requires write tools" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "replace_in_file") != null);
 }
 
+test "required edit detector catches missing named target" {
+    const touched = [_][]const u8{"examples/.gitkeep"};
+    try std.testing.expect(hasUnmetRequiredEdits("create a folder named examples then update gitignore to add this file", touched[0..]));
+}
+
+test "required edit detector passes when all named targets touched" {
+    const touched = [_][]const u8{ "examples/.gitkeep", ".gitignore" };
+    try std.testing.expect(!hasUnmetRequiredEdits("create a folder named examples then update gitignore to add this file", touched[0..]));
+}
+
 test "fallback tool call parser extracts name and json" {
     const allocator = std.testing.allocator;
     const parsed = try parseFallbackToolCallFromText(allocator, "TOOL_CALL write_file {\"path\":\"sample.txt\",\"content\":\"hello\"}");
@@ -1336,6 +1366,15 @@ test "history navigation moves through entries with up and down" {
 
     const to_current = historyNextIndex(&entries, down, .down);
     try std.testing.expectEqual(@as(?usize, null), to_current);
+}
+
+test "sanitize line input strips non-ascii" {
+    const allocator = std.testing.allocator;
+    const buf = try allocator.dupe(u8, "sk-abc\x00\x7F\xC2\xA9\n");
+    const cleaned = try sanitizeLineInput(allocator, buf);
+    try std.testing.expect(cleaned != null);
+    defer allocator.free(cleaned.?);
+    try std.testing.expectEqualStrings("sk-abc", cleaned.?);
 }
 
 test "history persistence loads prior session entries" {
@@ -1460,7 +1499,48 @@ fn promptLine(
     prompt: []const u8,
 ) !?[]u8 {
     try stdout.print("{s}", .{prompt});
-    return stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    const raw = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    return sanitizeLineInput(allocator, raw);
+}
+
+fn promptRawLine(
+    allocator: std.mem.Allocator,
+    stdin: anytype,
+    stdout: anytype,
+    prompt: []const u8,
+) !?[]u8 {
+    try stdout.print("{s}", .{prompt});
+    const raw = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    if (raw == null) return null;
+    const slice = raw.?;
+    defer allocator.free(slice);
+
+    // Just trim whitespace/newlines, keep all other bytes
+    const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    const value = try allocator.dupe(u8, trimmed);
+    return @as(?[]u8, value);
+}
+
+fn sanitizeLineInput(allocator: std.mem.Allocator, raw: ?[]u8) !?[]u8 {
+    if (raw == null) return null;
+    const slice = raw.?;
+    defer allocator.free(slice);
+
+    const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (trimmed) |ch| {
+        if (ch >= 32 and ch <= 126) {
+            try out.append(allocator, ch);
+        }
+    }
+    if (out.items.len == 0) return null;
+    const value = try out.toOwnedSlice(allocator);
+    return @as(?[]u8, value);
 }
 
 fn chooseProvider(
@@ -1760,6 +1840,14 @@ fn isKnownToolName(name: []const u8) bool {
     return false;
 }
 
+fn isMutatingToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write_file") or
+        std.mem.eql(u8, name, "replace_in_file") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "apply_patch");
+}
+
 fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -1815,6 +1903,110 @@ fn buildStrictMutationToolRoutingPrompt(allocator: std.mem.Allocator, user_text:
     );
 }
 
+fn isLikelyMultiStepMutationRequest(input: []const u8) bool {
+    return isLikelyFileMutationRequest(input) and (containsIgnoreCase(input, " then ") or containsIgnoreCase(input, " and "));
+}
+
+fn trimTargetToken(token: []const u8) []const u8 {
+    return std.mem.trim(u8, token, " \t\r\n`\"'.,:;!?()[]{}<>");
+}
+
+fn isMutationVerb(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "create") or
+        std.ascii.eqlIgnoreCase(token, "edit") or
+        std.ascii.eqlIgnoreCase(token, "write") or
+        std.ascii.eqlIgnoreCase(token, "modify") or
+        std.ascii.eqlIgnoreCase(token, "update") or
+        std.ascii.eqlIgnoreCase(token, "replace") or
+        std.ascii.eqlIgnoreCase(token, "add") or
+        std.ascii.eqlIgnoreCase(token, "refactor");
+}
+
+fn isIgnoredTargetWord(token: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token, "file") or
+        std.ascii.eqlIgnoreCase(token, "folder") or
+        std.ascii.eqlIgnoreCase(token, "directory") or
+        std.ascii.eqlIgnoreCase(token, "named") or
+        std.ascii.eqlIgnoreCase(token, "name") or
+        std.ascii.eqlIgnoreCase(token, "this") or
+        std.ascii.eqlIgnoreCase(token, "that") or
+        std.ascii.eqlIgnoreCase(token, "it") or
+        std.ascii.eqlIgnoreCase(token, "the") or
+        std.ascii.eqlIgnoreCase(token, "a") or
+        std.ascii.eqlIgnoreCase(token, "an") or
+        std.ascii.eqlIgnoreCase(token, "to") or
+        std.ascii.eqlIgnoreCase(token, "then") or
+        std.ascii.eqlIgnoreCase(token, "and") or
+        std.ascii.eqlIgnoreCase(token, "with");
+}
+
+fn looksLikePathTarget(token: []const u8) bool {
+    return std.mem.indexOfScalar(u8, token, '/') != null or std.mem.indexOfScalar(u8, token, '.') != null;
+}
+
+fn targetSatisfied(touched_paths: []const []const u8, target: []const u8) bool {
+    for (touched_paths) |p| {
+        if (containsIgnoreCase(p, target)) return true;
+        const base = std.fs.path.basename(p);
+        if (std.ascii.eqlIgnoreCase(base, target)) return true;
+
+        if (std.mem.indexOfScalar(u8, target, '.') == null and std.mem.indexOfScalar(u8, target, '/') == null) {
+            if (base.len == target.len + 1 and base[0] == '.') {
+                if (std.ascii.eqlIgnoreCase(base[1..], target)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn collectRequiredTargets(allocator: std.mem.Allocator, user_input: []const u8) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    defer out.deinit(allocator);
+
+    var words = std.mem.tokenizeAny(u8, user_input, " \t\r\n");
+    var prev_was_verb = false;
+    while (words.next()) |raw| {
+        const token = trimTargetToken(raw);
+        if (token.len == 0) continue;
+
+        if (isMutationVerb(token)) {
+            prev_was_verb = true;
+            continue;
+        }
+
+        if (isIgnoredTargetWord(token)) {
+            if (!std.ascii.eqlIgnoreCase(token, "named") and !std.ascii.eqlIgnoreCase(token, "name")) {
+                prev_was_verb = false;
+            }
+            continue;
+        }
+
+        if (looksLikePathTarget(token) or prev_was_verb) {
+            var exists = false;
+            for (out.items) |existing| {
+                if (std.ascii.eqlIgnoreCase(existing, token)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) try out.append(allocator, token);
+        }
+        prev_was_verb = false;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn hasUnmetRequiredEdits(user_input: []const u8, touched_paths: []const []const u8) bool {
+    const required = collectRequiredTargets(std.heap.page_allocator, user_input) catch return false;
+    defer std.heap.page_allocator.free(required);
+
+    for (required) |target| {
+        if (!targetSatisfied(touched_paths, target)) return true;
+    }
+    return false;
+}
+
 fn buildToolCallId(allocator: std.mem.Allocator, step: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "toolcall-{d}", .{step});
 }
@@ -1862,14 +2054,22 @@ fn joinPaths(allocator: std.mem.Allocator, paths: []const []u8) !?[]u8 {
     return @as(?[]u8, value);
 }
 
-fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, user_input: []const u8) !RunTurnResult {
+fn runModelTurnWithTools(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    active: ActiveModel,
+    raw_user_request: []const u8,
+    user_input: []const u8,
+) !RunTurnResult {
     const max_tool_steps: usize = 6;
     var context_prompt = try allocator.dupe(u8, user_input);
     defer allocator.free(context_prompt);
     var forced_repo_probe_done = false;
     var forced_mutation_probe_done = false;
-    const repo_specific = isLikelyRepoSpecificQuestion(user_input);
-    const mutation_request = isLikelyFileMutationRequest(user_input);
+    var forced_completion_probe_done = false;
+    const repo_specific = isLikelyRepoSpecificQuestion(raw_user_request);
+    const mutation_request = isLikelyFileMutationRequest(raw_user_request);
+    const multi_step_mutation = isLikelyMultiStepMutationRequest(raw_user_request);
     var tool_calls: usize = 0;
     var paths = std.ArrayList([]u8).empty;
     defer {
@@ -1901,18 +2101,60 @@ fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: 
             routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
+        if (routed == null and mutation_request and !forced_completion_probe_done and step + 1 < max_tool_steps) {
+            var touched = std.ArrayList([]const u8).empty;
+            defer touched.deinit(allocator);
+            for (paths.items) |p| try touched.append(allocator, p);
+
+            const missing_required = hasUnmetRequiredEdits(raw_user_request, touched.items);
+            if ((multi_step_mutation and tool_calls < 2) or missing_required) {
+                forced_completion_probe_done = true;
+                const completion_prompt = try std.fmt.allocPrint(
+                    allocator,
+                    "The user requested multiple edits. Completed tool calls so far: {d}. Touched paths: {s}. You must continue with a real tool call to complete remaining requested edits, especially any missing required files like .gitignore when requested.\n\nCurrent request:\n{s}",
+                    .{ tool_calls, if (try joinPaths(allocator, paths.items)) |jp| blk: {
+                        defer allocator.free(jp);
+                        break :blk jp;
+                    } else "(none)", raw_user_request },
+                );
+                defer allocator.free(completion_prompt);
+                routed = try inferToolCallWithModel(allocator, active, completion_prompt, true);
+                if (routed == null) {
+                    routed = try inferToolCallWithTextFallback(allocator, active, completion_prompt, true);
+                }
+            }
+        }
+
         if (routed == null) {
             if (mutation_request and tool_calls == 0) {
                 return .{
                     .response = try allocator.dupe(
                         u8,
-                        "I could not confirm a real file-edit tool call for this edit request. Please retry; I will only report success after write_file, edit/replace_in_file, or apply_patch runs.",
+                        "Your request looks like a file edit, but I couldn't determine what to write. Please be more specific—include a filename and the content or change you want.",
                     ),
                     .tool_calls = 0,
                     .error_count = 1,
                     .files_touched = null,
                 };
             }
+
+            if (mutation_request) {
+                var touched = std.ArrayList([]const u8).empty;
+                defer touched.deinit(allocator);
+                for (paths.items) |p| try touched.append(allocator, p);
+                if (hasUnmetRequiredEdits(raw_user_request, touched.items) or (multi_step_mutation and tool_calls < 2)) {
+                    return .{
+                        .response = try allocator.dupe(
+                            u8,
+                            "I completed only part of the requested edits. Please specify which remaining file(s) to modify and what changes to make.",
+                        ),
+                        .tool_calls = tool_calls,
+                        .error_count = 1,
+                        .files_touched = try joinPaths(allocator, paths.items),
+                    };
+                }
+            }
+
             const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
             return .{
                 .response = final,
@@ -1927,6 +2169,16 @@ fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: 
         }
 
         if (!isKnownToolName(routed.?.tool)) {
+            const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
+            return .{
+                .response = final,
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
+        }
+
+        if (!mutation_request and isMutatingToolName(routed.?.tool)) {
             const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, context_prompt);
             return .{
                 .response = final,
@@ -1983,6 +2235,11 @@ fn runModelTurnWithTools(allocator: std.mem.Allocator, stdout: anytype, active: 
         const ok_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms);
         defer allocator.free(ok_line);
         try stdout.print("{s}\n", .{ok_line});
+
+        if (isMutatingToolName(routed.?.tool)) {
+            const meta = if (tool_out.len > 2200) tool_out[0..2200] else tool_out;
+            try stdout.print("event=tool-meta step={d} call_id={s} tool={s}\n{s}\n", .{ step + 1, call_id, routed.?.tool, meta });
+        }
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
         const next_prompt = try std.fmt.allocPrint(
@@ -2051,6 +2308,10 @@ fn readFilterQueryRealtime(
         if (ch == '\n' or ch == '\r') {
             try stdout.print("\n", .{});
             return try allocator.dupe(u8, query);
+        }
+        if (ch == 0x1B) { // ESC key
+            try stdout.print("\n", .{});
+            return null;
         }
         if (ch == 127 or ch == 8) {
             if (query.len > 0) query = try allocator.realloc(query, query.len - 1);

@@ -86,10 +86,19 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         defer p.deinit();
         const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
         const content = p.value.content orelse return NamedToolError.InvalidArguments;
+
+        const before = readFileAtPath(allocator, path, 4 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (before) |b| allocator.free(b);
+
         try writeFileAtPath(path, content);
+        const diff = try renderMiniDiff(allocator, path, before orelse "", content);
+        defer allocator.free(diff);
         const diag = try zigFmtDiagnostics(allocator, path);
         defer if (diag) |d| allocator.free(d);
-        return std.fmt.allocPrint(allocator, "Wrote file successfully.{s}", .{diag orelse ""});
+        return std.fmt.allocPrint(allocator, "Wrote file: {s}\n{s}{s}", .{ path, diff, diag orelse "" });
     }
 
     if (std.mem.eql(u8, name, "replace_in_file") or std.mem.eql(u8, name, "edit")) {
@@ -118,9 +127,11 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         defer allocator.free(next);
 
         try writeFileAtPath(path, next);
+        const diff = try renderMiniDiff(allocator, path, original, next);
+        defer allocator.free(diff);
         const diag = try zigFmtDiagnostics(allocator, path);
         defer if (diag) |d| allocator.free(d);
-        return std.fmt.allocPrint(allocator, "Edit applied successfully.{s}", .{diag orelse ""});
+        return std.fmt.allocPrint(allocator, "Edited file: {s}\n{s}{s}", .{ path, diff, diag orelse "" });
     }
 
     if (std.mem.eql(u8, name, "apply_patch")) {
@@ -540,6 +551,60 @@ fn joinLines(allocator: std.mem.Allocator, lines: []const []const u8, trailing_n
     return out.toOwnedSlice(allocator);
 }
 
+fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []const u8, after: []const u8) ![]u8 {
+    if (std.mem.eql(u8, before, after)) {
+        return allocator.dupe(u8, "(no textual change)\n");
+    }
+
+    var before_lines = std.ArrayList([]const u8).empty;
+    defer before_lines.deinit(allocator);
+    var after_lines = std.ArrayList([]const u8).empty;
+    defer after_lines.deinit(allocator);
+
+    var bit = std.mem.splitScalar(u8, before, '\n');
+    while (bit.next()) |line| try before_lines.append(allocator, std.mem.trimRight(u8, line, "\r"));
+    var ait = std.mem.splitScalar(u8, after, '\n');
+    while (ait.next()) |line| try after_lines.append(allocator, std.mem.trimRight(u8, line, "\r"));
+
+    if (before.len > 0 and before[before.len - 1] == '\n' and before_lines.items.len > 0 and before_lines.items[before_lines.items.len - 1].len == 0) {
+        _ = before_lines.pop();
+    }
+    if (after.len > 0 and after[after.len - 1] == '\n' and after_lines.items.len > 0 and after_lines.items[after_lines.items.len - 1].len == 0) {
+        _ = after_lines.pop();
+    }
+
+    var prefix: usize = 0;
+    while (prefix < before_lines.items.len and prefix < after_lines.items.len and std.mem.eql(u8, before_lines.items[prefix], after_lines.items[prefix])) : (prefix += 1) {}
+
+    var bs = before_lines.items.len;
+    var as = after_lines.items.len;
+    while (bs > prefix and as > prefix and std.mem.eql(u8, before_lines.items[bs - 1], after_lines.items[as - 1])) {
+        bs -= 1;
+        as -= 1;
+    }
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    const c_reset = "\x1b[0m";
+    const c_head = "\x1b[36m";
+    const c_hunk = "\x1b[33m";
+    const c_del = "\x1b[31m";
+    const c_add = "\x1b[32m";
+    try w.print("{s}--- a/{s}{s}\n{s}+++ b/{s}{s}\n{s}@@ -{d},{d} +{d},{d} @@{s}\n", .{ c_head, path, c_reset, c_head, path, c_reset, c_hunk, prefix + 1, bs - prefix, prefix + 1, as - prefix, c_reset });
+
+    var i = prefix;
+    while (i < bs) : (i += 1) {
+        try w.print("{s}-{s}{s}\n", .{ c_del, before_lines.items[i], c_reset });
+    }
+    i = prefix;
+    while (i < as) : (i += 1) {
+        try w.print("{s}+{s}{s}\n", .{ c_add, after_lines.items[i], c_reset });
+    }
+    try w.print("", .{});
+    return out.toOwnedSlice(allocator);
+}
+
 fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -602,4 +667,12 @@ test "edit supports trimmed line fallback replacement" {
     const replaced = try replaceTextStrict(allocator, original, find, repl, false);
     defer allocator.free(replaced);
     try std.testing.expect(std.mem.indexOf(u8, replaced, "const x = 2;") != null);
+}
+
+test "render mini diff includes path headers" {
+    const allocator = std.testing.allocator;
+    const diff = try renderMiniDiff(allocator, "src/demo.zig", "const x = 1;\n", "const x = 2;\n");
+    defer allocator.free(diff);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "--- a/src/demo.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff, "+const x = 2;") != null);
 }

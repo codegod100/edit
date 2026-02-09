@@ -1,12 +1,26 @@
 const std = @import("std");
 const repl = @import("repl.zig");
+const logger = @import("logger.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
+
+    // Initialize verbose logging
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const log_path = try std.fs.path.join(allocator, &.{ home, ".config", "zagent", "debug.log" });
+    defer allocator.free(log_path);
+
+    try logger.init(allocator, .debug, log_path);
+    defer logger.deinit();
+
+    logger.info("zagent starting up", .{});
+
     try repl.run(allocator);
+
+    logger.info("zagent shutting down", .{});
 }
 
 test {
@@ -17,4 +31,5 @@ test {
     _ = @import("repl.zig");
     _ = @import("provider_manager.zig");
     _ = @import("provider_store.zig");
+    _ = @import("logger.zig");
 }

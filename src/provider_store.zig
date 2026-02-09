@@ -32,11 +32,20 @@ pub fn load(allocator: std.mem.Allocator, base_path: []const u8) ![]StoredPair {
 }
 
 pub fn upsertFile(allocator: std.mem.Allocator, base_path: []const u8, name: []const u8, value: []const u8) !void {
-    var pairs = try load(allocator, base_path);
-    defer free(allocator, pairs);
+    const raw_pairs = try load(allocator, base_path);
+    var list = try std.ArrayList(StoredPair).initCapacity(allocator, raw_pairs.len);
+    try list.appendSlice(allocator, raw_pairs);
+    allocator.free(raw_pairs);
+
+    if (value.len == 0) return error.InvalidEnvValue;
+
+    defer {
+        for (list.items) |*pair| pair.deinit(allocator);
+        list.deinit(allocator);
+    }
 
     var found = false;
-    for (pairs) |*pair| {
+    for (list.items) |*pair| {
         if (std.mem.eql(u8, pair.name, name)) {
             allocator.free(pair.value);
             pair.value = try allocator.dupe(u8, value);
@@ -46,11 +55,10 @@ pub fn upsertFile(allocator: std.mem.Allocator, base_path: []const u8, name: []c
     }
 
     if (!found) {
-        pairs = try allocator.realloc(pairs, pairs.len + 1);
-        pairs[pairs.len - 1] = .{
+        try list.append(allocator, .{
             .name = try allocator.dupe(u8, name),
             .value = try allocator.dupe(u8, value),
-        };
+        });
     }
 
     const path = try storePathAlloc(allocator, base_path);
@@ -65,10 +73,32 @@ pub fn upsertFile(allocator: std.mem.Allocator, base_path: []const u8, name: []c
     var file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
 
-    const writer = file.deprecatedWriter();
-    for (pairs) |pair| {
+    const writer = if (@hasDecl(std.fs.File, "deprecatedWriter"))
+        file.deprecatedWriter()
+    else
+        file.writer();
+    for (list.items) |pair| {
         try writer.print("{s}={s}\n", .{ pair.name, pair.value });
     }
+}
+
+const SanitizedValue = struct {
+    value: []u8,
+    stripped: bool,
+};
+
+fn sanitizeEnvValue(allocator: std.mem.Allocator, value: []const u8) !SanitizedValue {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var stripped = false;
+    for (value) |ch| {
+        if (ch >= 32 and ch <= 126) {
+            try out.append(allocator, ch);
+        } else {
+            stripped = true;
+        }
+    }
+    return .{ .value = try out.toOwnedSlice(allocator), .stripped = stripped };
 }
 
 fn parseContent(allocator: std.mem.Allocator, content: []const u8) ![]StoredPair {
@@ -119,4 +149,12 @@ test "upsert file stores and updates provider key" {
     try std.testing.expectEqual(@as(usize, 1), loaded.len);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", loaded[0].name);
     try std.testing.expectEqualStrings("xyz", loaded[0].value);
+}
+
+test "sanitize env value strips non-ascii" {
+    const allocator = std.testing.allocator;
+    const out = try sanitizeEnvValue(allocator, "sk-abc\x00\x7F\xC2\xA9");
+    defer allocator.free(out.value);
+    try std.testing.expect(out.stripped);
+    try std.testing.expectEqualStrings("sk-abc", out.value);
 }
