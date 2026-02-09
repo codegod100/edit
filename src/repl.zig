@@ -7,6 +7,10 @@ const config_store = @import("config_store.zig");
 const llm = @import("llm.zig");
 const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
+const rl = @import("readline.zig");
+
+// Flag to track if readline is initialized
+var readline_initialized: bool = false;
 
 // Helper to convert tools.ToolDef slice to llm.ToolRouteDef slice
 fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
@@ -706,6 +710,16 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try allocator.dupe(u8, "> ");
     defer allocator.free(prompt_text);
 
+    // Try to initialize readline for better terminal input
+    if (stdin_file.isTty()) {
+        if (rl.init()) {
+            readline_initialized = true;
+        } else |err| {
+            logger.info("Readline initialization failed ({}), falling back to basic input\n", .{err});
+        }
+    }
+    defer if (readline_initialized) rl.deinit();
+
     const home = std.posix.getenv("HOME") orelse "";
     const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
     defer allocator.free(config_dir);
@@ -981,7 +995,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try compactContextWindow(allocator, &context_window, active.?);
                 try saveContextWindow(allocator, config_dir, &context_window);
 
-                try stdout.print("{s}\n", .{turn.response});
+                try stdout.print("{s}{s}{s}\n", .{ C_BRIGHT_WHITE, turn.response, C_RESET });
             },
         }
     }
@@ -1000,6 +1014,36 @@ fn readPromptLine(
         return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
     }
 
+    // Use readline library if available
+    if (readline_initialized) {
+        const line_opt = rl.readPrompt(allocator, prompt) catch |err| {
+            logger.info("Readline failed ({}), falling back to basic input\n", .{err});
+            readline_initialized = false;
+            // Fall through to custom implementation
+            return readPromptLineFallback(allocator, stdin_file, stdin_reader, stdout, prompt, history);
+        };
+
+        if (line_opt) |line| {
+            // Add to both readline history and our custom history
+            if (line.len > 0) {
+                rl.addToHistory(line);
+                try history.append(allocator, line);
+            }
+        }
+        return line_opt;
+    }
+
+    return readPromptLineFallback(allocator, stdin_file, stdin_reader, stdout, prompt, history);
+}
+
+fn readPromptLineFallback(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    stdin_reader: anytype,
+    stdout: anytype,
+    prompt: []const u8,
+    history: *CommandHistory,
+) !?[]u8 {
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
         try stdout.print("{s}", .{prompt});
         return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
@@ -2197,6 +2241,7 @@ const C_GREEN = "\x1b[32m"; // success status
 const C_RED = "\x1b[31m"; // error status
 const C_CYAN = "\x1b[36m"; // metadata
 const C_DIM = "\x1b[90m"; // low priority info
+const C_BRIGHT_WHITE = "\x1b[97m"; // model response text
 
 fn buildToolResultEventLine(
     allocator: std.mem.Allocator,
