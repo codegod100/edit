@@ -518,19 +518,19 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     if (config.referer) |r| {
         const header = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{r});
         try allocated_headers.append(allocator, header);
-        try argv.append(allocator, header);
+        try argv.appendSlice(allocator, &.{ "-H", header });
     }
     if (config.title) |t| {
         const header = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{t});
         try allocated_headers.append(allocator, header);
-        try argv.append(allocator, header);
+        try argv.appendSlice(allocator, &.{ "-H", header });
     }
     if (config.user_agent) |ua| {
         const header = try std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua});
         try allocated_headers.append(allocator, header);
-        try argv.append(allocator, header);
+        try argv.appendSlice(allocator, &.{ "-H", header });
     }
-    try argv.append(allocator, auth);
+    try argv.appendSlice(allocator, &.{ "-H", auth });
     try argv.append(allocator, "-d");
     try argv.append(allocator, body);
 
