@@ -349,12 +349,49 @@ fn buildOpenAIRequestBody(allocator: std.mem.Allocator, model_id: []const u8, pr
     const content = [_]InputText{.{ .type = "input_text", .text = prompt }};
     const input = [_]InputMessage{.{ .role = "user", .content = content[0..] }};
 
+    const system_prompt =
+        "You are zagent, an AI coding assistant that works in a REPL loop.\\n\\n" ++
+        "CORE BEHAVIOR:\\n" ++
+        "1. ONE ACTION PER RESPONSE - You get one tool call per iteration\\n" ++
+        "2. After each tool execution, you'll be asked 'What's next?'\\n" ++
+        "3. Think step by step, but only execute ONE step at a time\\n\\n" ++
+        "TODO MANAGEMENT:\\n" ++
+        "- Create todos at the START for multi-step tasks using todo_add\\n" ++
+        "- After completing work on a file, mark related todos done with todo_update\\n" ++
+        "- Check todo status with todo_list when deciding what to do next\\n" ++
+        "- When all todos are done, say 'DONE' to finish\\n\\n" ++
+        "TOOL USAGE:\\n" ++
+        "- read_file: For understanding code before editing\\n" ++
+        "- write_file: For creating new files\\n" ++
+        "- edit: For precise text replacements (safer than full rewrites)\\n" ++
+        "- bash: For running commands, git, testing\\n" ++
+        "- todo_add/todo_update/todo_list: For task tracking\\n\\n" ++
+        "FILE OPERATIONS:\\n" ++
+        "- Always read files before editing to understand context\\n" ++
+        "- Prefer edit over write_file for existing files\\n" ++
+        "- Use offset/limit when reading large files\\n\\n" ++
+        "RESPONSE FORMAT:\\n" ++
+        "- Return exactly ONE TOOL_CALL per response: TOOL_CALL tool_name {\\\"arg\\\":\\\"value\\\"}\\n" ++
+        "- Or say 'DONE' when the task is complete\\n" ++
+        "- No extra text, no explanations, just the tool call or DONE\\n\\n" ++
+        "EXAMPLE SESSION:\\n" ++
+        "User: Add a feature to handle errors\\n" ++
+        "→ todo_add {\\\"description\\\":\\\"Read current error handling\\\"}\\n" ++
+        "[Result shown...]\\n" ++
+        "→ read_file {\\\"path\\\":\\\"src/errors.zig\\\"}\\n" ++
+        "[Result shown...]\\n" ++
+        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
+        "→ todo_add {\\\"description\\\":\\\"Add error logging\\\"}\\n" ++
+        "→ edit {\\\"path\\\":\\\"src/errors.zig\\\", \\\"oldString\\\":\\\"...\\\", \\\"newString\\\":\\\"...\\\"}\\n" ++
+        "→ todo_update {\\\"id\\\":\\\"...\\\", \\\"status\\\":\\\"done\\\"}\\n" ++
+        "→ DONE\\n";
+
     return std.fmt.allocPrint(
         allocator,
         "{f}",
         .{std.json.fmt(.{
             .model = model_id,
-            .instructions = "You are a helpful coding assistant.",
+            .instructions = system_prompt,
             .input = input[0..],
             .store = false,
             .stream = stream,
@@ -489,8 +526,17 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
 
     const config = getProviderConfig(provider_id);
 
+    const system_prompt =
+        "You are zagent, an AI coding assistant. Work in ONE step at a time. " ++
+        "Use tools: read_file (before editing), write_file (new files), edit (changes), bash (commands), todo_add/update/list (tracking). " ++
+        "Create todos for multi-step tasks. Mark todos done after editing. " ++
+        "Say DONE when complete. Return ONE TOOL_CALL per response.";
+
     const Message = struct { role: []const u8, content: []const u8 };
-    const messages = [_]Message{.{ .role = "user", .content = prompt }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = system_prompt },
+        .{ .role = "user", .content = prompt },
+    };
 
     // Build tools array if provided
     var tools_json: ?[]u8 = null;
