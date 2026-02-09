@@ -122,8 +122,10 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
             filePath: ?[]const u8 = null,
             find: ?[]const u8 = null,
             oldString: ?[]const u8 = null,
+            old: ?[]const u8 = null,
             replace: ?[]const u8 = null,
             newString: ?[]const u8 = null,
+            new: ?[]const u8 = null,
             all: ?bool = null,
             replaceAll: ?bool = null,
         };
@@ -131,8 +133,8 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         defer p.deinit();
 
         const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
-        const find = p.value.find orelse p.value.oldString orelse return NamedToolError.InvalidArguments;
-        const repl = p.value.replace orelse p.value.newString orelse return NamedToolError.InvalidArguments;
+        const find = p.value.find orelse p.value.oldString orelse p.value.old orelse return NamedToolError.InvalidArguments;
+        const repl = p.value.replace orelse p.value.newString orelse p.value.new orelse return NamedToolError.InvalidArguments;
         const replace_all = p.value.all orelse p.value.replaceAll orelse false;
 
         const original = try readFileAtPath(allocator, path, 4 * 1024 * 1024);
