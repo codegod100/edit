@@ -4,6 +4,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { z } from "zod";
+import * as readline from "node:readline";
 
 const providerId = process.env.ZAGENT_PROVIDER || "openai";
 const modelId = process.env.ZAGENT_MODEL || "gpt-4o";
@@ -177,12 +178,13 @@ function normalizeMessages(messages: any[]): CoreMessage[] {
           }))
         };
       } else {
+        const name = m.toolName || m.tool || toolCallMap.get(toolCallId) || 'unknown_tool';
         return {
           role: 'tool',
           content: [{
             type: 'tool-result',
             toolCallId: toolCallId,
-            toolName: m.toolName || m.tool || toolCallMap.get(toolCallId) || 'unknown',
+            toolName: name,
             result: content
           }]
         };
@@ -244,34 +246,28 @@ async function handleChat(request: any) {
   } catch (e: any) {
     console.error(`AI SDK Error: ${e.name} - ${e.message}`);
     if (e.data) console.error(`Error data: ${JSON.stringify(e.data)}`);
-    return { type: "error", error: e.message };
+    return { type: "error", err: e.message };
   }
 }
 
 console.log(JSON.stringify({ type: "ready" }));
 
-const reader = Bun.stdin.stream().getReader();
-let buffer = "";
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: false
+});
 
-while (true) {
-  const { value, done } = await reader.read();
-  if (done) break;
-  
-  buffer += new TextDecoder().decode(value);
-  const lines = buffer.split("\n");
-  buffer = lines.pop() || "";
-  
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    try {
-      const request = JSON.parse(line);
-      if (request.type === "chat") {
-        const response = await handleChat(request);
-        console.log(JSON.stringify(response));
-      }
-    } catch (e: any) {
-      console.error(`Parse Error: ${e.message} (line: ${line})`);
-      console.log(JSON.stringify({ type: "error", error: e.message }));
+rl.on('line', async (line) => {
+  if (!line.trim()) return;
+  try {
+    const request = JSON.parse(line);
+    if (request.type === "chat") {
+      const response = await handleChat(request);
+      console.log(JSON.stringify(response));
     }
+  } catch (e: any) {
+    console.error(`Parse Error: ${e.message} (line: ${line})`);
+    console.log(JSON.stringify({ type: "error", err: e.message }));
   }
-}
+});
