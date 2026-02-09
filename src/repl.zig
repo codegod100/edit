@@ -42,6 +42,7 @@ pub const CommandTag = enum {
     default_model,
     connect_provider,
     set_model,
+    stats,
 };
 
 pub const Command = struct {
@@ -90,6 +91,9 @@ pub fn parseCommand(line: []const u8) Command {
         var rest = trimmed[8..];
         rest = std.mem.trim(u8, rest, " \t");
         return .{ .tag = .connect_provider, .arg = rest };
+    }
+    if (std.mem.eql(u8, trimmed, "/stats")) {
+        return .{ .tag = .stats, .arg = "" };
     }
     if (std.mem.startsWith(u8, trimmed, "/model")) {
         var rest = trimmed[6..];
@@ -1018,6 +1022,18 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 });
                 try stdout.print("Active model set to {s}/{s}\n", .{ p.provider_id, p.model_id });
             },
+            .stats => {
+                var total_chars: usize = 0;
+                var total_tools: usize = 0;
+                for (context_window.turns.items) |turn| {
+                    total_chars += turn.content.len;
+                    total_tools += turn.tool_calls;
+                }
+                try stdout.print("\n{s}Session Statistics:{s}\n", .{ C_BRIGHT_WHITE, C_RESET });
+                try stdout.print("- Message Count:   {d}\n", .{context_window.turns.items.len});
+                try stdout.print("- Character Count: {d}\n", .{total_chars});
+                try stdout.print("- Tool Executions: {d}\n\n", .{total_tools});
+            },
             .none => {
                 const trimmed = std.mem.trim(u8, normalized, " \t\r\n");
                 if (trimmed.len == 0) continue;
@@ -1267,6 +1283,9 @@ test "parse command recognizes slash commands" {
     const model = parseCommand("/model openai/gpt-5");
     try std.testing.expectEqual(CommandTag.set_model, model.tag);
     try std.testing.expectEqualStrings("openai/gpt-5", model.arg);
+
+    const stats = parseCommand("/stats");
+    try std.testing.expectEqual(CommandTag.stats, stats.tag);
 }
 
 test "parse command trims /skill argument" {
@@ -1683,6 +1702,7 @@ fn commandNames() []const []const u8 {
         "/default-model",
         "/connect",
         "/model",
+        "/stats",
     };
 }
 
@@ -2934,11 +2954,6 @@ fn runWithBridge(
                 allocator.free(tc.args);
             }
             allocator.free(response.tool_calls);
-        }
-
-        // Show model text
-        if (response.text.len > 0) {
-            try stdout.print("{s}\n", .{response.text});
         }
 
         // Add assistant message to history

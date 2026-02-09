@@ -96,10 +96,15 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     }
 
     if (std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "write")) {
-        const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null, content: ?[]const u8 = null };
+        const A = struct {
+            path: ?[]const u8 = null,
+            filePath: ?[]const u8 = null,
+            file_path: ?[]const u8 = null,
+            content: ?[]const u8 = null,
+        };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
-        const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
+        const path = p.value.path orelse p.value.filePath orelse p.value.file_path orelse return NamedToolError.InvalidArguments;
         const content = p.value.content orelse return NamedToolError.InvalidArguments;
 
         const before = readFileAtPath(allocator, path, 4 * 1024 * 1024) catch |err| switch (err) {
@@ -120,11 +125,14 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const A = struct {
             path: ?[]const u8 = null,
             filePath: ?[]const u8 = null,
+            file_path: ?[]const u8 = null,
             find: ?[]const u8 = null,
             oldString: ?[]const u8 = null,
+            old_string: ?[]const u8 = null,
             old: ?[]const u8 = null,
             replace: ?[]const u8 = null,
             newString: ?[]const u8 = null,
+            new_string: ?[]const u8 = null,
             new: ?[]const u8 = null,
             all: ?bool = null,
             replaceAll: ?bool = null,
@@ -132,9 +140,9 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
 
-        const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
-        const find = p.value.find orelse p.value.oldString orelse p.value.old orelse return NamedToolError.InvalidArguments;
-        const repl = p.value.replace orelse p.value.newString orelse p.value.new orelse return NamedToolError.InvalidArguments;
+        const path = p.value.path orelse p.value.filePath orelse p.value.file_path orelse return NamedToolError.InvalidArguments;
+        const find = p.value.find orelse p.value.oldString orelse p.value.old_string orelse p.value.old orelse return NamedToolError.InvalidArguments;
+        const repl = p.value.replace orelse p.value.newString orelse p.value.new_string orelse p.value.new orelse return NamedToolError.InvalidArguments;
         const replace_all = p.value.all orelse p.value.replaceAll orelse false;
 
         const original = try readFileAtPath(allocator, path, 4 * 1024 * 1024);
