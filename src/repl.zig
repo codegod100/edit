@@ -281,12 +281,19 @@ fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, line: 
     try file.writeAll("\n");
 }
 
-fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ base_path, "context.json" });
+fn hashProjectPath(cwd: []const u8) u64 {
+    // Simple hash of project path for filename
+    return std.hash.Crc32.hash(cwd);
 }
 
-fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow) !void {
-    const path = try contextPathAlloc(allocator, base_path);
+fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{project_hash});
+    defer allocator.free(filename);
+    return std.fs.path.join(allocator, &.{ base_path, filename });
+}
+
+fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, project_hash: u64) !void {
+    const path = try contextPathAlloc(allocator, base_path, project_hash);
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -328,8 +335,8 @@ fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window
     }
 }
 
-fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow) !void {
-    const path = try contextPathAlloc(allocator, base_path);
+fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow, project_hash: u64) !void {
+    const path = try contextPathAlloc(allocator, base_path, project_hash);
     defer allocator.free(path);
 
     const dir_path = std.fs.path.dirname(path) orelse return;
@@ -735,6 +742,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
+    // Compute project hash for project-aware storage
+    const project_hash = hashProjectPath(cwd);
+
     const home = std.posix.getenv("HOME") orelse "";
     const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
     defer allocator.free(config_dir);
@@ -758,15 +768,17 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     var context_window = ContextWindow.init(24 * 1024, 8);
     defer context_window.deinit(allocator);
-    try loadContextWindow(allocator, config_dir, &context_window);
+    try loadContextWindow(allocator, config_dir, &context_window, project_hash);
     try compactContextWindow(allocator, &context_window, null);
 
     // Initialize todo list for tracking progress
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
 
-    // Load persisted todos
-    const todos_file = try std.fs.path.join(allocator, &.{ config_dir, "todos.json" });
+    // Load persisted todos (project-aware)
+    const todos_filename = try std.fmt.allocPrint(allocator, "todos-{x}.json", .{project_hash});
+    defer allocator.free(todos_filename);
+    const todos_file = try std.fs.path.join(allocator, &.{ config_dir, todos_filename });
     defer allocator.free(todos_file);
     try todo_list.loadFromFile(allocator, todos_file);
 
@@ -1041,7 +1053,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     .files_touched = turn.files_touched,
                 });
                 try compactContextWindow(allocator, &context_window, active.?);
-                try saveContextWindow(allocator, config_dir, &context_window);
+                try saveContextWindow(allocator, config_dir, &context_window, project_hash);
 
                 // Only print response if it's not a tool call instruction
                 if (!std.mem.startsWith(u8, turn.response, "TOOL_CALL ")) {
@@ -1445,11 +1457,11 @@ test "context window persists across save and load" {
     try out.append(allocator, .user, "hello", .{});
     try out.append(allocator, .assistant, "world", .{ .tool_calls = 1, .files_touched = "src/main.zig" });
     out.summary = try allocator.dupe(u8, "sum");
-    try saveContextWindow(allocator, root, &out);
+    try saveContextWindow(allocator, root, &out, 0x12345678);
 
     var loaded = ContextWindow.init(1024, 4);
     defer loaded.deinit(allocator);
-    try loadContextWindow(allocator, root, &loaded);
+    try loadContextWindow(allocator, root, &loaded, 0x12345678);
 
     try std.testing.expect(loaded.summary != null);
     try std.testing.expectEqualStrings("sum", loaded.summary.?);
