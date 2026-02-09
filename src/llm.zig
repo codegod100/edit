@@ -670,9 +670,10 @@ fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
                 defer result.deinit(allocator);
                 const w = result.writer(allocator);
 
-                // Add reasoning content first if present
+                // Add reasoning content first if present (with color coding)
                 if (has_reasoning) {
-                    try w.print("[thinking]\n{s}\n\n", .{message.reasoning_content.?});
+                    // C_CYAN = "\x1b[36m" for thinking text, C_RESET = "\x1b[0m"
+                    try w.print("\x1b[90m[thinking]\x1b[0m\n\x1b[36m{s}\x1b[0m\n\n", .{message.reasoning_content.?});
                 }
 
                 // Add main content

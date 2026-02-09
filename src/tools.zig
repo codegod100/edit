@@ -11,12 +11,12 @@ pub const ToolDef = struct {
 
 pub const definitions = [_]ToolDef{
     .{ .name = "bash", .description = "Execute a shell command and return stdout.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}" },
-    .{ .name = "read_file", .description = "Read a file and return its contents.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
+    .{ .name = "read_file", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 8192)\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "list_files", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write_file", .description = "Write complete file contents to a path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "replace_in_file", .description = "Replace text in a file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\",\"replace\"],\"additionalProperties\":false}" },
     // OpenCode-compatible aliases.
-    .{ .name = "read", .description = "Read a file and return its contents.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"}},\"required\":[\"filePath\"],\"additionalProperties\":false}" },
+    .{ .name = "read", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 8192)\"}},\"required\":[\"filePath\"],\"additionalProperties\":false}" },
     .{ .name = "list", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write", .description = "Write full content to a file path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"filePath\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "edit", .description = "Replace oldString with newString in one file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
@@ -63,11 +63,13 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     }
 
     if (std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read")) {
-        const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null };
+        const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null, offset: ?usize = null, limit: ?usize = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
         const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
-        return readFileAtPath(allocator, path, 1024 * 1024);
+        const offset = p.value.offset orelse 0;
+        const limit = p.value.limit orelse 8192;
+        return readFileAtPathWithOffset(allocator, path, offset, limit);
     }
 
     if (std.mem.eql(u8, name, "list_files") or std.mem.eql(u8, name, "list")) {
@@ -158,6 +160,48 @@ fn readFileAtPath(allocator: std.mem.Allocator, path: []const u8, max_bytes: usi
     var file = try std.fs.openFileAbsolute(resolved, .{});
     defer file.close();
     return file.readToEndAlloc(allocator, max_bytes);
+}
+
+fn readFileAtPathWithOffset(allocator: std.mem.Allocator, path: []const u8, offset: usize, limit: usize) ![]u8 {
+    const resolved = try resolveWorkspacePath(allocator, path);
+    defer allocator.free(resolved);
+    var file = try std.fs.openFileAbsolute(resolved, .{});
+    defer file.close();
+
+    // Get file info to check size
+    const stat = try file.stat();
+    const file_size = stat.size;
+
+    // Handle offset larger than file size
+    if (offset >= file_size) {
+        return allocator.dupe(u8, "[offset beyond file end]");
+    }
+
+    // Seek to offset
+    try file.seekTo(offset);
+
+    // Calculate how many bytes to read
+    const bytes_remaining = file_size - offset;
+    const bytes_to_read = @min(limit, bytes_remaining);
+
+    // Read the content
+    const content = try file.readToEndAlloc(allocator, bytes_to_read);
+
+    // If we only read part of the file, add a note
+    if (offset > 0 or content.len < bytes_remaining) {
+        const prefix = if (offset > 0) try std.fmt.allocPrint(allocator, "[showing bytes {} to {} of {} total]\n\n", .{ offset, offset + content.len, file_size }) else "";
+        defer if (offset > 0) allocator.free(prefix);
+
+        const suffix = if (content.len < bytes_remaining) "\n\n[...truncated, more content available]" else "";
+
+        if (offset > 0 or content.len < bytes_remaining) {
+            const result = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, content, suffix });
+            allocator.free(content);
+            return result;
+        }
+    }
+
+    return content;
 }
 
 fn writeFileAtPath(path: []const u8, content: []const u8) !void {
