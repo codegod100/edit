@@ -2017,6 +2017,15 @@ fn buildToolCallId(allocator: std.mem.Allocator, step: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, "toolcall-{d}", .{step});
 }
 
+// ANSI color codes for tool debugging
+const C_RESET = "\x1b[0m";
+const C_BLUE = "\x1b[34m"; // event type
+const C_YELLOW = "\x1b[33m"; // tool names
+const C_GREEN = "\x1b[32m"; // success status
+const C_RED = "\x1b[31m"; // error status
+const C_CYAN = "\x1b[36m"; // metadata
+const C_DIM = "\x1b[90m"; // low priority info
+
 fn buildToolResultEventLine(
     allocator: std.mem.Allocator,
     step: usize,
@@ -2026,11 +2035,38 @@ fn buildToolResultEventLine(
     bytes: usize,
     duration_ms: i64,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "event=tool-result step={d} call_id={s} tool={s} status={s} bytes={d} duration_ms={d}",
-        .{ step, call_id, tool_name, status, bytes, duration_ms },
-    );
+    // Colorize status
+    const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
+
+    // Build colored output using ArrayList
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("{s}event=tool-result{s} ", .{ C_BLUE, C_RESET });
+    try w.print("{s}step={d}{s} ", .{ C_CYAN, step, C_RESET });
+    try w.print("{s}call_id={s}{s} ", .{ C_DIM, call_id, C_RESET });
+    try w.print("{s}tool={s}{s} ", .{ C_YELLOW, tool_name, C_RESET });
+    try w.print("{s}status={s}{s} ", .{ status_color, status, C_RESET });
+    try w.print("{s}bytes={d}{s} ", .{ C_DIM, bytes, C_RESET });
+    try w.print("{s}duration_ms={d}{s}", .{ C_DIM, duration_ms, C_RESET });
+
+    return out.toOwnedSlice(allocator);
+}
+
+// Helper to print colored tool events
+fn printColoredToolEvent(stdout: anytype, event_type: []const u8, step: ?usize, call_id: ?[]const u8, tool_name: ?[]const u8) !void {
+    try stdout.print("{s}event={s}{s}{s}", .{ C_BLUE, C_RESET, event_type, C_RESET });
+    if (step) |s| {
+        try stdout.print(" {s}step={d}{s}", .{ C_CYAN, s, C_RESET });
+    }
+    if (call_id) |cid| {
+        try stdout.print(" {s}call_id={s}{s}", .{ C_DIM, cid, C_RESET });
+    }
+    if (tool_name) |tname| {
+        try stdout.print(" {s}tool={s}{s}", .{ C_YELLOW, tname, C_RESET });
+    }
+    try stdout.print("\n", .{});
 }
 
 // Execute tool calls embedded in model response (TOOL_CALL format)
@@ -2076,7 +2112,7 @@ fn executeInlineToolCalls(
         }
 
         // Execute tool
-        try stdout.print("event=tool-inline tool={s}\n", .{tool_name});
+        try printColoredToolEvent(stdout, "tool-inline", null, null, tool_name);
 
         const tool_out = tools.executeNamed(allocator, tool_name, args) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
@@ -2317,14 +2353,8 @@ fn runModelTurnWithTools(
         const call_id = try buildToolCallId(allocator, step + 1);
         defer allocator.free(call_id);
 
-        try stdout.print(
-            "event=tool-input-start step={d} call_id={s} tool={s}\n",
-            .{ step + 1, call_id, routed.?.tool },
-        );
-        try stdout.print(
-            "event=tool-call step={d} call_id={s} tool={s}\n",
-            .{ step + 1, call_id, routed.?.tool },
-        );
+        try printColoredToolEvent(stdout, "tool-input-start", step + 1, call_id, routed.?.tool);
+        try printColoredToolEvent(stdout, "tool-call", step + 1, call_id, routed.?.tool);
 
         const started_ms = std.time.milliTimestamp();
 
@@ -2355,7 +2385,8 @@ fn runModelTurnWithTools(
 
         if (isMutatingToolName(routed.?.tool)) {
             const meta = if (tool_out.len > 2200) tool_out[0..2200] else tool_out;
-            try stdout.print("event=tool-meta step={d} call_id={s} tool={s}\n{s}\n", .{ step + 1, call_id, routed.?.tool, meta });
+            try printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
+            try stdout.print("{s}\n", .{meta});
         }
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
