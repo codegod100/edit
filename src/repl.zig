@@ -572,6 +572,20 @@ fn parseModelSelection(input: []const u8) ?ModelSelection {
     };
 }
 
+fn buildPrompt(allocator: std.mem.Allocator, cwd: []const u8, selected_model: ?OwnedModelSelection) ![]u8 {
+    if (selected_model) |model| {
+        // Shorten model name if it's long
+        const max_model_len = 20;
+        const display_model = if (model.model_id.len > max_model_len)
+            model.model_id[0..max_model_len]
+        else
+            model.model_id;
+        return std.fmt.allocPrint(allocator, "{s} [{s}/{s}]> ", .{ cwd, model.provider_id, display_model });
+    } else {
+        return std.fmt.allocPrint(allocator, "{s}> ", .{cwd});
+    }
+}
+
 const OwnedModelSelection = struct {
     provider_id: []u8,
     model_id: []u8,
@@ -708,11 +722,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
         stdout_file.writer();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-    const prompt_text = if (cwd.len > 0)
-        try std.fmt.allocPrint(allocator, "{s}> ", .{cwd})
-    else
-        try allocator.dupe(u8, "> ");
-    defer allocator.free(prompt_text);
 
     // Try to initialize readline for better terminal input
     if (stdin_file.isTty()) {
@@ -766,6 +775,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         .{},
     );
     while (true) {
+        // Build prompt dynamically with current model info
+        const prompt_text = try buildPrompt(allocator, cwd, selected_model);
+        defer allocator.free(prompt_text);
+
         const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
         if (line_opt == null) {
             try stdout.print("\n", .{});
@@ -2336,8 +2349,16 @@ fn executeInlineToolCalls(
             }
         }
 
+        // Extract file path from args for display
+        const file_path = parsePrimaryPathFromArgs(allocator, args);
+        defer if (file_path) |fp| allocator.free(fp);
+
         // Execute tool
         try printColoredToolEvent(stdout, "tool-inline", null, null, tool_name);
+        if (file_path) |fp| {
+            try stdout.print(" {s}file={s}{s}", .{ C_CYAN, fp, C_RESET });
+        }
+        try stdout.print("\n", .{});
 
         const tool_out = tools.executeNamed(allocator, tool_name, args) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
