@@ -1338,7 +1338,7 @@ test "tool call id is stable per step" {
 
 test "tool result event line includes status and bytes" {
     const allocator = std.testing.allocator;
-    const line = try buildToolResultEventLine(allocator, 2, "toolcall-2", "read_file", "ok", 42, 12);
+    const line = try buildToolResultEventLine(allocator, 2, "toolcall-2", "read_file", "ok", 42, 12, "src/main.zig");
     defer allocator.free(line);
     try std.testing.expect(std.mem.indexOf(u8, line, "tool-result") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "status=ok") != null);

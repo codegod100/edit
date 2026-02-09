@@ -70,14 +70,11 @@ pub fn query(
     logger.logModelRequest(provider_id, model_id, prompt.len, tool_defs != null and tool_defs.?.len > 0);
 
     const start_time = std.time.milliTimestamp();
-    const result = if (std.mem.eql(u8, provider_id, "openai"))
-        queryOpenAI(allocator, key, model_id, prompt, tool_defs)
-    else if (std.mem.eql(u8, provider_id, "anthropic"))
+    const result = if (std.mem.eql(u8, provider_id, "anthropic"))
         queryAnthropic(allocator, key, model_id, prompt, tool_defs)
-    else if (std.mem.eql(u8, provider_id, "opencode"))
-        queryOpenCodeZen(allocator, key, model_id, prompt, tool_defs)
     else
-        error.UnsupportedProvider;
+        // All other providers use OpenAI-compatible API
+        queryOpenAICompatible(allocator, key, model_id, prompt, tool_defs, provider_id);
 
     return result catch |err| {
         _ = start_time;
@@ -393,9 +390,51 @@ fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: [
     return extractAnthropicText(allocator, output);
 }
 
-fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, tool_defs: ?[]const ToolRouteDef) ![]u8 {
+const ProviderConfig = struct {
+    endpoint: []const u8,
+    referer: ?[]const u8,
+    title: ?[]const u8,
+    user_agent: ?[]const u8,
+};
+
+fn getProviderConfig(provider_id: []const u8) ProviderConfig {
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return .{
+            .endpoint = "https://api.openai.com/v1/chat/completions",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
+    } else if (std.mem.eql(u8, provider_id, "opencode")) {
+        return .{
+            .endpoint = "https://opencode.ai/zen/v1/chat/completions",
+            .referer = "https://opencode.ai/",
+            .title = "opencode",
+            .user_agent = "opencode/0.1.0 (linux; x86_64)",
+        };
+    } else if (std.mem.eql(u8, provider_id, "openrouter")) {
+        return .{
+            .endpoint = "https://openrouter.ai/api/v1/chat/completions",
+            .referer = "https://zagent.local/",
+            .title = "zagent",
+            .user_agent = null,
+        };
+    } else {
+        // Default to OpenAI format
+        return .{
+            .endpoint = "https://api.openai.com/v1/chat/completions",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
+    }
+}
+
+fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, tool_defs: ?[]const ToolRouteDef, provider_id: []const u8) ![]u8 {
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth);
+
+    const config = getProviderConfig(provider_id);
 
     const Message = struct { role: []const u8, content: []const u8 };
     const messages = [_]Message{.{ .role = "user", .content = prompt }};
@@ -411,7 +450,6 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
         try tools_arr.appendSlice(allocator, "[");
         for (defs, 0..) |def, i| {
             if (i > 0) try tools_arr.appendSlice(allocator, ",");
-            // Build tool JSON manually
             try tools_arr.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":\"");
             try tools_arr.appendSlice(allocator, def.name);
             try tools_arr.appendSlice(allocator, "\",\"description\":\"");
@@ -426,15 +464,12 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
 
     var body: []u8 = undefined;
     if (tools_json) |tj| {
-        // Build body with tools
         var body_arr = std.ArrayList(u8).empty;
         defer body_arr.deinit(allocator);
         const w = body_arr.writer(allocator);
 
         try w.print("{{\"model\":\"{s}\",\"messages\":", .{model_id});
-        // Serialize messages manually
         try w.print("[{{\"role\":\"user\",\"content\":\"", .{});
-        // Escape the prompt - handle all control characters
         for (prompt) |ch| {
             switch (ch) {
                 '\\' => try w.print("\\\\", .{}),
@@ -442,11 +477,11 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
                 '\n' => try w.print("\\n", .{}),
                 '\r' => try w.print("\\r", .{}),
                 '\t' => try w.print("\\t", .{}),
-                0x08 => try w.print("\\b", .{}), // backspace
-                0x0C => try w.print("\\f", .{}), // form feed
+                0x08 => try w.print("\\b", .{}),
+                0x0C => try w.print("\\f", .{}),
                 else => {
                     if (ch < 0x20) {
-                        try w.print("\\u{x:0>4}", .{ch}); // other control chars
+                        try w.print("\\u{x:0>4}", .{ch});
                     } else {
                         try w.print("{c}", .{ch});
                     }
@@ -467,29 +502,45 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
     }
     defer allocator.free(body);
 
-    const output = try runCommandCapture(allocator, &.{
-        "curl",
-        "-sS",
-        "-X",
-        "POST",
-        "https://opencode.ai/zen/v1/chat/completions",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        "HTTP-Referer: https://opencode.ai/",
-        "-H",
-        "X-Title: opencode",
-        "-H",
-        "User-Agent: opencode/0.1.0 (linux; x86_64)",
-        "-H",
-        auth,
-        "-d",
-        body,
-    });
+    // Build curl arguments dynamically
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    try argv.appendSlice(allocator, &.{ "curl", "-sS", "-X", "POST", config.endpoint, "-H", "Content-Type: application/json" });
+
+    // Track dynamically allocated headers so we can free them
+    var allocated_headers = std.ArrayList([]u8).empty;
+    defer {
+        for (allocated_headers.items) |h| allocator.free(h);
+        allocated_headers.deinit(allocator);
+    }
+
+    if (config.referer) |r| {
+        const header = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{r});
+        try allocated_headers.append(allocator, header);
+        try argv.append(allocator, header);
+    }
+    if (config.title) |t| {
+        const header = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{t});
+        try allocated_headers.append(allocator, header);
+        try argv.append(allocator, header);
+    }
+    if (config.user_agent) |ua| {
+        const header = try std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua});
+        try allocated_headers.append(allocator, header);
+        try argv.append(allocator, header);
+    }
+    try argv.append(allocator, auth);
+    try argv.append(allocator, "-d");
+    try argv.append(allocator, body);
+
+    const output = try runCommandCapture(allocator, argv.items);
     defer allocator.free(output);
 
     return extractOpenAIText(allocator, output);
 }
+
+// queryOpenRouter removed - now handled by queryOpenAICompatible
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     const result = try std.process.Child.run(.{
