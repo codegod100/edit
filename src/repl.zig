@@ -2515,11 +2515,44 @@ fn runModelTurnWithTools(
     }
 
     var step: usize = 0;
-    while (step < max_tool_steps) : (step += 1) {
+    const soft_limit: usize = 6; // After this, check todos and ask model if we should continue
+
+    while (true) : (step += 1) {
         // Check for cancellation at start of each iteration
         if (isCancelled()) {
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try joinPaths(allocator, paths.items),
+            };
+        }
+
+        // On step 6+, check todos and ask model if we should continue
+        if (step >= soft_limit) {
+            const todo_summary = todo_list.summary();
+            const continue_prompt = try std.fmt.allocPrint(
+                allocator,
+                "{s}\n\n[SYSTEM] You have completed {d} tool steps. Todo status: {s}.\n\nDo you need more steps to complete the task? If yes, make another tool call. If no, provide the final answer.",
+                .{ context_prompt, step, todo_summary },
+            );
+            defer allocator.free(continue_prompt);
+
+            // Query model to see if it wants to continue
+            const check_response = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, continue_prompt, toolDefsToLlm(tools.definitions[0..]));
+
+            // If model returns TOOL_CALL, continue the loop
+            if (std.mem.startsWith(u8, check_response, "TOOL_CALL ")) {
+                allocator.free(context_prompt);
+                context_prompt = try allocator.dupe(u8, check_response);
+                allocator.free(check_response);
+                continue;
+            }
+
+            // Model gave final answer, return it
+            allocator.free(context_prompt);
+            return .{
+                .response = check_response,
                 .tool_calls = tool_calls,
                 .error_count = 0,
                 .files_touched = try joinPaths(allocator, paths.items),
@@ -2755,20 +2788,6 @@ fn runModelTurnWithTools(
         allocator.free(context_prompt);
         context_prompt = next_prompt;
     }
-
-    const fallback_prompt = try std.fmt.allocPrint(
-        allocator,
-        "{s}\n\nTool loop limit reached ({d}). Return the best final answer based on available context.",
-        .{ context_prompt, max_tool_steps },
-    );
-    defer allocator.free(fallback_prompt);
-    const final = try llm.query(allocator, active.provider_id, active.api_key, active.model_id, fallback_prompt, toolDefsToLlm(tools.definitions[0..]));
-    return .{
-        .response = final,
-        .tool_calls = tool_calls,
-        .error_count = 0,
-        .files_touched = try joinPaths(allocator, paths.items),
-    };
 }
 
 fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
