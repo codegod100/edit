@@ -167,7 +167,12 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
     return std.fmt.allocPrint(allocator, "Empty response from API (0 bytes)", .{});
 }
 
-pub fn inferToolCall(
+pub const ToolRouteResult = struct {
+    call: ToolRouteCall,
+    thinking: ?[]const u8,
+};
+
+pub fn inferToolCallWithThinking(
     allocator: std.mem.Allocator,
     provider_id: []const u8,
     api_key: ?[]const u8,
@@ -175,7 +180,7 @@ pub fn inferToolCall(
     prompt: []const u8,
     defs: []const ToolRouteDef,
     force_tool: bool,
-) !?ToolRouteCall {
+) !?ToolRouteResult {
     if (!std.mem.eql(u8, provider_id, "openai")) return null;
     const key = api_key orelse return QueryError.MissingApiKey;
 
@@ -194,7 +199,55 @@ pub fn inferToolCall(
     });
     defer allocator.free(output);
 
-    return parseOpenAIFunctionCall(allocator, output);
+    // Parse both the function call and any thinking content
+    const call = try parseOpenAIFunctionCall(allocator, output);
+    if (call == null) return null;
+
+    // Try to extract thinking/reasoning from the response
+    const thinking = try extractThinkingFromResponse(allocator, output);
+
+    return .{
+        .call = call.?,
+        .thinking = thinking,
+    };
+}
+
+pub fn inferToolCall(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    api_key: ?[]const u8,
+    model_id: []const u8,
+    prompt: []const u8,
+    defs: []const ToolRouteDef,
+    force_tool: bool,
+) !?ToolRouteCall {
+    const result = try inferToolCallWithThinking(allocator, provider_id, api_key, model_id, prompt, defs, force_tool);
+    if (result) |r| {
+        if (r.thinking) |t| allocator.free(t);
+        return r.call;
+    }
+    return null;
+}
+
+fn extractThinkingFromResponse(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
+    // Parse JSON to find thinking/reasoning fields
+    const Resp = struct {
+        reasoning: ?[]const u8 = null,
+        thinking: ?[]const u8 = null,
+        thought: ?[]const u8 = null,
+        reasoning_content: ?[]const u8 = null,
+    };
+
+    if (std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        const r = parsed.value;
+        const thinking = r.reasoning orelse r.thinking orelse r.thought orelse r.reasoning_content;
+        if (thinking) |t| {
+            return try allocator.dupe(u8, t);
+        }
+    } else |_| {}
+
+    return null;
 }
 
 fn buildOpenAIToolRouteBody(

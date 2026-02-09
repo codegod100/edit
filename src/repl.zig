@@ -2051,7 +2051,7 @@ fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
     return if (options.len == 1) options[0] else null;
 }
 
-fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8, force: bool) !?llm.ToolRouteCall {
+fn inferToolCallWithModel(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, input: []const u8, force: bool) !?llm.ToolRouteCall {
     var defs = try std.ArrayList(llm.ToolRouteDef).initCapacity(allocator, tools.definitions.len);
     defer defs.deinit(allocator);
 
@@ -2059,10 +2059,18 @@ fn inferToolCallWithModel(allocator: std.mem.Allocator, active: ActiveModel, inp
         try defs.append(allocator, .{ .name = d.name, .description = d.description, .parameters_json = d.parameters_json });
     }
 
-    return llm.inferToolCall(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items, force) catch |err| switch (err) {
-        llm.QueryError.UnsupportedProvider => null,
-        else => return err,
-    };
+    const result = try llm.inferToolCallWithThinking(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items, force);
+    if (result) |r| {
+        // Print thinking content if available
+        if (r.thinking) |thinking| {
+            defer allocator.free(thinking);
+            if (thinking.len > 0) {
+                try stdout.print("\x1b[90m[thinking: {s}]\x1b[0m ", .{thinking});
+            }
+        }
+        return r.call;
+    }
+    return null;
 }
 
 fn buildFallbackToolInferencePrompt(allocator: std.mem.Allocator, user_text: []const u8, require_mutation: bool) ![]u8 {
@@ -2562,27 +2570,31 @@ fn runModelTurnWithTools(
             };
         }
 
-        try stdout.print("{s}[step {d}] Routing...{s} ", .{ C_DIM, step, C_RESET });
+        try stdout.print("{s}[step {d}]{s} ", .{ C_DIM, step, C_RESET });
 
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
 
-        var routed = try inferToolCallWithModel(allocator, active, route_prompt, false);
+        try stdout.print("{s}thinking...{s} ", .{ C_DIM, C_RESET });
+        var routed = try inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
+            try stdout.print("{s}re-analyzing...{s} ", .{ C_DIM, C_RESET });
             const strict_prompt = try buildStrictToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_prompt);
-            routed = try inferToolCallWithModel(allocator, active, strict_prompt, true);
+            routed = try inferToolCallWithModel(allocator, stdout, active, strict_prompt, true);
         }
 
         if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
             forced_mutation_probe_done = true;
+            try stdout.print("{s}checking edit requirements...{s} ", .{ C_DIM, C_RESET });
             const strict_mutation_prompt = try buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_mutation_prompt);
-            routed = try inferToolCallWithModel(allocator, active, strict_mutation_prompt, true);
+            routed = try inferToolCallWithModel(allocator, stdout, active, strict_mutation_prompt, true);
         }
 
         if (routed == null and step == 0 and mutation_request) {
+            try stdout.print("{s}fallback parsing...{s} ", .{ C_DIM, C_RESET });
             routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
@@ -2603,7 +2615,7 @@ fn runModelTurnWithTools(
                     } else "(none)", raw_user_request },
                 );
                 defer allocator.free(completion_prompt);
-                routed = try inferToolCallWithModel(allocator, active, completion_prompt, true);
+                routed = try inferToolCallWithModel(allocator, stdout, active, completion_prompt, true);
                 if (routed == null) {
                     routed = try inferToolCallWithTextFallback(allocator, active, completion_prompt, true);
                 }
