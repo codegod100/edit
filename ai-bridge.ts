@@ -125,6 +125,7 @@ async function handleChat(request: any) {
     const response = {
       type: "response",
       text: message.content || "",
+      reasoning: (message as any).reasoning_content || (message as any).thinking || "",
       toolCalls: (message.tool_calls || []).map(tc => ({
         id: tc.id,
         tool: tc.function.name,

@@ -9,6 +9,7 @@ pub const ToolCall = struct {
 
 pub const ChatResponse = struct {
     text: []const u8,
+    reasoning: []const u8 = "",
     tool_calls: []ToolCall,
     finish_reason: []const u8,
 };
@@ -28,7 +29,7 @@ pub const Bridge = struct {
         var env_map = std.process.EnvMap.init(allocator);
         defer env_map.deinit();
         // Log API key (masked)
-        logger.info("Bridge spawning with provider={s}, model={s}, api_key_len={d}", .{ provider_id, model_id, api_key.len });
+        logger.debug("Bridge spawning with provider={s}, model={s}, api_key_len={d}", .{ provider_id, model_id, api_key.len });
 
         // Pass all API keys from providers.env
         try env_map.put("OPENCODE_API_KEY", api_key);
@@ -64,7 +65,7 @@ pub const Bridge = struct {
         const ready_line = try stdout_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096);
         if (ready_line) |line| {
             defer allocator.free(line);
-            logger.info("Bridge ready: {s}", .{line});
+            logger.debug("Bridge ready: {s}", .{line});
         }
 
         return .{
@@ -87,7 +88,7 @@ pub const Bridge = struct {
             if (line) |l| {
                 defer allocator.free(l);
                 if (l.len > 0) {
-                    logger.info("Bridge: {s}", .{l});
+                    logger.debug("Bridge: {s}", .{l});
                 }
             } else break;
         }
@@ -118,23 +119,24 @@ pub const Bridge = struct {
 
         const request = request_buf.items;
 
-        logger.info("Sending request ({d} bytes): {s}", .{ request.len, request });
+        logger.debug("Sending request ({d} bytes): {s}", .{ request.len, request });
 
         try stdin_writer.writeAll(request);
 
-        logger.info("Request sent, waiting for response...", .{});
+        logger.debug("Request sent, waiting for response...", .{});
 
         // Read response line
         const line = try stdout_reader.readUntilDelimiterOrEofAlloc(self.allocator, '\n', 10 * 1024 * 1024);
         if (line == null) return error.BridgeClosed;
         defer self.allocator.free(line.?);
 
-        logger.info("Received line from bridge (len={d}): {s}", .{ line.?.len, line.? });
+        logger.debug("Received line from bridge (len={d}): {s}", .{ line.?.len, line.? });
 
         // Parse JSON response
         const Response = struct {
             type: []const u8,
             text: ?[]const u8 = null,
+            reasoning: ?[]const u8 = null,
             toolCalls: ?[]struct {
                 id: []const u8,
                 tool: []const u8,
@@ -180,6 +182,7 @@ pub const Bridge = struct {
 
         return .{
             .text = try self.allocator.dupe(u8, parsed.value.text orelse ""),
+            .reasoning = try self.allocator.dupe(u8, parsed.value.reasoning orelse ""),
             .tool_calls = try tool_calls.toOwnedSlice(self.allocator),
             .finish_reason = try self.allocator.dupe(u8, parsed.value.finishReason orelse "unknown"),
         };

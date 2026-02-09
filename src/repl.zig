@@ -175,12 +175,14 @@ const TurnMeta = struct {
 
 const RunTurnResult = struct {
     response: []u8,
+    reasoning: []u8,
     tool_calls: usize,
     error_count: usize,
     files_touched: ?[]u8,
 
     fn deinit(self: *RunTurnResult, allocator: std.mem.Allocator) void {
         allocator.free(self.response);
+        allocator.free(self.reasoning);
         if (self.files_touched) |f| allocator.free(f);
     }
 };
@@ -758,7 +760,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const skill_list = try skills.discover(allocator, cwd, home);
     defer skills.freeList(allocator, skill_list);
 
-    const providers = defaultProviderSpecs();
+    const providers = try catalog.loadProviderSpecs(allocator, config_dir);
+    defer catalog.freeProviderSpecs(allocator, providers);
+
     var stored_pairs = try store.load(allocator, config_dir);
     defer store.free(allocator, stored_pairs);
 
@@ -1002,10 +1006,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
                 const p = parsed.?;
-                if (findConnectedProvider(provider_states, p.provider_id) == null) {
-                    try stdout.print("Provider not connected: {s}\n", .{p.provider_id});
-                    continue;
-                }
                 if (!providerHasModel(providers, p.provider_id, p.model_id)) {
                     try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
                     continue;
@@ -1918,9 +1918,9 @@ fn chooseActiveModel(
     selected: ?OwnedModelSelection,
 ) ?ActiveModel {
     if (selected) |sel| {
-        const provider = findConnectedProvider(connected, sel.provider_id) orelse return null;
+        const provider = findConnectedProvider(connected, sel.provider_id);
         if (!providerHasModel(providers, sel.provider_id, sel.model_id)) return null;
-        return .{ .provider_id = sel.provider_id, .model_id = sel.model_id, .api_key = provider.key };
+        return .{ .provider_id = sel.provider_id, .model_id = sel.model_id, .api_key = if (provider) |p| p.key else null };
     }
 
     if (connected.len == 0) return null;
@@ -1953,11 +1953,6 @@ fn interactiveModelSelect(
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
 ) !?ModelSelection {
-    if (connected.len == 0) {
-        try stdout.print("No connected providers. Run /connect first.\n", .{});
-        return null;
-    }
-
     const options = try collectModelOptions(allocator, providers, connected);
     defer allocator.free(options);
 
@@ -2016,13 +2011,13 @@ fn collectModelOptions(
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
 ) ![]ModelOption {
+    _ = connected;
     var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
-    for (connected) |cp| {
-        const spec = findProviderSpecByID(providers, cp.id) orelse continue;
+    for (providers) |spec| {
         for (spec.models) |m| {
-            try out.append(allocator, .{ .provider_id = cp.id, .model_id = m.id, .display_name = m.display_name });
+            try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
         }
     }
     return out.toOwnedSlice(allocator);
@@ -2897,18 +2892,22 @@ fn runWithBridge(
     _ = raw_user_request;
 
     // Check API key
-    const api_key = active.api_key orelse {
+    if (active.api_key == null and !std.mem.eql(u8, active.provider_id, "opencode")) {
         return .{
-            .response = try allocator.dupe(u8, "No API key configured. Run /providers to connect."),
+            .response = try allocator.dupe(u8, "No API key configured for this provider. Run /connect to set it up."),
+            .reasoning = try allocator.dupe(u8, ""),
             .tool_calls = 0,
             .error_count = 1,
             .files_touched = null,
         };
-    };
+    }
+    const api_key = active.api_key orelse "";
 
     // Spawn the Bun AI bridge
     var bridge = try ai_bridge.Bridge.spawn(allocator, api_key, active.model_id, active.provider_id);
     defer bridge.deinit();
+
+    try stdout.print("{s}Thinking...{s}\n", .{ C_DIM, C_RESET });
 
     // Build initial messages
     var messages = std.ArrayList(u8).empty;
@@ -2935,6 +2934,7 @@ fn runWithBridge(
         if (isCancelled()) {
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
+                .reasoning = try allocator.dupe(u8, ""),
                 .tool_calls = tool_calls,
                 .error_count = 0,
                 .files_touched = try joinPaths(allocator, paths.items),
@@ -2951,6 +2951,7 @@ fn runWithBridge(
         const response = try bridge.chat(messages_json, max_iterations - iteration);
         defer {
             allocator.free(response.text);
+            allocator.free(response.reasoning);
             allocator.free(response.finish_reason);
             for (response.tool_calls) |tc| {
                 allocator.free(tc.id);
@@ -2958,6 +2959,10 @@ fn runWithBridge(
                 allocator.free(tc.args);
             }
             allocator.free(response.tool_calls);
+        }
+
+        if (response.reasoning.len > 0) {
+            try stdout.print("{s}{s}{s}\n", .{ C_DIM, response.reasoning, C_RESET });
         }
 
         // Add assistant message to history
@@ -2973,7 +2978,7 @@ fn runWithBridge(
                 try w.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
                 try w.print("{f}", .{std.json.fmt(tc.tool, .{})});
                 try w.writeAll(",\"arguments\":");
-                try w.writeAll(tc.args);
+                try w.print("{f}", .{std.json.fmt(tc.args, .{})});
                 try w.writeAll("}}");
             }
             try w.writeAll("]");
@@ -2985,6 +2990,7 @@ fn runWithBridge(
             // No tools - we're done
             return .{
                 .response = try allocator.dupe(u8, response.text),
+                .reasoning = try allocator.dupe(u8, response.reasoning),
                 .tool_calls = tool_calls,
                 .error_count = 0,
                 .files_touched = try joinPaths(allocator, paths.items),
@@ -3038,6 +3044,7 @@ fn runWithBridge(
 
     return .{
         .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
+        .reasoning = try allocator.dupe(u8, ""),
         .tool_calls = tool_calls,
         .error_count = 0,
         .files_touched = try joinPaths(allocator, paths.items),

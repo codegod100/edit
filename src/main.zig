@@ -13,7 +13,7 @@ pub fn main() !void {
     const log_path = try std.fs.path.join(allocator, &.{ home, ".config", "zagent", "debug.log" });
     defer allocator.free(log_path);
 
-    try logger.init(allocator, .debug, log_path);
+    try logger.init(allocator, .info, log_path);
     defer logger.deinit();
 
     logger.info("zagent starting up", .{});
