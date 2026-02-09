@@ -472,6 +472,8 @@ fn queryOpenCodeZen(allocator: std.mem.Allocator, api_key: []const u8, model_id:
         "-H",
         "X-Title: opencode",
         "-H",
+        "User-Agent: opencode/0.1.0 (linux; x86_64)",
+        "-H",
         auth,
         "-d",
         body,
