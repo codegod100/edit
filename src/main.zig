@@ -2,6 +2,10 @@ const std = @import("std");
 const repl = @import("repl.zig");
 const logger = @import("logger.zig");
 
+pub fn multiply(a: i32, b: i32) i32 {
+    return a * b;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -17,6 +21,9 @@ pub fn main() !void {
     defer logger.deinit();
 
     logger.info("zagent starting up", .{});
+
+    const result = multiply(10, 5);
+    std.debug.print("10 * 5 = {}\n", .{result});
 
     try repl.run(allocator);
 

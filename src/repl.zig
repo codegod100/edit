@@ -2588,6 +2588,55 @@ fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []const
     };
 }
 
+fn buildToolWhyLine(allocator: std.mem.Allocator, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
+    if (isReadToolName(tool_name)) {
+        const path = parsePrimaryPathFromArgs(allocator, arguments_json);
+        defer if (path) |p| allocator.free(p);
+        const params = try parseReadParamsFromArgs(allocator, arguments_json);
+        if (path) |p| {
+            if (params) |rp| {
+                return std.fmt.allocPrint(
+                    allocator,
+                    "reading a bounded chunk from {s} (offset={d}, limit={d}) to inspect only relevant sections",
+                    .{ p, rp.offset orelse 0, rp.limit orelse 0 },
+                );
+            }
+            return std.fmt.allocPrint(allocator, "reading {s} to inspect relevant code", .{p});
+        }
+        return allocator.dupe(u8, "reading file content to inspect relevant code");
+    }
+
+    if (std.mem.eql(u8, tool_name, "bash")) {
+        const command = parseBashCommandFromArgs(allocator, arguments_json);
+        defer if (command) |c| allocator.free(c);
+        if (command) |c| {
+            if (std.mem.indexOf(u8, c, "rg ") != null) {
+                return allocator.dupe(u8, "running ripgrep search to quickly locate matching files or symbols");
+            }
+            if (std.mem.indexOf(u8, c, "zig build") != null or std.mem.indexOf(u8, c, "zig run") != null) {
+                return allocator.dupe(u8, "running Zig command to verify behavior and catch regressions");
+            }
+            return std.fmt.allocPrint(allocator, "running shell command to gather evidence: {s}", .{c});
+        }
+        return allocator.dupe(u8, "running shell command to gather evidence");
+    }
+
+    if (isMutatingToolName(tool_name)) {
+        const path = parsePrimaryPathFromArgs(allocator, arguments_json);
+        defer if (path) |p| allocator.free(p);
+        if (path) |p| {
+            return std.fmt.allocPrint(allocator, "modifying {s} to implement the requested change", .{p});
+        }
+        return allocator.dupe(u8, "modifying files to implement the requested change");
+    }
+
+    if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) {
+        return allocator.dupe(u8, "listing directory entries to discover candidate files");
+    }
+
+    return std.fmt.allocPrint(allocator, "executing tool {s} to progress the task", .{tool_name});
+}
+
 fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, use_color: bool) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);

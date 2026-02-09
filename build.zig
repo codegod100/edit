@@ -4,8 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const refresh_models = b.addSystemCommand(&.{ "sh", "-c", "test -f src/models.dev.json || curl -fsSL https://models.dev/api.json -o src/models.dev.json || true" });
-
     const exe = b.addExecutable(.{
         .name = "zagent",
         .root_module = b.createModule(.{
@@ -14,7 +12,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.step.dependOn(&refresh_models.step);
 
     b.installArtifact(exe);
 
@@ -32,7 +29,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    tests.step.dependOn(&refresh_models.step);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
