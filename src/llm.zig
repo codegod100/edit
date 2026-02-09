@@ -537,6 +537,14 @@ fn queryOpenAICompatible(allocator: std.mem.Allocator, api_key: []const u8, mode
     const output = try runCommandCapture(allocator, argv.items);
     defer allocator.free(output);
 
+    // Debug: Log raw output if it contains thinking/reasoning keywords
+    if (std.mem.indexOf(u8, output, "reasoning") != null or
+        std.mem.indexOf(u8, output, "thinking") != null or
+        std.mem.indexOf(u8, output, "thought") != null)
+    {
+        logger.info("API response contains thinking fields: {s}", .{output});
+    }
+
     return extractOpenAIText(allocator, output);
 }
 
@@ -596,6 +604,10 @@ fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     const Msg = struct {
         content: ?[]const u8 = null,
         reasoning_content: ?[]const u8 = null,
+        // Alternative field names for thinking content
+        reasoning: ?[]const u8 = null,
+        thought: ?[]const u8 = null,
+        thinking: ?[]const u8 = null,
     };
     const Choice = struct { message: Msg };
     const ApiError = struct { message: ?[]const u8 = null };
@@ -662,7 +674,9 @@ fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
     if (resp.choices) |choices| {
         if (choices.len > 0) {
             const message = choices[0].message;
-            const has_reasoning = message.reasoning_content != null and message.reasoning_content.?.len > 0;
+            // Check all possible thinking/reasoning field names
+            const reasoning = message.reasoning_content orelse message.reasoning orelse message.thought orelse message.thinking;
+            const has_reasoning = reasoning != null and reasoning.?.len > 0;
             const has_content = message.content != null and message.content.?.len > 0;
 
             if (has_reasoning or has_content) {
@@ -673,7 +687,7 @@ fn extractFromResp(allocator: std.mem.Allocator, resp: anytype) !?[]u8 {
                 // Add reasoning content first if present (with color coding)
                 if (has_reasoning) {
                     // C_CYAN = "\x1b[36m" for thinking text, C_RESET = "\x1b[0m"
-                    try w.print("\x1b[90m[thinking]\x1b[0m\n\x1b[36m{s}\x1b[0m\n\n", .{message.reasoning_content.?});
+                    try w.print("\x1b[90m[thinking]\x1b[0m\n\x1b[36m{s}\x1b[0m\n\n", .{reasoning.?});
                 }
 
                 // Add main content
