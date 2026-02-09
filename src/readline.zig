@@ -1,7 +1,7 @@
 const std = @import("std");
 
-// Readline support is available when compiled with -Dreadline flag
-// Otherwise this module provides stub implementations
+// Readline module - currently uses fallback implementation in Zig
+// We use our custom readPromptLineFallback instead of an external library
 pub const have_readline = false;
 
 pub const ReadlineError = error{
