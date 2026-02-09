@@ -4,8 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Option to enable readline support (requires libreadline-dev or libedit-dev)
-    const use_readline = b.option(bool, "readline", "Enable readline library support") orelse false;
+    // Option to disable readline support if libreadline-dev is not installed
+    const use_readline = b.option(bool, "readline", "Enable readline library support (default: true)") orelse true;
 
     const refresh_models = b.addSystemCommand(&.{ "sh", "-c", "test -f src/models.dev.json || curl -fsSL https://models.dev/api.json -o src/models.dev.json || true" });
 
