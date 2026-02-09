@@ -682,8 +682,12 @@ fn applyEditKeyAtCursor(
 }
 
 fn renderLine(stdout: anytype, prompt: []const u8, line: []const u8, cursor_pos: usize) !void {
-    // Clear line and redraw
-    try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
+    // Clear current line and all lines below (handles wrapping)
+    try stdout.print("\r\x1b[2K\x1b[J", .{});
+
+    // Redraw prompt and line
+    try stdout.print("{s}{s}", .{ prompt, line });
+
     // Move cursor to correct position
     if (cursor_pos < line.len) {
         const move_back = line.len - cursor_pos;
