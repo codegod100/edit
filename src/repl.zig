@@ -770,6 +770,60 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     if (sub_key == null) continue;
                     owned_key = sub_key.?;
                     key_slice = owned_key.?;
+                } else if (std.mem.eql(u8, provider.id, "opencode")) {
+                    // Check if opencode has free tier models
+                    var has_free_models = false;
+                    for (provider.models) |model| {
+                        if (std.mem.indexOf(u8, model.id, "free") != null) {
+                            has_free_models = true;
+                            break;
+                        }
+                    }
+
+                    if (has_free_models) {
+                        const use_free_opt = try promptLine(allocator, stdin, stdout, "Use free tier models? [Y/n]: ");
+                        if (use_free_opt) |uf| {
+                            defer allocator.free(uf);
+                            const trimmed = std.mem.trim(u8, uf, " \t\r\n");
+                            if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "y") or std.mem.eql(u8, trimmed, "Y")) {
+                                // Use public key for free tier
+                                owned_key = try allocator.dupe(u8, "public");
+                                key_slice = owned_key.?;
+                                try stdout.print("Using free tier (public key)\n", .{});
+                            } else {
+                                // Prompt for real API key
+                                const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
+                                if (key_opt == null) continue;
+                                const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
+                                if (key.len == 0) {
+                                    allocator.free(key_opt.?);
+                                    try stdout.print("Cancelled: empty key.\n", .{});
+                                    continue;
+                                }
+                                owned_key = try allocator.dupe(u8, key);
+                                allocator.free(key_opt.?);
+                                key_slice = owned_key.?;
+                            }
+                        } else {
+                            // Default to free tier if user just hits enter
+                            owned_key = try allocator.dupe(u8, "public");
+                            key_slice = owned_key.?;
+                            try stdout.print("Using free tier (public key)\n", .{});
+                        }
+                    } else {
+                        // No free models, prompt for API key normally
+                        const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
+                        if (key_opt == null) continue;
+                        const key = std.mem.trim(u8, key_opt.?, " \t\r\n");
+                        if (key.len == 0) {
+                            allocator.free(key_opt.?);
+                            try stdout.print("Cancelled: empty key.\n", .{});
+                            continue;
+                        }
+                        owned_key = try allocator.dupe(u8, key);
+                        allocator.free(key_opt.?);
+                        key_slice = owned_key.?;
+                    }
                 } else {
                     const key_opt = try promptRawLine(allocator, stdin, stdout, "API key: ");
                     if (key_opt == null) continue;
