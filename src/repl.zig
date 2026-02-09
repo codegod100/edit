@@ -604,9 +604,9 @@ fn buildPrompt(allocator: std.mem.Allocator, cwd: []const u8, selected_model: ?O
             model.model_id[0..max_model_len]
         else
             model.model_id;
-        return std.fmt.allocPrint(allocator, "{s} [{s}/{s}]> ", .{ cwd, model.provider_id, display_model });
+        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}]{s}> ", .{ C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, C_RESET });
     } else {
-        return std.fmt.allocPrint(allocator, "{s}> ", .{cwd});
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}> ", .{ C_BOLD, cwd, C_RESET });
     }
 }
 
@@ -806,8 +806,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 
     try stdout.print(
-        "zagent MVP. Commands: /skills, /skill <name>, /tools, /tool <spec>, /providers, /default-model <provider>, /model <provider/model>, /connect, /quit\n",
-        .{},
+        "{s}══ zagent ══{s}\n{s}Commands:{s} /skills, /tools, /providers, /model <provider/model>, /stats, /quit\n\n",
+        .{ C_BOLD, C_RESET, C_CYAN, C_RESET },
     );
     while (true) {
         // Reset cancellation flag at start of each iteration
@@ -1029,10 +1029,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     total_chars += turn.content.len;
                     total_tools += turn.tool_calls;
                 }
-                try stdout.print("\n{s}Session Statistics:{s}\n", .{ C_BRIGHT_WHITE, C_RESET });
-                try stdout.print("- Message Count:   {d}\n", .{context_window.turns.items.len});
-                try stdout.print("- Character Count: {d}\n", .{total_chars});
-                try stdout.print("- Tool Executions: {d}\n\n", .{total_tools});
+                try stdout.print("\n{s}══ Session Statistics ══{s}\n", .{ C_BOLD, C_RESET });
+                try stdout.print("{s}Message Count:{s}   {d}\n", .{ C_CYAN, C_RESET, context_window.turns.items.len });
+                try stdout.print("{s}Character Count:{s} {d}\n", .{ C_CYAN, C_RESET, total_chars });
+                try stdout.print("{s}Tool Executions:{s} {d}\n\n", .{ C_CYAN, C_RESET, total_tools });
             },
             .none => {
                 const trimmed = std.mem.trim(u8, normalized, " \t\r\n");
@@ -2328,13 +2328,17 @@ fn buildToolCallId(allocator: std.mem.Allocator, step: usize) ![]u8 {
 
 // ANSI color codes for tool debugging
 const C_RESET = "\x1b[0m";
+const C_BOLD = "\x1b[1m";
+const C_DIM = "\x1b[2m";
+const C_ITALIC = "\x1b[3m";
+const C_UNDERLINE = "\x1b[4m";
 const C_BLUE = "\x1b[34m"; // event type
 const C_YELLOW = "\x1b[33m"; // tool names
 const C_GREEN = "\x1b[32m"; // success status
 const C_RED = "\x1b[31m"; // error status
 const C_CYAN = "\x1b[36m"; // metadata
-const C_DIM = "\x1b[90m"; // low priority info
 const C_BRIGHT_WHITE = "\x1b[97m"; // model response text
+const C_GREY = "\x1b[90m";
 
 fn buildToolResultEventLine(
     allocator: std.mem.Allocator,
@@ -2937,7 +2941,7 @@ fn runWithBridge(
             };
         }
 
-        try stdout.print("{s}[step {d}]{s} ", .{ C_DIM, iteration, C_RESET });
+        try stdout.print("{s}Step {d}:{s} ", .{ C_DIM, iteration + 1, C_RESET });
 
         // Send current messages (add closing bracket)
         const messages_json = try std.fmt.allocPrint(allocator, "{s}]", .{messages.items});
@@ -2989,10 +2993,10 @@ fn runWithBridge(
 
         for (response.tool_calls) |tc| {
             tool_calls += 1;
-            try stdout.print("{s}→ {s}{s}", .{ C_GREEN, tc.tool, C_RESET });
+            try stdout.print("{s}Tool: {s}{s} {s}{s}{s}\n", .{ C_YELLOW, tc.tool, C_RESET, C_DIM, tc.args, C_RESET });
 
             const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
-                try stdout.print(" error: {s}\n", .{@errorName(err)});
+                try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
                 
@@ -3005,7 +3009,14 @@ fn runWithBridge(
             };
             defer allocator.free(result);
 
-            try stdout.print("\n{s}\n", .{result});
+            // Indent and dim result
+            if (result.len > 0) {
+                var it = std.mem.splitScalar(u8, result, '\n');
+                while (it.next()) |line| {
+                    if (line.len == 0) continue;
+                    try stdout.print("  {s}{s}{s}\n", .{ C_GREY, line, C_RESET });
+                }
+            }
 
             // Add tool result to history
             try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
