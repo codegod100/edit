@@ -48,17 +48,13 @@ pub fn query(
 }
 
 fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8) ![]u8 {
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "{f}",
-        .{std.json.fmt(.{ .model = model_id, .input = prompt }, .{})},
-    );
-    defer allocator.free(body);
-
     const auth = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth);
 
     const endpoint = if (isLikelyOAuthToken(api_key)) OPENAI_CODEX_ENDPOINT else OPENAI_API_ENDPOINT;
+    const is_codex = std.mem.eql(u8, endpoint, OPENAI_CODEX_ENDPOINT);
+    const body = try buildOpenAIRequestBody(allocator, model_id, prompt, is_codex);
+    defer allocator.free(body);
 
     const output = try runCommandCapture(allocator, &.{
         "curl",
@@ -82,6 +78,12 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
         else => return err,
     };
     if (first) |text| return text;
+
+    const stream_text = extractOpenAIStreamText(allocator, output) catch |err| switch (err) {
+        QueryError.EmptyModelResponse => null,
+        else => return err,
+    };
+    if (stream_text) |text| return text;
 
     if (std.mem.eql(u8, endpoint, OPENAI_API_ENDPOINT)) {
         const meta = try parseOpenAIResponseMeta(allocator, output);
@@ -130,6 +132,66 @@ fn queryOpenAI(allocator: std.mem.Allocator, api_key: []const u8, model_id: []co
         return std.fmt.allocPrint(allocator, "No text found in model response: {s}", .{output[0..cap]});
     }
     return QueryError.EmptyModelResponse;
+}
+
+fn buildOpenAIRequestBody(allocator: std.mem.Allocator, model_id: []const u8, prompt: []const u8, stream: bool) ![]u8 {
+    const InputText = struct {
+        type: []const u8,
+        text: []const u8,
+    };
+    const InputMessage = struct {
+        role: []const u8,
+        content: []const InputText,
+    };
+
+    const content = [_]InputText{.{ .type = "input_text", .text = prompt }};
+    const input = [_]InputMessage{.{ .role = "user", .content = content[0..] }};
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{f}",
+        .{std.json.fmt(.{
+            .model = model_id,
+            .instructions = "You are a helpful coding assistant.",
+            .input = input[0..],
+            .store = false,
+            .stream = stream,
+        }, .{})},
+    );
+}
+
+fn extractOpenAIStreamText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, "data:")) continue;
+        const payload = std.mem.trim(u8, line[5..], " \t");
+        if (payload.len == 0) continue;
+        if (std.mem.eql(u8, payload, "[DONE]")) continue;
+
+        const Event = struct {
+            type: ?[]const u8 = null,
+            delta: ?[]const u8 = null,
+            text: ?[]const u8 = null,
+            output_text: ?[]const u8 = null,
+        };
+
+        var event = std.json.parseFromSlice(Event, allocator, payload, .{ .ignore_unknown_fields = true }) catch continue;
+        defer event.deinit();
+
+        if (event.value.type) |event_type| {
+            if (!std.mem.endsWith(u8, event_type, ".delta")) continue;
+        }
+
+        const piece = event.value.delta orelse event.value.text orelse event.value.output_text orelse continue;
+        try out.appendSlice(allocator, piece);
+    }
+
+    if (out.items.len == 0) return QueryError.EmptyModelResponse;
+    return out.toOwnedSlice(allocator);
 }
 
 fn isLikelyOAuthToken(token: []const u8) bool {
@@ -208,15 +270,13 @@ fn extractOpenAIText(allocator: std.mem.Allocator, json: []const u8) ![]u8 {
     };
 
     var parsed = std.json.parseFromSlice(Resp, allocator, json, .{ .ignore_unknown_fields = true }) catch {
-        return allocator.dupe(u8, json);
+        return QueryError.EmptyModelResponse;
     };
     defer parsed.deinit();
 
     if (try extractFromResp(allocator, parsed.value)) |text| return text;
 
-    var wrapped = std.json.parseFromSlice(Wrapper, allocator, json, .{ .ignore_unknown_fields = true }) catch {
-        return QueryError.EmptyModelResponse;
-    };
+    var wrapped = std.json.parseFromSlice(Wrapper, allocator, json, .{ .ignore_unknown_fields = true }) catch return QueryError.EmptyModelResponse;
     defer wrapped.deinit();
 
     if (wrapped.value.response) |r| {
@@ -317,6 +377,73 @@ test "extract openai error message" {
 test "oauth token detector" {
     try std.testing.expect(!isLikelyOAuthToken("sk-test-key"));
     try std.testing.expect(isLikelyOAuthToken("a.b.c"));
+}
+
+test "codex body includes instructions" {
+    const allocator = std.testing.allocator;
+    const body = try buildOpenAIRequestBody(allocator, "gpt-5.3-codex", "hello", true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "instructions") != null);
+}
+
+test "openai body sends input as list" {
+    const allocator = std.testing.allocator;
+    const body = try buildOpenAIRequestBody(allocator, "gpt-5.3-codex", "hello", true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"input\":[") != null);
+}
+
+test "openai body sets store false" {
+    const allocator = std.testing.allocator;
+    const body = try buildOpenAIRequestBody(allocator, "gpt-5.3-codex", "hello", true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\":false") != null);
+}
+
+test "openai body sets stream true for codex" {
+    const allocator = std.testing.allocator;
+    const body = try buildOpenAIRequestBody(allocator, "gpt-5.3-codex", "hello", true);
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "extract stream text from sse data lines" {
+    const allocator = std.testing.allocator;
+    const raw = "data: {\"delta\":\"hello \"}\n\ndata: {\"delta\":\"world\"}\n\ndata: [DONE]\n";
+    const out = try extractOpenAIStreamText(allocator, raw);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("hello world", out);
+}
+
+test "extract stream text from event plus data lines" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "event: response.output_text.delta\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n" ++
+        "event: response.output_text.delta\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"!\"}\n\n" ++
+        "data: [DONE]\n";
+    const out = try extractOpenAIStreamText(allocator, raw);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Hi!", out);
+}
+
+test "stream parser ignores done payload to avoid duplicate text" {
+    const allocator = std.testing.allocator;
+    const raw =
+        "event: response.output_text.delta\n" ++
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n" ++
+        "event: response.output_text.done\n" ++
+        "data: {\"type\":\"response.output_text.done\",\"text\":\"Hi\"}\n\n" ++
+        "data: [DONE]\n";
+    const out = try extractOpenAIStreamText(allocator, raw);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Hi", out);
+}
+
+test "non-json response does not dump raw stream" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(QueryError.EmptyModelResponse, extractOpenAIText(allocator, "event: x\\ndata: y"));
 }
 
 test "extract openai wrapped response object" {

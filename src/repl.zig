@@ -3,7 +3,9 @@ const skills = @import("skills.zig");
 const tools = @import("tools.zig");
 const pm = @import("provider_manager.zig");
 const store = @import("provider_store.zig");
+const config_store = @import("config_store.zig");
 const llm = @import("llm.zig");
+const catalog = @import("models_catalog.zig");
 
 pub const CommandTag = enum {
     none,
@@ -148,6 +150,12 @@ const ActiveModel = struct {
     api_key: ?[]const u8,
 };
 
+const ModelOption = struct {
+    provider_id: []const u8,
+    model_id: []const u8,
+    display_name: []const u8,
+};
+
 const ModelSelection = struct {
     provider_id: []const u8,
     model_id: []const u8,
@@ -203,12 +211,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
+    const project_name = std.fs.path.basename(cwd);
+    const prompt_text = if (project_name.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}> ", .{project_name})
+    else
+        try allocator.dupe(u8, "> ");
+    defer allocator.free(prompt_text);
 
     const home = std.posix.getenv("HOME") orelse "";
     const skill_list = try skills.discover(allocator, cwd, home);
     defer skills.freeList(allocator, skill_list);
 
-    const providers = defaultProviderSpecs();
+    const providers_owned = try catalog.loadProviderSpecs(allocator);
+    defer catalog.freeProviderSpecs(allocator, providers_owned);
+    const providers = if (providers_owned.len > 0) providers_owned else defaultProviderSpecs();
     var stored_pairs = try store.load(allocator, cwd);
     defer store.free(allocator, stored_pairs);
 
@@ -220,12 +236,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
 
+    const persisted_model = try config_store.loadSelectedModel(allocator, cwd);
+    if (persisted_model) |persisted| {
+        selected_model = .{
+            .provider_id = persisted.provider_id,
+            .model_id = persisted.model_id,
+        };
+    }
+
     try stdout.print(
         "zagent MVP. Commands: /skills, /skill <name>, /tools, /tool <spec>, /providers, /default-model <provider>, /model <provider/model>, /connect, /quit\n",
         .{},
     );
     while (true) {
-        const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, "> ", &history);
+        const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
         if (line_opt == null) {
             try stdout.print("\n", .{});
             break;
@@ -365,7 +389,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                         continue;
                     }
 
-                    const picked = try interactiveModelSelect(allocator, stdin, stdout, providers, provider_states);
+                    const picked = try interactiveModelSelect(allocator, stdin, stdout, stdin_file, providers, provider_states);
                     if (picked == null) {
                         try stdout.print("No explicit model set. Using default connected provider model.\n", .{});
                         continue;
@@ -375,6 +399,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                         .provider_id = try allocator.dupe(u8, picked.?.provider_id),
                         .model_id = try allocator.dupe(u8, picked.?.model_id),
                     };
+                    try config_store.saveSelectedModel(allocator, cwd, .{
+                        .provider_id = picked.?.provider_id,
+                        .model_id = picked.?.model_id,
+                    });
                     try stdout.print("Active model set to {s}/{s}\n", .{ picked.?.provider_id, picked.?.model_id });
                     continue;
                 }
@@ -398,6 +426,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     .provider_id = try allocator.dupe(u8, p.provider_id),
                     .model_id = try allocator.dupe(u8, p.model_id),
                 };
+                try config_store.saveSelectedModel(allocator, cwd, .{
+                    .provider_id = p.provider_id,
+                    .model_id = p.model_id,
+                });
                 try stdout.print("Active model set to {s}/{s}\n", .{ p.provider_id, p.model_id });
             },
             .none => {
@@ -409,6 +441,25 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 }
 
                 const active = chooseActiveModel(providers, provider_states, selected_model);
+
+                const auto_tool = if (active) |a|
+                    try inferToolCallSpecWithModel(allocator, a, trimmed)
+                else
+                    null;
+                if (auto_tool) |spec| {
+                    defer allocator.free(spec);
+                    const output = tools.execute(allocator, spec) catch |err| {
+                        try stdout.print("Tool failed: {s}\n", .{@errorName(err)});
+                        continue;
+                    };
+                    defer allocator.free(output);
+                    if (output.len == 0) {
+                        try stdout.print("(no output)\n", .{});
+                    } else {
+                        try stdout.print("{s}\n", .{output});
+                    }
+                    continue;
+                }
                 if (active == null) {
                     try stdout.print("No connected providers. Run /providers then /connect <provider-id>.\n", .{});
                     continue;
@@ -639,6 +690,90 @@ test "resolve model pick accepts index and id" {
     try std.testing.expectEqualStrings("gpt-5", by_id.?.id);
 }
 
+test "filter model options matches model and provider text" {
+    const options = [_]ModelOption{
+        .{ .provider_id = "openai", .model_id = "gpt-5", .display_name = "GPT-5" },
+        .{ .provider_id = "anthropic", .model_id = "claude-sonnet-4", .display_name = "Claude Sonnet 4" },
+        .{ .provider_id = "openai", .model_id = "gpt-5-nano", .display_name = "GPT-5 Nano" },
+    };
+
+    const by_provider = try filterModelOptions(std.testing.allocator, options[0..], "anth");
+    defer std.testing.allocator.free(by_provider);
+    try std.testing.expectEqual(@as(usize, 1), by_provider.len);
+    try std.testing.expectEqualStrings("claude-sonnet-4", by_provider[0].model_id);
+
+    const by_model = try filterModelOptions(std.testing.allocator, options[0..], "nano");
+    defer std.testing.allocator.free(by_model);
+    try std.testing.expectEqual(@as(usize, 1), by_model.len);
+    try std.testing.expectEqualStrings("gpt-5-nano", by_model[0].model_id);
+}
+
+test "filter preview line includes matching model names" {
+    const options = [_]ModelOption{
+        .{ .provider_id = "openai", .model_id = "gpt-5", .display_name = "GPT-5" },
+        .{ .provider_id = "openai", .model_id = "gpt-5-nano", .display_name = "GPT-5 Nano" },
+    };
+
+    const line = try buildFilterPreviewLine(std.testing.allocator, options[0..], "nano");
+    defer std.testing.allocator.free(line);
+    try std.testing.expect(containsIgnoreCase(line, "gpt-5-nano"));
+}
+
+test "filter preview block includes multiple match rows" {
+    const options = [_]ModelOption{
+        .{ .provider_id = "openai", .model_id = "gpt-5", .display_name = "GPT-5" },
+        .{ .provider_id = "openai", .model_id = "gpt-5.3-codex", .display_name = "GPT-5.3 Codex" },
+        .{ .provider_id = "anthropic", .model_id = "claude-sonnet-4", .display_name = "Claude Sonnet 4" },
+    };
+
+    const block = try buildFilterPreviewBlock(std.testing.allocator, options[0..], "5");
+    defer std.testing.allocator.free(block);
+    try std.testing.expect(containsIgnoreCase(block, "openai/gpt-5"));
+    try std.testing.expect(containsIgnoreCase(block, "openai/gpt-5.3-codex"));
+}
+
+test "auto pick single model when only one match" {
+    const options = [_]ModelOption{
+        .{ .provider_id = "openai", .model_id = "gpt-5.3-codex", .display_name = "GPT-5.3 Codex" },
+    };
+    const picked = autoPickSingleModel(options[0..]);
+    try std.testing.expect(picked != null);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", picked.?.model_id);
+}
+
+test "infer tool call spec for list files prompt" {
+    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":true,\"tool\":\"bash\",\"input\":\"ls -la .\"}");
+    try std.testing.expect(decision != null);
+    defer if (decision) |d| d.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("bash", decision.?.tool.?);
+}
+
+test "infer tool call spec includes explicit path" {
+    const decision = try parseToolDecisionJson(std.testing.allocator, "```json\n{\"call\":true,\"tool\":\"read\",\"input\":\"src/main.zig\"}\n```");
+    try std.testing.expect(decision != null);
+    defer if (decision) |d| d.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("read", decision.?.tool.?);
+}
+
+test "infer tool call spec returns null for normal chat" {
+    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":false}");
+    try std.testing.expect(decision != null);
+    defer if (decision) |d| d.deinit(std.testing.allocator);
+    try std.testing.expect(!decision.?.call);
+}
+
+test "infer tool call spec for system time prompt" {
+    const decision = try parseToolDecisionJson(std.testing.allocator, "{\"call\":true,\"tool\":\"bash\",\"input\":\"date +%T\"}");
+    try std.testing.expect(decision != null);
+    defer if (decision) |d| d.deinit(std.testing.allocator);
+    try std.testing.expect(decision.?.call);
+}
+
+test "infer tool call spec for time not date followup" {
+    const decision = try parseToolDecisionJson(std.testing.allocator, "hello");
+    try std.testing.expect(decision == null);
+}
+
 test "history navigation moves through entries with up and down" {
     const entries = [_][]const u8{ "/providers", "/connect openai", "/tools" };
 
@@ -843,6 +978,7 @@ fn interactiveModelSelect(
     allocator: std.mem.Allocator,
     stdin: anytype,
     stdout: anytype,
+    stdin_file: std.fs.File,
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
 ) !?ModelSelection {
@@ -851,50 +987,46 @@ fn interactiveModelSelect(
         return null;
     }
 
-    try stdout.print("Select provider:\n", .{});
-    for (connected, 0..) |p, i| {
-        try stdout.print("  {d}) {s}\n", .{ i + 1, p.id });
+    const options = try collectModelOptions(allocator, providers, connected);
+    defer allocator.free(options);
+
+    const query_opt = if (stdin_file.isTty())
+        try readFilterQueryRealtime(allocator, stdin_file, stdout, options)
+    else
+        try promptLine(allocator, stdin, stdout, "Filter models (empty = all): ");
+    if (query_opt == null) return null;
+    defer allocator.free(query_opt.?);
+    const query = std.mem.trim(u8, query_opt.?, " \t\r\n");
+
+    const filtered = try filterModelOptions(allocator, options, query);
+    defer allocator.free(filtered);
+    if (filtered.len == 0) {
+        try stdout.print("No models matched filter: {s}\n", .{query});
+        return null;
     }
 
-    const provider_pick_opt = try promptLine(allocator, stdin, stdout, "Provider number or id: ");
-    if (provider_pick_opt == null) return null;
-    defer allocator.free(provider_pick_opt.?);
-    const provider_pick = std.mem.trim(u8, provider_pick_opt.?, " \t\r\n");
-    if (provider_pick.len == 0) return null;
-
-    const provider_state = resolveProviderPick(connected, provider_pick) orelse {
-        try stdout.print("Unknown connected provider: {s}\n", .{provider_pick});
-        return null;
-    };
-    const provider_spec = findProviderSpecByID(providers, provider_state.id) orelse {
-        try stdout.print("Provider metadata unavailable: {s}\n", .{provider_state.id});
-        return null;
-    };
-
-    try stdout.print("Select model for {s}:\n", .{provider_state.id});
-    for (provider_spec.models, 0..) |m, i| {
-        try stdout.print("  {d}) {s} ({s})\n", .{ i + 1, m.id, m.display_name });
+    if (autoPickSingleModel(filtered)) |model| {
+        try stdout.print("Auto-selected: {s}/{s}\n", .{ model.provider_id, model.model_id });
+        return .{ .provider_id = model.provider_id, .model_id = model.model_id };
     }
+
+    try stdout.print("Select model:\n", .{});
+    for (filtered, 0..) |m, i| {
+        try stdout.print("  {d}) {s}/{s} ({s})\n", .{ i + 1, m.provider_id, m.model_id, m.display_name });
+    }
+
     const model_pick_opt = try promptLine(allocator, stdin, stdout, "Model number or id: ");
     if (model_pick_opt == null) return null;
     defer allocator.free(model_pick_opt.?);
     const model_pick = std.mem.trim(u8, model_pick_opt.?, " \t\r\n");
     if (model_pick.len == 0) return null;
 
-    const model = resolveModelPick(provider_spec.models, model_pick) orelse {
+    const model = resolveGlobalModelPick(filtered, model_pick) orelse {
         try stdout.print("Unknown model: {s}\n", .{model_pick});
         return null;
     };
 
-    return .{ .provider_id = provider_state.id, .model_id = model.id };
-}
-
-fn resolveProviderPick(connected: []const pm.ProviderState, pick: []const u8) ?pm.ProviderState {
-    const n = std.fmt.parseInt(usize, pick, 10) catch null;
-    if (n) |idx| {
-        if (idx > 0 and idx <= connected.len) return connected[idx - 1];
-    }
-    return findConnectedProvider(connected, pick);
+    return .{ .provider_id = model.provider_id, .model_id = model.model_id };
 }
 
 fn resolveModelPick(models: []const pm.Model, pick: []const u8) ?pm.Model {
@@ -906,6 +1038,266 @@ fn resolveModelPick(models: []const pm.Model, pick: []const u8) ?pm.Model {
         if (std.mem.eql(u8, m.id, pick)) return m;
     }
     return null;
+}
+
+fn collectModelOptions(
+    allocator: std.mem.Allocator,
+    providers: []const pm.ProviderSpec,
+    connected: []const pm.ProviderState,
+) ![]ModelOption {
+    var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
+    errdefer out.deinit(allocator);
+
+    for (connected) |cp| {
+        const spec = findProviderSpecByID(providers, cp.id) orelse continue;
+        for (spec.models) |m| {
+            try out.append(allocator, .{ .provider_id = cp.id, .model_id = m.id, .display_name = m.display_name });
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn filterModelOptions(allocator: std.mem.Allocator, options: []const ModelOption, query: []const u8) ![]ModelOption {
+    const q = std.mem.trim(u8, query, " \t\r\n");
+    if (q.len == 0) return allocator.dupe(ModelOption, options);
+
+    var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
+    errdefer out.deinit(allocator);
+
+    for (options) |o| {
+        if (containsIgnoreCase(o.model_id, q) or containsIgnoreCase(o.display_name, q) or containsIgnoreCase(o.provider_id, q)) {
+            try out.append(allocator, o);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        var ok = true;
+        while (j < needle.len) : (j += 1) {
+            const a = std.ascii.toLower(haystack[i + j]);
+            const b = std.ascii.toLower(needle[j]);
+            if (a != b) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+fn resolveGlobalModelPick(options: []const ModelOption, pick: []const u8) ?ModelOption {
+    const n = std.fmt.parseInt(usize, pick, 10) catch null;
+    if (n) |idx| {
+        if (idx > 0 and idx <= options.len) return options[idx - 1];
+    }
+
+    for (options) |m| {
+        if (std.mem.eql(u8, m.model_id, pick)) return m;
+        if (std.mem.eql(u8, m.provider_id, pick)) return m;
+        if (std.mem.eql(u8, m.display_name, pick)) return m;
+    }
+
+    for (options) |m| {
+        if (std.mem.eql(u8, m.provider_id, pick)) return m;
+        if (containsIgnoreCase(m.model_id, pick)) return m;
+        if (containsIgnoreCase(m.display_name, pick)) return m;
+    }
+    return null;
+}
+
+fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
+    return if (options.len == 1) options[0] else null;
+}
+
+const ToolDecision = struct {
+    call: bool,
+    tool: ?[]u8 = null,
+    input: ?[]u8 = null,
+
+    fn deinit(self: ToolDecision, allocator: std.mem.Allocator) void {
+        if (self.tool) |t| allocator.free(t);
+        if (self.input) |i| allocator.free(i);
+    }
+};
+
+fn inferToolCallSpecWithModel(allocator: std.mem.Allocator, active: ActiveModel, input: []const u8) !?[]u8 {
+    const route_prompt = try std.fmt.allocPrint(
+        allocator,
+        "Decide whether to execute a local tool. Available tools:\n- bash: run shell command\n- read: read file content\nReturn STRICT JSON ONLY with one object: {{\"call\":false}} OR {{\"call\":true,\"tool\":\"bash|read\",\"input\":\"...\"}}.\nUser request: {s}",
+        .{input},
+    );
+    defer allocator.free(route_prompt);
+
+    const raw = llm.query(allocator, active.provider_id, active.api_key, active.model_id, route_prompt) catch return null;
+    defer allocator.free(raw);
+
+    const parsed = (try parseToolDecisionJson(allocator, raw)) orelse return null;
+    defer {
+        var owned = parsed;
+        owned.deinit(allocator);
+    }
+    if (!parsed.call) return null;
+    const tool_name = parsed.tool orelse return null;
+    const tool_input = parsed.input orelse return null;
+    if (!(std.mem.eql(u8, tool_name, "bash") or std.mem.eql(u8, tool_name, "read"))) return null;
+    return try std.fmt.allocPrint(allocator, "{s} {s}", .{ tool_name, tool_input });
+}
+
+fn parseToolDecisionJson(allocator: std.mem.Allocator, text: []const u8) !?ToolDecision {
+    const Parsed = struct {
+        call: ?bool = null,
+        tool: ?[]const u8 = null,
+        input: ?[]const u8 = null,
+    };
+
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const json_slice = if (std.mem.startsWith(u8, trimmed, "```")) blk: {
+        const first = std.mem.indexOfScalar(u8, trimmed, '{') orelse break :blk trimmed;
+        const last = std.mem.lastIndexOfScalar(u8, trimmed, '}') orelse break :blk trimmed;
+        if (last <= first) break :blk trimmed;
+        break :blk trimmed[first .. last + 1];
+    } else trimmed;
+
+    var parsed = std.json.parseFromSlice(Parsed, allocator, json_slice, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return ToolDecision{
+        .call = parsed.value.call orelse false,
+        .tool = if (parsed.value.tool) |t| try allocator.dupe(u8, t) else null,
+        .input = if (parsed.value.input) |i| try allocator.dupe(u8, i) else null,
+    };
+}
+
+fn shellQuoteSingle(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '\'');
+    for (text) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(allocator, "'\\''");
+        } else {
+            try out.append(allocator, ch);
+        }
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
+}
+
+fn readFilterQueryRealtime(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    stdout: anytype,
+    options: []const ModelOption,
+) !?[]u8 {
+    const original = std.posix.tcgetattr(stdin_file.handle) catch return try allocator.dupe(u8, "");
+    var raw = original;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    try std.posix.tcsetattr(stdin_file.handle, .NOW, raw);
+    defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
+
+    var query = try allocator.alloc(u8, 0);
+    defer allocator.free(query);
+
+    var rendered_lines: usize = 0;
+    try renderFilterPreview(allocator, stdout, options, query, &rendered_lines);
+
+    var byte_buf: [1]u8 = undefined;
+    while (true) {
+        const n = try stdin_file.read(&byte_buf);
+        if (n == 0) return null;
+        const ch = byte_buf[0];
+        if (ch == '\n' or ch == '\r') {
+            try stdout.print("\n", .{});
+            return try allocator.dupe(u8, query);
+        }
+        if (ch == 127 or ch == 8) {
+            if (query.len > 0) query = try allocator.realloc(query, query.len - 1);
+        } else if (ch >= 32 and ch != 127) {
+            query = try allocator.realloc(query, query.len + 1);
+            query[query.len - 1] = ch;
+        }
+        try renderFilterPreview(allocator, stdout, options, query, &rendered_lines);
+    }
+}
+
+fn renderFilterPreview(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    options: []const ModelOption,
+    query: []const u8,
+    rendered_lines: *usize,
+) !void {
+    if (rendered_lines.* > 1) {
+        try stdout.print("\x1b[{d}A", .{rendered_lines.* - 1});
+    }
+
+    if (rendered_lines.* > 0) {
+        var i: usize = 0;
+        while (i < rendered_lines.*) : (i += 1) {
+            try stdout.print("\r\x1b[2K", .{});
+            if (i + 1 < rendered_lines.*) try stdout.print("\x1b[1B", .{});
+        }
+        if (rendered_lines.* > 1) {
+            try stdout.print("\x1b[{d}A", .{rendered_lines.* - 1});
+        }
+    }
+
+    const block = try buildFilterPreviewBlock(allocator, options, query);
+    defer allocator.free(block);
+    try stdout.print("{s}", .{block});
+
+    rendered_lines.* = 1;
+    for (block) |ch| {
+        if (ch == '\n') rendered_lines.* += 1;
+    }
+}
+
+fn buildFilterPreviewBlock(allocator: std.mem.Allocator, options: []const ModelOption, query: []const u8) ![]u8 {
+    const filtered = try filterModelOptions(allocator, options, query);
+    defer allocator.free(filtered);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("Filter models: {s} | matches: {d}", .{ query, filtered.len });
+    const limit = @min(filtered.len, 6);
+    var i: usize = 0;
+    while (i < limit) : (i += 1) {
+        try w.print("\n  {d}) {s}/{s} ({s})", .{ i + 1, filtered[i].provider_id, filtered[i].model_id, filtered[i].display_name });
+    }
+    if (filtered.len > limit) {
+        try w.print("\n  ... and {d} more", .{filtered.len - limit});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildFilterPreviewLine(allocator: std.mem.Allocator, options: []const ModelOption, query: []const u8) ![]u8 {
+    const filtered = try filterModelOptions(allocator, options, query);
+    defer allocator.free(filtered);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("Filter models: {s} | matches: {d}", .{ query, filtered.len });
+    if (filtered.len > 0) {
+        try w.print(" | top: ", .{});
+        const limit = @min(filtered.len, 3);
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            if (i > 0) try w.print(", ", .{});
+            try w.print("{s}/{s}", .{ filtered[i].provider_id, filtered[i].model_id });
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn supportsSubscription(provider_id: []const u8) bool {

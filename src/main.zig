@@ -10,7 +10,9 @@ pub fn main() !void {
 }
 
 test {
+    _ = @import("config_store.zig");
     _ = @import("llm.zig");
+    _ = @import("models_catalog.zig");
     _ = @import("skills.zig");
     _ = @import("repl.zig");
     _ = @import("provider_manager.zig");
