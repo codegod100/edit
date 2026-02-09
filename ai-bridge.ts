@@ -54,7 +54,7 @@ const tools = {
     parameters: z.object({
       path: z.string().describe("The path to the file to read"),
       offset: z.number().int().optional().describe("Byte offset to start reading from"),
-      limit: z.number().int().optional().describe("Maximum bytes to read"),
+      limit: z.number().int().optional().describe("Maximum bytes to read (default 4096, ~100 lines)"),
     }),
   },
   list_files: {
@@ -84,7 +84,7 @@ const tools = {
     parameters: z.object({
       filePath: z.string().describe("The path to the file"),
       offset: z.number().int().optional().describe("Byte offset to start reading from"),
-      limit: z.number().int().optional().describe("Maximum bytes to read"),
+      limit: z.number().int().optional().describe("Maximum bytes to read (default 4096, ~100 lines)"),
     }),
   },
   list: {

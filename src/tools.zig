@@ -12,12 +12,12 @@ pub const ToolDef = struct {
 
 pub const definitions = [_]ToolDef{
     .{ .name = "bash", .description = "Execute a shell command and return stdout.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}" },
-    .{ .name = "read_file", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 8192)\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
+    .{ .name = "read_file", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 4096, ~100 lines)\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "list_files", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write_file", .description = "Write complete file contents to a path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "replace_in_file", .description = "Replace text in a file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\",\"replace\"],\"additionalProperties\":false}" },
     // OpenCode-compatible aliases.
-    .{ .name = "read", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 8192)\"}},\"required\":[\"filePath\"],\"additionalProperties\":false}" },
+    .{ .name = "read", .description = "Read a file and return its contents. Supports partial reads with offset/limit.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of characters to skip from the start\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum number of characters to read (default 4096, ~100 lines)\"}},\"required\":[\"filePath\"],\"additionalProperties\":false}" },
     .{ .name = "list", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write", .description = "Write full content to a file path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"filePath\",\"content\"],\"additionalProperties\":false}" },
     .{ .name = "edit", .description = "Replace oldString with newString in one file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
@@ -75,7 +75,7 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         defer p.deinit();
         const path = p.value.path orelse p.value.filePath orelse return NamedToolError.InvalidArguments;
         const offset = p.value.offset orelse 0;
-        const limit = p.value.limit orelse 8192;
+        const limit = p.value.limit orelse 4096;
         return readFileAtPathWithOffset(allocator, path, offset, limit) catch |err| {
             // Return snarky error to guide model back on track
             if (err == NamedToolError.InvalidArguments) {
