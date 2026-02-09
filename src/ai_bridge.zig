@@ -122,7 +122,7 @@ pub const Bridge = struct {
         logger.info("Request sent, waiting for response...", .{});
 
         // Read response line
-        const line = try stdout_reader.readUntilDelimiterOrEofAlloc(self.allocator, '\n', 65536);
+        const line = try stdout_reader.readUntilDelimiterOrEofAlloc(self.allocator, '\n', 10 * 1024 * 1024);
         if (line == null) return error.BridgeClosed;
         defer self.allocator.free(line.?);
 
