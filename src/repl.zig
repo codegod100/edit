@@ -108,6 +108,11 @@ const EditKey = enum {
     backspace,
     enter,
     character,
+    left,
+    right,
+    home,
+    end,
+    delete,
 };
 
 const AuthMethod = enum {
@@ -593,7 +598,93 @@ fn applyEditKey(
             return out;
         },
         .enter => allocator.dupe(u8, current),
+        else => allocator.dupe(u8, current), // Cursor movement keys don't change text
     };
+}
+
+const LineEditResult = struct {
+    text: []u8,
+    cursor_pos: usize,
+};
+
+fn applyEditKeyAtCursor(
+    allocator: std.mem.Allocator,
+    current: []const u8,
+    key: EditKey,
+    character: u8,
+    cursor_pos: usize,
+) !LineEditResult {
+    const pos = @min(cursor_pos, current.len);
+
+    return switch (key) {
+        .tab => {
+            const text = try allocator.dupe(u8, autocompleteCommand(current));
+            return .{ .text = text, .cursor_pos = text.len };
+        },
+        .backspace => {
+            if (pos == 0) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = 0 };
+            }
+            const new_len = current.len - 1;
+            const text = try allocator.alloc(u8, new_len);
+            @memcpy(text[0 .. pos - 1], current[0 .. pos - 1]);
+            @memcpy(text[pos - 1 ..], current[pos..]);
+            return .{ .text = text, .cursor_pos = pos - 1 };
+        },
+        .delete => {
+            if (pos >= current.len) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = pos };
+            }
+            const new_len = current.len - 1;
+            const text = try allocator.alloc(u8, new_len);
+            @memcpy(text[0..pos], current[0..pos]);
+            @memcpy(text[pos..], current[pos + 1 ..]);
+            return .{ .text = text, .cursor_pos = pos };
+        },
+        .character => {
+            if (character < 32 or character == 127) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = pos };
+            }
+            const text = try allocator.alloc(u8, current.len + 1);
+            @memcpy(text[0..pos], current[0..pos]);
+            text[pos] = character;
+            @memcpy(text[pos + 1 ..], current[pos..]);
+            return .{ .text = text, .cursor_pos = pos + 1 };
+        },
+        .left => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = if (pos > 0) pos - 1 else 0 };
+        },
+        .right => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = if (pos < current.len) pos + 1 else current.len };
+        },
+        .home => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = 0 };
+        },
+        .end => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = current.len };
+        },
+        .enter => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = pos };
+        },
+    };
+}
+
+fn renderLine(stdout: anytype, prompt: []const u8, line: []const u8, cursor_pos: usize) !void {
+    // Clear line and redraw
+    try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
+    // Move cursor to correct position
+    if (cursor_pos < line.len) {
+        const move_back = line.len - cursor_pos;
+        try stdout.print("\x1b[{d}D", .{move_back});
+    }
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
@@ -921,11 +1012,12 @@ fn readPromptLine(
 
     var line = try allocator.alloc(u8, 0);
     defer allocator.free(line);
+    var cursor_pos: usize = 0;
     var history_index: ?usize = null;
 
     try stdout.print("{s}", .{prompt});
 
-    var byte_buf: [3]u8 = undefined;
+    var byte_buf: [4]u8 = undefined;
     while (true) {
         const n = try stdin_file.read(byte_buf[0..1]);
         if (n == 0) {
@@ -934,48 +1026,117 @@ fn readPromptLine(
         }
 
         const ch = byte_buf[0];
+
+        // Escape sequences (arrow keys, etc.)
         if (ch == 27) {
             const n1 = try stdin_file.read(byte_buf[1..2]);
             if (n1 == 0) continue;
-            if (byte_buf[1] != '[') continue;
 
-            const n2 = try stdin_file.read(byte_buf[2..3]);
-            if (n2 == 0) continue;
-            const nav: ?HistoryNav = switch (byte_buf[2]) {
-                'A' => .up,
-                'B' => .down,
-                else => null,
-            };
-            if (nav == null) continue;
+            if (byte_buf[1] == '[') {
+                const n2 = try stdin_file.read(byte_buf[2..3]);
+                if (n2 == 0) continue;
 
-            const next_index = historyNextIndex(history.items.items, history_index, nav.?);
-            history_index = next_index;
-
-            const entry = if (history_index) |idx| history.items.items[idx] else "";
-            line = try allocator.realloc(line, entry.len);
-            @memcpy(line, entry);
-            try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
+                // Handle arrow keys and navigation
+                switch (byte_buf[2]) {
+                    'A' => { // Up arrow - history
+                        const next_index = historyNextIndex(history.items.items, history_index, .up);
+                        history_index = next_index;
+                        const entry = if (history_index) |idx| history.items.items[idx] else "";
+                        allocator.free(line);
+                        line = try allocator.dupe(u8, entry);
+                        cursor_pos = line.len;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    'B' => { // Down arrow - history
+                        const next_index = historyNextIndex(history.items.items, history_index, .down);
+                        history_index = next_index;
+                        const entry = if (history_index) |idx| history.items.items[idx] else "";
+                        allocator.free(line);
+                        line = try allocator.dupe(u8, entry);
+                        cursor_pos = line.len;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    'C' => { // Right arrow
+                        history_index = null;
+                        const next = try applyEditKeyAtCursor(allocator, line, .right, 0, cursor_pos);
+                        defer allocator.free(next.text);
+                        line = try allocator.dupe(u8, next.text);
+                        cursor_pos = next.cursor_pos;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    'D' => { // Left arrow
+                        history_index = null;
+                        const next = try applyEditKeyAtCursor(allocator, line, .left, 0, cursor_pos);
+                        defer allocator.free(next.text);
+                        line = try allocator.dupe(u8, next.text);
+                        cursor_pos = next.cursor_pos;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    'H' => { // Home
+                        history_index = null;
+                        const next = try applyEditKeyAtCursor(allocator, line, .home, 0, cursor_pos);
+                        defer allocator.free(next.text);
+                        line = try allocator.dupe(u8, next.text);
+                        cursor_pos = next.cursor_pos;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    'F' => { // End
+                        history_index = null;
+                        const next = try applyEditKeyAtCursor(allocator, line, .end, 0, cursor_pos);
+                        defer allocator.free(next.text);
+                        line = try allocator.dupe(u8, next.text);
+                        cursor_pos = next.cursor_pos;
+                        try renderLine(stdout, prompt, line, cursor_pos);
+                        continue;
+                    },
+                    '3' => { // Delete key (ESC[3~)
+                        const n3 = try stdin_file.read(byte_buf[3..4]);
+                        if (n3 > 0 and byte_buf[3] == '~') {
+                            history_index = null;
+                            const next = try applyEditKeyAtCursor(allocator, line, .delete, 0, cursor_pos);
+                            defer allocator.free(next.text);
+                            line = try allocator.dupe(u8, next.text);
+                            cursor_pos = next.cursor_pos;
+                            try renderLine(stdout, prompt, line, cursor_pos);
+                        }
+                        continue;
+                    },
+                    else => continue,
+                }
+            }
             continue;
         }
 
+        // Enter key
         if (ch == '\n' or ch == '\r') {
             try stdout.print("\n", .{});
             return try allocator.dupe(u8, line);
         }
 
+        // Ctrl+C
+        if (ch == 3) {
+            return null;
+        }
+
         history_index = null;
 
-        const next = blk: {
-            if (ch == 9) break :blk try applyEditKey(allocator, line, .tab, 0);
-            if (ch == 127 or ch == 8) break :blk try applyEditKey(allocator, line, .backspace, 0);
-            break :blk try applyEditKey(allocator, line, .character, ch);
+        // Handle special keys
+        const key: EditKey = switch (ch) {
+            9 => .tab, // Tab
+            127, 8 => .backspace, // Backspace
+            else => .character,
         };
-        defer allocator.free(next);
 
-        line = try allocator.realloc(line, next.len);
-        @memcpy(line, next);
-
-        try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, line });
+        const next = try applyEditKeyAtCursor(allocator, line, key, ch, cursor_pos);
+        defer allocator.free(next.text);
+        line = try allocator.dupe(u8, next.text);
+        cursor_pos = next.cursor_pos;
+        try renderLine(stdout, prompt, line, cursor_pos);
     }
 }
 
