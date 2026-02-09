@@ -276,7 +276,7 @@ fn replaceTextStrict(allocator: std.mem.Allocator, original: []const u8, find: [
     if (matches == 0) {
         const fuzzy = try replaceByTrimmedLines(allocator, original, find, repl);
         if (fuzzy) |value| return value;
-        return allocator.dupe(u8, "no-op: pattern not found");
+        return NamedToolError.InvalidArguments; // Pattern not found
     }
     if (!replace_all and matches > 1) return NamedToolError.InvalidArguments;
 
