@@ -38,7 +38,18 @@ pub const definitions = [_]ToolDef{
 };
 
 pub fn list() []const []const u8 {
-    return &.{ "bash <command>", "read <path>", "list <path>", "write <path>", "replace <path>", "apply_patch <patch-text>" };
+    // Return the actual tool names from `definitions` so callers (e.g. REPL help)
+    // don't drift from the registered tools.
+    comptime {
+        // Keep this function comptime-friendly.
+        _ = definitions;
+    }
+
+    // Build a comptime list of tool names.
+    // Note: returning `[]const []const u8` is fine since `definitions` is static.
+    var names: [definitions.len][]const u8 = undefined;
+    for (definitions, 0..) |d, i| names[i] = d.name;
+    return names[0..];
 }
 
 pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
