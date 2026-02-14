@@ -13,18 +13,21 @@ pub const ToolDef = struct {
 const DEFAULT_READ_OFFSET: usize = 0;
 const DEFAULT_READ_LIMIT: usize = 4096;
 const MAX_READ_LIMIT: usize = 16384;
+const MAX_EDIT_LINES_WITHOUT_CONFIRM: usize = 100;
 
 pub const definitions = [_]ToolDef{
     .{ .name = "bash", .description = "Execute a shell command and return stdout.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"],\"additionalProperties\":false}" },
+    // Keep schema minimal/strict for providers that validate JSON Schema tightly.
+    .{ .name = "respond_text", .description = "Return a final plain-text response to the user when no further tools are needed.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}" },
     .{ .name = "read_file", .description = "Read a file and return its contents. Always provide offset and limit for bounded reads.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of bytes to skip from the start (always include; use 0 first)\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum bytes to read (always include; use <=16384)\"}},\"required\":[\"path\",\"offset\",\"limit\"],\"additionalProperties\":false}" },
     .{ .name = "list_files", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write_file", .description = "Write complete file contents to a path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}" },
-    .{ .name = "replace_in_file", .description = "Replace text in a file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\",\"replace\"],\"additionalProperties\":false}" },
+    .{ .name = "replace_in_file", .description = "Replace text in a file. Large edits (>100 lines) require confirm=true.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"find\":{\"type\":\"string\"},\"replace\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"},\"confirm\":{\"type\":\"boolean\"}},\"required\":[\"path\",\"find\",\"replace\"],\"additionalProperties\":false}" },
     // OpenCode-compatible aliases.
     .{ .name = "read", .description = "Read a file and return its contents. Always provide offset and limit for bounded reads.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"description\":\"Number of bytes to skip from the start (always include; use 0 first)\"},\"limit\":{\"type\":\"integer\",\"description\":\"Maximum bytes to read (always include; use <=16384)\"}},\"required\":[\"filePath\",\"offset\",\"limit\"],\"additionalProperties\":false}" },
     .{ .name = "list", .description = "List files and directories in a folder.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"additionalProperties\":false}" },
     .{ .name = "write", .description = "Write full content to a file path.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"filePath\",\"content\"],\"additionalProperties\":false}" },
-    .{ .name = "edit", .description = "Replace oldString with newString in one file.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
+    .{ .name = "edit", .description = "Replace oldString with newString in one file. Large edits (>100 lines) require confirm=true.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"filePath\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"},\"replaceAll\":{\"type\":\"boolean\"},\"confirm\":{\"type\":\"boolean\"}},\"required\":[\"filePath\",\"oldString\",\"newString\"],\"additionalProperties\":false}" },
     .{ .name = "apply_patch", .description = "Apply a structured patch with add/update/delete operations.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"patchText\":{\"type\":\"string\"}},\"required\":[\"patchText\"],\"additionalProperties\":false}" },
     // Todo tools for tracking progress
     .{ .name = "todo_add", .description = "Add a new task to the todo list to track progress.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"description\":{\"type\":\"string\",\"description\":\"Task description\"}},\"required\":[\"description\"],\"additionalProperties\":false}" },
@@ -71,6 +74,19 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
         return runBash(allocator, p.value.command orelse return NamedToolError.InvalidArguments);
+    }
+
+    if (std.mem.eql(u8, name, "respond_text")) {
+        const A = struct {
+            text: ?[]const u8 = null,
+            message: ?[]const u8 = null,
+            summary: ?[]const u8 = null,
+            content: ?[]const u8 = null,
+        };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const msg = p.value.text orelse p.value.message orelse p.value.summary orelse p.value.content orelse "";
+        return allocator.dupe(u8, msg);
     }
 
     if (std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read")) {
@@ -142,6 +158,7 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
             new: ?[]const u8 = null,
             all: ?bool = null,
             replaceAll: ?bool = null,
+            confirm: ?bool = null,
         };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
@@ -150,12 +167,42 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const find = p.value.find orelse p.value.oldString orelse p.value.old_string orelse p.value.old orelse return NamedToolError.InvalidArguments;
         const repl = p.value.replace orelse p.value.newString orelse p.value.new_string orelse p.value.new orelse return NamedToolError.InvalidArguments;
         const replace_all = p.value.all orelse p.value.replaceAll orelse false;
+        const confirmed = p.value.confirm orelse false;
 
         const original = try readFileAtPath(allocator, path, 4 * 1024 * 1024);
         defer allocator.free(original);
 
-        const next = try replaceTextStrict(allocator, original, find, repl, replace_all);
+        const next = replaceTextStrict(allocator, original, find, repl, replace_all) catch |err| switch (err) {
+            NamedToolError.InvalidArguments => {
+                const matches = countOccurrences(original, find);
+                if (matches == 0) {
+                    return std.fmt.allocPrint(
+                        allocator,
+                        "Replace failed: pattern not found in {s}. Use exact text for 'find' (including punctuation/indentation), or include more surrounding context.",
+                        .{path},
+                    );
+                }
+                if (!replace_all and matches > 1) {
+                    return std.fmt.allocPrint(
+                        allocator,
+                        "Replace failed: pattern matched {d} locations in {s}. Provide a more specific 'find' string or set all=true/replaceAll=true.",
+                        .{ matches, path },
+                    );
+                }
+                return std.fmt.allocPrint(allocator, "Replace failed in {s}: invalid replace arguments.", .{path});
+            },
+            else => return err,
+        };
         defer allocator.free(next);
+
+        const edited_lines = countEditedLines(original, next);
+        if (edited_lines > MAX_EDIT_LINES_WITHOUT_CONFIRM and !confirmed) {
+            return std.fmt.allocPrint(
+                allocator,
+                "CONFIRM_REQUIRED: edit would modify {d} lines in {s} (limit {d}). Re-run the same edit with {{\"confirm\":true}} to proceed.",
+                .{ edited_lines, path, MAX_EDIT_LINES_WITHOUT_CONFIRM },
+            );
+        }
 
         try writeFileAtPath(path, next);
         const diff = try renderMiniDiff(allocator, path, original, next);
@@ -735,6 +782,41 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
     return out.toOwnedSlice(allocator);
 }
 
+fn countEditedLines(before: []const u8, after: []const u8) usize {
+    if (std.mem.eql(u8, before, after)) return 0;
+
+    var before_lines = std.ArrayList([]const u8).empty;
+    defer before_lines.deinit(std.heap.page_allocator);
+    var after_lines = std.ArrayList([]const u8).empty;
+    defer after_lines.deinit(std.heap.page_allocator);
+
+    var bit = std.mem.splitScalar(u8, before, '\n');
+    while (bit.next()) |line| before_lines.append(std.heap.page_allocator, std.mem.trimRight(u8, line, "\r")) catch return MAX_EDIT_LINES_WITHOUT_CONFIRM + 1;
+    var ait = std.mem.splitScalar(u8, after, '\n');
+    while (ait.next()) |line| after_lines.append(std.heap.page_allocator, std.mem.trimRight(u8, line, "\r")) catch return MAX_EDIT_LINES_WITHOUT_CONFIRM + 1;
+
+    if (before.len > 0 and before[before.len - 1] == '\n' and before_lines.items.len > 0 and before_lines.items[before_lines.items.len - 1].len == 0) {
+        _ = before_lines.pop();
+    }
+    if (after.len > 0 and after[after.len - 1] == '\n' and after_lines.items.len > 0 and after_lines.items[after_lines.items.len - 1].len == 0) {
+        _ = after_lines.pop();
+    }
+
+    var prefix: usize = 0;
+    while (prefix < before_lines.items.len and prefix < after_lines.items.len and std.mem.eql(u8, before_lines.items[prefix], after_lines.items[prefix])) : (prefix += 1) {}
+
+    var bs = before_lines.items.len;
+    var as = after_lines.items.len;
+    while (bs > prefix and as > prefix and std.mem.eql(u8, before_lines.items[bs - 1], after_lines.items[as - 1])) {
+        bs -= 1;
+        as -= 1;
+    }
+
+    const removed = bs - prefix;
+    const added = as - prefix;
+    return @max(removed, added);
+}
+
 fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
     const result = try std.process.Child.run(.{
         .allocator = allocator,
@@ -811,4 +893,9 @@ test "render mini diff includes path headers" {
     defer allocator.free(diff);
     try std.testing.expect(std.mem.indexOf(u8, diff, "--- a/src/demo.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, diff, "+const x = 2;") != null);
+}
+
+test "count edited lines tracks changed block size" {
+    try std.testing.expectEqual(@as(usize, 1), countEditedLines("a\nb\nc\n", "a\nx\nc\n"));
+    try std.testing.expectEqual(@as(usize, 3), countEditedLines("a\nb\nc\n", "a\nx\ny\nz\n"));
 }

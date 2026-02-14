@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const skills = @import("skills.zig");
 const tools = @import("tools.zig");
 const pm = @import("provider_manager.zig");
@@ -42,8 +43,11 @@ pub const CommandTag = enum {
     default_model,
     connect_provider,
     set_model,
+    list_models,
     set_effort,
     stats,
+    ping,
+    todo,
 };
 
 pub const Command = struct {
@@ -96,7 +100,12 @@ pub fn parseCommand(line: []const u8) Command {
     if (std.mem.eql(u8, trimmed, "/stats")) {
         return .{ .tag = .stats, .arg = "" };
     }
-    if (std.mem.startsWith(u8, trimmed, "/model")) {
+    if (std.mem.eql(u8, trimmed, "/models") or std.mem.startsWith(u8, trimmed, "/models ")) {
+        var rest = trimmed[7..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .list_models, .arg = rest };
+    }
+    if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
         var rest = trimmed[6..];
         rest = std.mem.trim(u8, rest, " \t");
         return .{ .tag = .set_model, .arg = rest };
@@ -107,6 +116,14 @@ pub fn parseCommand(line: []const u8) Command {
         return .{ .tag = .set_effort, .arg = rest };
     }
 
+    if (std.mem.eql(u8, trimmed, "/ping")) {
+        return .{ .tag = .ping, .arg = "" };
+    }
+    if (std.mem.startsWith(u8, trimmed, "/todo")) {
+        var rest = trimmed[5..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .todo, .arg = rest };
+    }
     return .{ .tag = .none, .arg = "" };
 }
 
@@ -128,6 +145,102 @@ fn autocompleteCommand(input: []const u8) []const u8 {
     }
 
     return if (matches == 1) winner else trimmed;
+}
+
+const MentionReadLimit: usize = 4096;
+const MentionMaxFiles: usize = 4;
+
+fn isWhitespace(ch: u8) bool {
+    return ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r';
+}
+
+fn isMentionPathChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '/' or ch == '.' or ch == '_' or ch == '-';
+}
+
+fn sharedPrefixLen(a: []const u8, b: []const u8) usize {
+    const max_len = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < max_len and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+fn isCodexModelId(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "codex") != null;
+}
+
+fn mentionCompletionSuffix(allocator: std.mem.Allocator, mention_prefix: []const u8) !?[]u8 {
+    const slash = std.mem.lastIndexOfScalar(u8, mention_prefix, '/');
+    const dir_path = if (slash) |idx| if (idx == 0) "/" else mention_prefix[0..idx] else ".";
+    const needle = if (slash) |idx| mention_prefix[idx + 1 ..] else mention_prefix;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var it = dir.iterate();
+    var common: ?[]u8 = null;
+    errdefer if (common) |v| allocator.free(v);
+
+    while (try it.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, needle)) continue;
+
+        const rest = entry.name[needle.len..];
+        const candidate = if (entry.kind == .directory)
+            try std.fmt.allocPrint(allocator, "{s}/", .{rest})
+        else
+            try allocator.dupe(u8, rest);
+
+        if (common) |existing| {
+            const keep = sharedPrefixLen(existing, candidate);
+            const next = try allocator.dupe(u8, existing[0..keep]);
+            allocator.free(existing);
+            allocator.free(candidate);
+            common = next;
+        } else {
+            common = candidate;
+        }
+    }
+
+    if (common) |value| {
+        if (value.len == 0) {
+            allocator.free(value);
+            return null;
+        }
+        return value;
+    }
+    return null;
+}
+
+fn autocompleteMentionAtCursor(
+    allocator: std.mem.Allocator,
+    current: []const u8,
+    cursor_pos: usize,
+) !?LineEditResult {
+    const pos = @min(cursor_pos, current.len);
+
+    var start = pos;
+    while (start > 0 and !isWhitespace(current[start - 1])) : (start -= 1) {}
+
+    var end = pos;
+    while (end < current.len and !isWhitespace(current[end])) : (end += 1) {}
+
+    if (start >= current.len or current[start] != '@') return null;
+    if (pos != end) return null;
+    if (start + 1 > pos) return null;
+
+    const mention_prefix = current[start + 1 .. pos];
+    for (mention_prefix) |ch| {
+        if (!isMentionPathChar(ch)) return null;
+    }
+
+    const suffix = (try mentionCompletionSuffix(allocator, mention_prefix)) orelse return null;
+    defer allocator.free(suffix);
+
+    const out = try allocator.alloc(u8, current.len + suffix.len);
+    @memcpy(out[0..pos], current[0..pos]);
+    @memcpy(out[pos .. pos + suffix.len], suffix);
+    @memcpy(out[pos + suffix.len ..], current[pos..]);
+    return .{ .text = out, .cursor_pos = pos + suffix.len };
 }
 
 const EditKey = enum {
@@ -548,6 +661,109 @@ fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWindow
     return out.toOwnedSlice(allocator);
 }
 
+fn pathWithinBase(base: []const u8, candidate: []const u8) bool {
+    if (!std.mem.startsWith(u8, candidate, base)) return false;
+    if (candidate.len == base.len) return true;
+    return candidate[base.len] == '/';
+}
+
+fn resolveMentionPath(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+
+    const abs = if (std.fs.path.isAbsolute(raw_path))
+        try allocator.dupe(u8, raw_path)
+    else
+        try std.fs.path.resolve(allocator, &.{ cwd, raw_path });
+
+    if (!pathWithinBase(cwd, abs)) {
+        allocator.free(abs);
+        return error.InvalidPath;
+    }
+    return abs;
+}
+
+fn collectMentionPaths(allocator: std.mem.Allocator, input: []const u8, max_files: usize) !std.ArrayList([]u8) {
+    var out = std.ArrayList([]u8).empty;
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < input.len and out.items.len < max_files) : (i += 1) {
+        if (input[i] != '@') continue;
+        if (i > 0 and !isWhitespace(input[i - 1])) continue;
+
+        var j = i + 1;
+        while (j < input.len and isMentionPathChar(input[j])) : (j += 1) {}
+        if (j == i + 1) continue;
+
+        const path = input[i + 1 .. j];
+        var exists = false;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) try out.append(allocator, try allocator.dupe(u8, path));
+        i = j - 1;
+    }
+
+    return out;
+}
+
+fn readMentionedFileSnippet(allocator: std.mem.Allocator, raw_path: []const u8, max_bytes: usize) !?[]u8 {
+    const resolved = resolveMentionPath(allocator, raw_path) catch return null;
+    defer allocator.free(resolved);
+
+    var file = std.fs.openFileAbsolute(resolved, .{}) catch return null;
+    defer file.close();
+
+    const stat = file.stat() catch return null;
+    if (stat.kind != .file) return null;
+
+    const content = file.readToEndAlloc(allocator, max_bytes) catch return null;
+    errdefer allocator.free(content);
+
+    if (stat.size > content.len) {
+        const with_note = try std.fmt.allocPrint(allocator, "{s}\n\n[...truncated at {d} bytes]", .{ content, max_bytes });
+        allocator.free(content);
+        return with_note;
+    }
+    return content;
+}
+
+fn buildPromptWithMentions(allocator: std.mem.Allocator, base_prompt: []const u8, user_input: []const u8) ![]u8 {
+    var mentions = try collectMentionPaths(allocator, user_input, MentionMaxFiles);
+    defer {
+        for (mentions.items) |m| allocator.free(m);
+        mentions.deinit(allocator);
+    }
+
+    if (mentions.items.len == 0) return allocator.dupe(u8, base_prompt);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+    try w.print("{s}", .{base_prompt});
+
+    var added: usize = 0;
+    for (mentions.items) |raw_path| {
+        const snippet = try readMentionedFileSnippet(allocator, raw_path, MentionReadLimit) orelse continue;
+        defer allocator.free(snippet);
+
+        if (added == 0) {
+            try w.print("\n\nMentioned file context (from @path in current request):\n", .{});
+        }
+        try w.print("\n@{s}\n{s}\n", .{ raw_path, snippet });
+        added += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
     if (entries.len == 0) return null;
     return switch (nav) {
@@ -608,26 +824,24 @@ fn parseModelSelection(input: []const u8) ?ModelSelection {
 fn buildPrompt(
     allocator: std.mem.Allocator,
     cwd: []const u8,
-    selected_model: ?OwnedModelSelection,
+    active: ?ActiveModel,
     current_effort: ?[]const u8,
 ) ![]u8 {
-    if (selected_model) |model| {
-        // Shorten model name if it's long
-        const max_model_len = 20;
-        const display_model = if (model.model_id.len > max_model_len)
-            model.model_id[0..max_model_len]
-        else
-            model.model_id;
+    const max_cwd_len: usize = 36;
+    const display_cwd = if (cwd.len > max_cwd_len) blk: {
+        const tail = cwd[cwd.len - (max_cwd_len - 1) ..];
+        break :blk try std.fmt.allocPrint(allocator, "…{s}", .{tail});
+    } else try allocator.dupe(u8, cwd);
+    defer allocator.free(display_cwd);
 
-        const effort_suffix = if (current_effort) |e|
-            try std.fmt.allocPrint(allocator, ":{s}", .{e})
-        else
-            try allocator.dupe(u8, "");
-        defer allocator.free(effort_suffix);
-
-        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s}/{s}{s}]{s}> ", .{ C_BOLD, cwd, C_RESET, C_CYAN, model.provider_id, display_model, effort_suffix, C_RESET });
+    if (active) |model| {
+        const model_display = model.model_id;
+        if (current_effort) |effort| {
+            return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s} {s} {s}]{s}> ", .{ C_BOLD, display_cwd, C_RESET, C_CYAN, model.provider_id, model_display, effort, C_RESET });
+        }
+        return std.fmt.allocPrint(allocator, "{s}{s}{s} {s}[{s} {s}]{s}> ", .{ C_BOLD, display_cwd, C_RESET, C_CYAN, model.provider_id, model_display, C_RESET });
     } else {
-        return std.fmt.allocPrint(allocator, "{s}{s}{s}> ", .{ C_BOLD, cwd, C_RESET });
+        return std.fmt.allocPrint(allocator, "{s}{s}{s}> ", .{ C_BOLD, display_cwd, C_RESET });
     }
 }
 
@@ -681,6 +895,9 @@ fn applyEditKeyAtCursor(
 
     return switch (key) {
         .tab => {
+            if (try autocompleteMentionAtCursor(allocator, current, pos)) |completed| {
+                return completed;
+            }
             const text = try allocator.dupe(u8, autocompleteCommand(current));
             return .{ .text = text, .cursor_pos = text.len };
         },
@@ -740,18 +957,85 @@ fn applyEditKeyAtCursor(
     };
 }
 
-fn renderLine(stdout: anytype, prompt: []const u8, line: []const u8, cursor_pos: usize) !void {
-    // Clear current line and all lines below (handles wrapping)
-    try stdout.print("\r\x1b[2K\x1b[J", .{});
-
-    // Redraw prompt and line
-    try stdout.print("{s}{s}", .{ prompt, line });
-
-    // Move cursor to correct position
-    if (cursor_pos < line.len) {
-        const move_back = line.len - cursor_pos;
-        try stdout.print("\x1b[{d}D", .{move_back});
+fn terminalColumns() usize {
+    if (builtin.os.tag != .windows) {
+        var ws: std.posix.winsize = .{
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (std.posix.errno(rc) == .SUCCESS and ws.col > 0) {
+            return @as(usize, @intCast(ws.col));
+        }
     }
+    const cols_env = std.posix.getenv("COLUMNS") orelse return 80;
+    return std.fmt.parseInt(usize, cols_env, 10) catch 80;
+}
+
+fn visibleLenAnsi(text: []const u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            i += 2;
+            while (i < text.len and ((text[i] >= '0' and text[i] <= '9') or text[i] == ';')) : (i += 1) {}
+            continue;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+fn renderedRows(prompt: []const u8, line: []const u8, cols: usize) usize {
+    const width = if (cols == 0) 80 else cols;
+    const total = visibleLenAnsi(prompt) + line.len;
+    if (total == 0) return 1;
+    return 1 + (total - 1) / width;
+}
+
+fn cursorRowsAfterPrint(prompt: []const u8, line: []const u8, cols: usize) usize {
+    const width = if (cols == 0) 80 else cols;
+    const total = visibleLenAnsi(prompt) + line.len;
+    return 1 + (total / width);
+}
+
+fn cursorRowsAtPosition(prompt: []const u8, cursor_pos: usize, cols: usize) usize {
+    const width = if (cols == 0) 80 else cols;
+    const total = visibleLenAnsi(prompt) + cursor_pos;
+    return 1 + (total / width);
+}
+
+fn renderLine(
+    stdout: anytype,
+    prompt: []const u8,
+    line: []const u8,
+    cursor_pos: usize,
+    prev_rows: *usize,
+    prev_cursor_rows: *usize,
+) !void {
+    // Single-row rendering with horizontal scrolling avoids multi-line wrap bugs.
+    const cols = terminalColumns();
+    const prompt_width = visibleLenAnsi(prompt);
+    const available = if (cols > prompt_width + 1) cols - prompt_width else 1;
+    const safe_pos = @min(cursor_pos, line.len);
+    var start: usize = 0;
+    if (safe_pos >= available) start = safe_pos - available + 1;
+    const end = @min(start + available, line.len);
+    if (end - start < available and start > 0) {
+        start = end - @min(available, end);
+    }
+    const window = line[start..end];
+    const cursor_in_window = safe_pos - start;
+
+    try stdout.print("\r\x1b[2K{s}{s}", .{ prompt, window });
+    if (cursor_in_window < window.len) {
+        try stdout.print("\x1b[{d}D", .{window.len - cursor_in_window});
+    }
+
+    prev_rows.* = 1;
+    prev_cursor_rows.* = 1;
 }
 
 pub fn run(allocator: std.mem.Allocator) !void {
@@ -768,9 +1052,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
     const render_markdown = stdout_file.isTty();
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-
-    // Compute project hash for project-aware storage
-    const project_hash = hashProjectPath(cwd);
 
     const home = std.posix.getenv("HOME") orelse "";
     const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
@@ -795,28 +1076,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     var context_window = ContextWindow.init(24 * 1024, 8);
     defer context_window.deinit(allocator);
-    try loadContextWindow(allocator, config_dir, &context_window, project_hash);
-    try compactContextWindow(allocator, &context_window, null);
+    // Session-scoped context: start fresh each process run.
 
     // Initialize todo list for tracking progress
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
-
-    // Load persisted todos (project-aware)
-    const todos_filename = try std.fmt.allocPrint(allocator, "todos-{x}.json", .{project_hash});
-    defer allocator.free(todos_filename);
-    const todos_file = try std.fs.path.join(allocator, &.{ config_dir, todos_filename });
-    defer allocator.free(todos_file);
-    try todo_list.loadFromFile(allocator, todos_file);
-
-    // Helper to save todos (called after modifications)
-    const saveTodos = struct {
-        fn call(tl: *todo.TodoList, alloc: std.mem.Allocator, path: []const u8) void {
-            tl.saveToFile(alloc, path) catch |e| {
-                logger.info("Failed to save todos: {s}\n", .{@errorName(e)});
-            };
-        }
-    }.call;
+    // Session-scoped todos: do not load/save across runs.
 
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
@@ -838,7 +1103,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 
     try stdout.print(
-        "{s}══ zagent ══{s}\n{s}Commands:{s} /skills, /tools, /providers, /model <provider/model>, /stats, /quit\n\n",
+        "{s}══ zagent ══{s}\n{s}Commands:{s} /skills, /tools, /providers, /model <provider/model>, /models [provider] [filter], /todo, /stats, /quit\n\n",
         .{ C_BOLD, C_RESET, C_CYAN, C_RESET },
     );
     while (true) {
@@ -846,12 +1111,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
         resetCancelled();
 
         // Build prompt dynamically with current model info
-        const prompt_text = try buildPrompt(allocator, cwd, selected_model, current_effort);
+        const active_now = chooseActiveModel(providers, provider_states, selected_model, current_effort);
+        const prompt_text = try buildPrompt(allocator, cwd, active_now, current_effort);
         defer allocator.free(prompt_text);
 
         const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
         if (line_opt == null) {
-            try stdout.print("\n", .{});
+            try stdout.print("\nExiting: input stream ended (EOF).\n", .{});
             break;
         }
 
@@ -876,7 +1142,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         const command = parseCommand(normalized);
         switch (command.tag) {
-            .quit => break,
+            .quit => {
+                try stdout.print("Exiting: received /quit command.\n", .{});
+                break;
+            },
             .list_skills => {
                 if (skill_list.len == 0) {
                     try stdout.print("No skills found.\n", .{});
@@ -1003,6 +1272,70 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 pm.ProviderManager.freeResolved(allocator, provider_states);
                 provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
             },
+            .list_models => {
+                const active_cmd = chooseActiveModel(providers, provider_states, selected_model, current_effort);
+
+                var provider_id: []const u8 = "";
+                var filter: []const u8 = "";
+
+                const raw = std.mem.trim(u8, command.arg, " \t\r\n");
+                if (raw.len == 0) {
+                    if (active_cmd) |a| {
+                        provider_id = a.provider_id;
+                    } else {
+                        try stdout.print("No active provider. Use /model <provider/model> or /connect then /model.\n", .{});
+                        continue;
+                    }
+                } else {
+                    // Syntax:
+                    // - /models <filter>
+                    // - /models <provider>
+                    // - /models <provider> <filter>
+                    var it = std.mem.tokenizeAny(u8, raw, " \t\r\n");
+                    const first = it.next().?;
+                    const rest = raw[first.len..];
+                    const rest_trimmed = std.mem.trim(u8, rest, " \t\r\n");
+
+                    if (findProviderSpecByID(providers, first) != null) {
+                        provider_id = first;
+                        filter = rest_trimmed;
+                    } else {
+                        if (active_cmd) |a| {
+                            provider_id = a.provider_id;
+                            filter = raw;
+                        } else {
+                            try stdout.print("Unknown provider: {s}\n", .{first});
+                            continue;
+                        }
+                    }
+                }
+
+                const connected = findConnectedProvider(provider_states, provider_id) orelse {
+                    try stdout.print("Provider not connected: {s}\n", .{provider_id});
+                    continue;
+                };
+
+                const key = if (connected.key) |k|
+                    k
+                else if (std.mem.eql(u8, provider_id, "opencode"))
+                    "public"
+                else {
+                    try stdout.print("No API key is configured for provider {s}. Run /connect {s}.\n", .{ provider_id, provider_id });
+                    continue;
+                };
+
+                const out = ai_bridge.listModelsDirect(allocator, key, provider_id, filter) catch |err| {
+                    const last = ai_bridge.getLastProviderError();
+                    if (last) |msg| {
+                        try stdout.print("Models query failed: {s} ({s})\n", .{ @errorName(err), msg });
+                    } else {
+                        try stdout.print("Models query failed: {s}\n", .{@errorName(err)});
+                    }
+                    continue;
+                };
+                defer allocator.free(out);
+                try stdout.print("{s}\n", .{out});
+            },
             .set_model => {
                 if (command.arg.len == 0) {
                     if (selected_model) |sel| {
@@ -1011,7 +1344,18 @@ pub fn run(allocator: std.mem.Allocator) !void {
                         try stdout.print("No model currently set.\n", .{});
                     }
 
-                    const picked = try interactiveModelSelect(allocator, stdin, stdout, stdin_file, providers, provider_states);
+                    const active_cmd = chooseActiveModel(providers, provider_states, selected_model, current_effort);
+                    const current_provider_id = if (active_cmd) |a| a.provider_id else null;
+
+                    const picked = try interactiveModelSelect(
+                        allocator,
+                        stdin,
+                        stdout,
+                        stdin_file,
+                        providers,
+                        provider_states,
+                        current_provider_id,
+                    );
                     if (picked == null) {
                         try stdout.print("No explicit model set. Using default connected provider model.\n", .{});
                         continue;
@@ -1038,6 +1382,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 if (!providerHasModel(providers, p.provider_id, p.model_id)) {
                     try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
                     continue;
+                }
+                if (std.mem.eql(u8, p.provider_id, "openai")) {
+                    const st = findConnectedProvider(provider_states, "openai");
+                    if (st != null and st.?.key != null and isLikelyOAuthToken(st.?.key.?)) {
+                        if (!isCodexModelId(p.model_id)) {
+                            try stdout.print("Model {s}/{s} is not supported with OpenAI subscription auth; pick a Codex model (try: /models openai codex).\n", .{ p.provider_id, p.model_id });
+                            continue;
+                        }
+                    }
                 }
 
                 if (selected_model) |*old| old.deinit(allocator);
@@ -1090,6 +1443,79 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 try stdout.print("{s}Character Count:{s} {d}\n", .{ C_CYAN, C_RESET, total_chars });
                 try stdout.print("{s}Tool Executions:{s} {d}\n\n", .{ C_CYAN, C_RESET, total_tools });
             },
+            .ping => {
+                if (command.arg.len > 0) {
+                    try stdout.print("{s}PONG {s}{s}\n", .{C_PURPLE, command.arg, C_RESET});
+                } else {
+                    try stdout.print("{s}PONG{s}\n", .{C_PURPLE, C_RESET});
+                }
+            },
+            .todo => {
+                const arg = std.mem.trim(u8, command.arg, " \t\r\n");
+                if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "list")) {
+                    const out = try todo_list.list(allocator);
+                    defer allocator.free(out);
+                    try stdout.print("{s}", .{out});
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(arg, "clear")) {
+                    todo_list.clearAll();
+                    try stdout.print("All todos have been cleared.\n", .{});
+                    continue;
+                }
+                if (std.mem.startsWith(u8, arg, "add ")) {
+                    const desc = std.mem.trim(u8, arg[4..], " \t\r\n");
+                    if (desc.len == 0) {
+                        try stdout.print("Usage: /todo add <description>\n", .{});
+                        continue;
+                    }
+                    const id = try todo_list.add(desc);
+                    try stdout.print("Added todo {s}: {s}\n", .{ id, desc });
+                    continue;
+                }
+                if (std.mem.startsWith(u8, arg, "done ")) {
+                    const id = std.mem.trim(u8, arg[5..], " \t\r\n");
+                    if (id.len == 0) {
+                        try stdout.print("Usage: /todo done <id>\n", .{});
+                        continue;
+                    }
+                    const ok = try todo_list.update(id, .done);
+                    if (ok) try stdout.print("Marked todo {s} done.\n", .{id}) else try stdout.print("Todo {s} not found.\n", .{id});
+                    continue;
+                }
+                if (std.mem.startsWith(u8, arg, "progress ")) {
+                    const id = std.mem.trim(u8, arg[9..], " \t\r\n");
+                    if (id.len == 0) {
+                        try stdout.print("Usage: /todo progress <id>\n", .{});
+                        continue;
+                    }
+                    const ok = try todo_list.update(id, .in_progress);
+                    if (ok) try stdout.print("Marked todo {s} in_progress.\n", .{id}) else try stdout.print("Todo {s} not found.\n", .{id});
+                    continue;
+                }
+                if (std.mem.startsWith(u8, arg, "pending ")) {
+                    const id = std.mem.trim(u8, arg[8..], " \t\r\n");
+                    if (id.len == 0) {
+                        try stdout.print("Usage: /todo pending <id>\n", .{});
+                        continue;
+                    }
+                    const ok = try todo_list.update(id, .pending);
+                    if (ok) try stdout.print("Marked todo {s} pending.\n", .{id}) else try stdout.print("Todo {s} not found.\n", .{id});
+                    continue;
+                }
+                if (std.mem.startsWith(u8, arg, "remove ")) {
+                    const id = std.mem.trim(u8, arg[7..], " \t\r\n");
+                    if (id.len == 0) {
+                        try stdout.print("Usage: /todo remove <id>\n", .{});
+                        continue;
+                    }
+                    const ok = try todo_list.remove(id);
+                    if (ok) try stdout.print("Removed todo {s}.\n", .{id}) else try stdout.print("Todo {s} not found.\n", .{id});
+                    continue;
+                }
+                try stdout.print("Usage: /todo [list|clear|add <text>|done <id>|progress <id>|pending <id>|remove <id>]\n", .{});
+                continue;
+            },
             .none => {
                 const trimmed = std.mem.trim(u8, normalized, " \t\r\n");
                 if (trimmed.len == 0) continue;
@@ -1098,6 +1524,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
 
+                var prompt_todo_id: ?[]u8 = null;
+                defer if (prompt_todo_id) |id| allocator.free(id);
+                if (todo_list.add(trimmed)) |new_id| {
+                    prompt_todo_id = try allocator.dupe(u8, new_id);
+                    _ = try todo_list.update(new_id, .in_progress);
+                } else |_| {}
+
                 const active = chooseActiveModel(providers, provider_states, selected_model, current_effort);
 
                 if (active == null) {
@@ -1105,17 +1538,33 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     continue;
                 }
 
-                const model_input = try buildContextPrompt(allocator, &context_window, trimmed);
+                const base_model_input = try buildContextPrompt(allocator, &context_window, trimmed);
+                defer allocator.free(base_model_input);
+                const model_input = try buildPromptWithMentions(allocator, base_model_input, trimmed);
                 defer allocator.free(model_input);
 
                 var turn = runModel(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
-                    try stdout.print("Model query failed: {s}\n", .{@errorName(err)});
+                    if (prompt_todo_id) |id| {
+                        _ = todo_list.update(id, .pending) catch false;
+                    }
+                    if (err == error.ModelProviderError or err == error.ModelResponseMissingChoices) {
+                        if (ai_bridge.getLastProviderError()) |detail| {
+                            try stdout.print("Model query failed: {s} ({s})\n", .{ describeModelQueryError(err), detail });
+                            continue;
+                        }
+                    }
+                    try stdout.print("Model query failed: {s}\n", .{describeModelQueryError(err)});
                     continue;
                 };
                 defer turn.deinit(allocator);
 
-                // Save todos after model turn completes
-                saveTodos(&todo_list, allocator, todos_file);
+                if (prompt_todo_id) |id| {
+                    if (turn.error_count == 0) {
+                        _ = todo_list.update(id, .done) catch false;
+                    } else {
+                        _ = todo_list.update(id, .pending) catch false;
+                    }
+                }
 
                 try context_window.append(allocator, .user, trimmed, .{});
                 try context_window.append(allocator, .assistant, turn.response, .{
@@ -1124,7 +1573,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     .files_touched = turn.files_touched,
                 });
                 try compactContextWindow(allocator, &context_window, active.?);
-                try saveContextWindow(allocator, config_dir, &context_window, project_hash);
 
                 // Only print response if it's not a tool call instruction
                 if (!std.mem.startsWith(u8, turn.response, "TOOL_CALL ")) {
@@ -1174,6 +1622,9 @@ fn readPromptLineFallback(
     var line = try allocator.alloc(u8, 0);
     defer allocator.free(line);
     var cursor_pos: usize = 0;
+    const cols = terminalColumns();
+    var rendered_rows: usize = renderedRows(prompt, line, cols);
+    var rendered_cursor_rows: usize = cursorRowsAtPosition(prompt, cursor_pos, cols);
     var history_index: ?usize = null;
 
     try stdout.print("{s}", .{prompt});
@@ -1211,7 +1662,7 @@ fn readPromptLineFallback(
                         allocator.free(line);
                         line = try allocator.dupe(u8, entry);
                         cursor_pos = line.len;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     'B' => { // Down arrow - history
@@ -1221,7 +1672,7 @@ fn readPromptLineFallback(
                         allocator.free(line);
                         line = try allocator.dupe(u8, entry);
                         cursor_pos = line.len;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     'C' => { // Right arrow
@@ -1230,7 +1681,7 @@ fn readPromptLineFallback(
                         defer allocator.free(next.text);
                         line = try allocator.dupe(u8, next.text);
                         cursor_pos = next.cursor_pos;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     'D' => { // Left arrow
@@ -1239,7 +1690,7 @@ fn readPromptLineFallback(
                         defer allocator.free(next.text);
                         line = try allocator.dupe(u8, next.text);
                         cursor_pos = next.cursor_pos;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     'H' => { // Home
@@ -1248,7 +1699,7 @@ fn readPromptLineFallback(
                         defer allocator.free(next.text);
                         line = try allocator.dupe(u8, next.text);
                         cursor_pos = next.cursor_pos;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     'F' => { // End
@@ -1257,7 +1708,7 @@ fn readPromptLineFallback(
                         defer allocator.free(next.text);
                         line = try allocator.dupe(u8, next.text);
                         cursor_pos = next.cursor_pos;
-                        try renderLine(stdout, prompt, line, cursor_pos);
+                        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         continue;
                     },
                     '3' => { // Delete key (ESC[3~)
@@ -1268,7 +1719,7 @@ fn readPromptLineFallback(
                             defer allocator.free(next.text);
                             line = try allocator.dupe(u8, next.text);
                             cursor_pos = next.cursor_pos;
-                            try renderLine(stdout, prompt, line, cursor_pos);
+                            try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
                         }
                         continue;
                     },
@@ -1280,6 +1731,10 @@ fn readPromptLineFallback(
 
         // Enter key
         if (ch == '\n' or ch == '\r') {
+            // Keep submitted prompt/input visible on screen.
+            if (cursor_pos != line.len) {
+                try renderLine(stdout, prompt, line, line.len, &rendered_rows, &rendered_cursor_rows);
+            }
             try stdout.print("\n", .{});
             return try allocator.dupe(u8, line);
         }
@@ -1302,7 +1757,7 @@ fn readPromptLineFallback(
         defer allocator.free(next.text);
         line = try allocator.dupe(u8, next.text);
         cursor_pos = next.cursor_pos;
-        try renderLine(stdout, prompt, line, cursor_pos);
+        try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
     }
 }
 
@@ -1362,6 +1817,26 @@ test "autocomplete keeps ambiguous and exact commands" {
     try std.testing.expectEqualStrings("/skills", autocompleteCommand("/skills"));
 }
 
+test "collect mention paths extracts unique @paths" {
+    const allocator = std.testing.allocator;
+    var mentions = try collectMentionPaths(allocator, "check @src/repl.zig and @src/repl.zig then @build.zig", 8);
+    defer {
+        for (mentions.items) |m| allocator.free(m);
+        mentions.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), mentions.items.len);
+    try std.testing.expectEqualStrings("src/repl.zig", mentions.items[0]);
+    try std.testing.expectEqualStrings("build.zig", mentions.items[1]);
+}
+
+test "build prompt with mentions keeps base prompt when none provided" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildPromptWithMentions(allocator, "base prompt", "hello world");
+    defer allocator.free(prompt);
+    try std.testing.expectEqualStrings("base prompt", prompt);
+}
+
 test "apply edit key tab completes command" {
     const allocator = std.testing.allocator;
     const next = try applyEditKey(allocator, "/pro", .tab, 0);
@@ -1413,7 +1888,7 @@ test "default model prefers non-nano for openai oauth tokens" {
         .models = providers[1].models,
     }};
 
-    const active = chooseActiveModel(providers, &connected, null);
+    const active = chooseActiveModel(providers, &connected, null, null);
     try std.testing.expect(active != null);
     try std.testing.expectEqualStrings("gpt-5", active.?.model_id);
 }
@@ -1659,6 +2134,12 @@ test "fallback tool call parser returns null for plain text" {
     try std.testing.expect(parsed == null);
 }
 
+test "fallback tool call parser returns null for Tool style pseudo call" {
+    const allocator = std.testing.allocator;
+    const parsed = try parseFallbackToolCallFromText(allocator, "Tool: bash {\"command\":\"sed -n '1,200p' src/repl.zig\"}");
+    try std.testing.expect(parsed == null);
+}
+
 test "tool call id is stable per step" {
     const allocator = std.testing.allocator;
     const id = try buildToolCallId(allocator, 3);
@@ -1760,8 +2241,11 @@ fn commandNames() []const []const u8 {
         "/default-model",
         "/connect",
         "/model",
+        "/models",
         "/effort",
         "/stats",
+        "/ping",
+        "/todo",
     };
 }
 
@@ -1980,6 +2464,9 @@ fn chooseActiveModel(
     if (selected) |sel| {
         const provider = findConnectedProvider(connected, sel.provider_id);
         if (!providerHasModel(providers, sel.provider_id, sel.model_id)) return null;
+        if (std.mem.eql(u8, sel.provider_id, "openai") and provider != null and provider.?.key != null and isLikelyOAuthToken(provider.?.key.?)) {
+            if (!isCodexModelId(sel.model_id)) return null;
+        }
         return .{
             .provider_id = sel.provider_id,
             .model_id = sel.model_id,
@@ -2001,11 +2488,14 @@ fn chooseActiveModel(
 
 fn chooseDefaultModelForConnected(provider: pm.ProviderState) ?[]const u8 {
     if (std.mem.eql(u8, provider.id, "openai") and provider.key != null and isLikelyOAuthToken(provider.key.?)) {
+        // Subscription/OAuth token uses the Codex backend: default to a Codex model.
+        var best: ?[]const u8 = null;
         for (provider.models) |m| {
-            if (std.mem.indexOf(u8, m.id, "nano") == null and std.mem.indexOf(u8, m.id, "mini") == null) {
-                return m.id;
-            }
+            if (!isCodexModelId(m.id)) continue;
+            // Prefer newer/larger by simple lexical bias, falling back to first match.
+            if (best == null) best = m.id else if (std.mem.lessThan(u8, best.?, m.id)) best = m.id;
         }
+        if (best) |b| return b;
     }
     return pm.ProviderManager.defaultModelIDForProvider(provider.id, provider.models);
 }
@@ -2022,8 +2512,9 @@ fn interactiveModelSelect(
     stdin_file: std.fs.File,
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
+    only_provider_id: ?[]const u8,
 ) !?ModelSelection {
-    const options = try collectModelOptions(allocator, providers, connected);
+    const options = try collectModelOptions(allocator, providers, connected, only_provider_id);
     defer allocator.free(options);
 
     const query_opt = if (stdin_file.isTty())
@@ -2080,12 +2571,63 @@ fn collectModelOptions(
     allocator: std.mem.Allocator,
     providers: []const pm.ProviderSpec,
     connected: []const pm.ProviderState,
+    only_provider_id: ?[]const u8,
 ) ![]ModelOption {
-    _ = connected;
     var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
     for (providers) |spec| {
+        if (only_provider_id) |pid| {
+            if (!std.mem.eql(u8, spec.id, pid)) continue;
+        }
+        // Only offer models for providers that are currently connected.
+        if (!isConnected(spec.id, connected)) continue;
+
+        // Special case: OpenAI "subscription" auth (OAuth/JWT-ish token) uses the Codex backend, which
+        // only supports Codex models. Filter out non-codex models so /model can't select unsupported ids.
+        const state = findConnectedProvider(connected, spec.id);
+        const openai_oauth = std.mem.eql(u8, spec.id, "openai") and state != null and state.?.key != null and isLikelyOAuthToken(state.?.key.?);
+        if (openai_oauth) {
+            // Prefer live allowlist from the provider, but fall back to substring filter on failure.
+            var allowed_ids: ?[][]u8 = null;
+            if (state.?.key) |k| {
+                allowed_ids = ai_bridge.fetchModelIDsDirect(allocator, k, spec.id) catch null;
+            }
+            defer if (allowed_ids) |ids| ai_bridge.freeModelIDs(allocator, ids);
+
+            if (allowed_ids) |ids| {
+                var seen = std.StringHashMap(void).init(allocator);
+                defer seen.deinit();
+
+                for (ids) |id| {
+                    _ = try seen.put(id, {});
+                }
+
+                // Add catalog models that are allowed.
+                for (spec.models) |m| {
+                    if (seen.contains(m.id)) {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+                        _ = seen.remove(m.id);
+                    }
+                }
+
+                // Add any allowed models not present in our static catalog.
+                var it = seen.keyIterator();
+                while (it.next()) |key_ptr| {
+                    const id = key_ptr.*;
+                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = id, .display_name = id });
+                }
+                continue;
+            } else {
+                for (spec.models) |m| {
+                    if (isCodexModelId(m.id)) {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+                    }
+                }
+                continue;
+            }
+        }
+
         for (spec.models) |m| {
             try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
         }
@@ -2188,8 +2730,19 @@ fn buildFallbackToolInferencePrompt(allocator: std.mem.Allocator, user_text: []c
     );
 }
 
+fn hasPseudoToolCallText(text: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "Tool:") or std.mem.startsWith(u8, trimmed, "tool:")) return true;
+    }
+    return false;
+}
+
 fn parseFallbackToolCallFromText(allocator: std.mem.Allocator, text: []const u8) !?llm.ToolRouteCall {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "Tool:") or std.mem.startsWith(u8, trimmed, "tool:")) return null;
     if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) return null;
 
     const rest = std.mem.trim(u8, trimmed[10..], " \t");
@@ -2402,6 +2955,8 @@ const C_DIM = "\x1b[2m";
 const C_ITALIC = "\x1b[3m";
 const C_UNDERLINE = "\x1b[4m";
 const C_BLUE = "\x1b[34m"; // event type
+const C_ORANGE = "\x1b[38;5;208m"; // orange color
+const C_PURPLE = "\x1b[38;5;135m"; // purple color
 const C_YELLOW = "\x1b[33m"; // tool names
 const C_GREEN = "\x1b[32m"; // success status
 const C_RED = "\x1b[31m"; // error status
@@ -2513,6 +3068,9 @@ fn executeInlineToolCalls(
             null;
 
         // Execute tool
+        const why = try buildModelWhyLine(allocator, "", response, tool_name, args);
+        defer allocator.free(why);
+        try stdout.print("  {s}Why:{s} {s}\n", .{ C_DIM, C_RESET, why });
         try printColoredToolEvent(stdout, "tool-inline", null, null, tool_name);
         if (file_path) |fp| {
             try stdout.print(" {s}file={s}{s}", .{ C_CYAN, fp, C_RESET });
@@ -2637,6 +3195,83 @@ fn buildToolWhyLine(allocator: std.mem.Allocator, tool_name: []const u8, argumen
     return std.fmt.allocPrint(allocator, "executing tool {s} to progress the task", .{tool_name});
 }
 
+fn firstModelWhyLineFromText(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
+        if (std.mem.eql(u8, trimmed, "DONE")) continue;
+        return trimmed;
+    }
+    return null;
+}
+
+fn extractModelWhyLine(model_reasoning: []const u8, model_text: []const u8) ?[]const u8 {
+    const reasoning = std.mem.trim(u8, model_reasoning, " \t\r\n");
+    if (reasoning.len > 0) return reasoning;
+    return firstModelWhyLineFromText(model_text);
+}
+
+fn buildModelWhyLine(
+    allocator: std.mem.Allocator,
+    model_reasoning: []const u8,
+    model_text: []const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+) ![]u8 {
+    if (extractModelWhyLine(model_reasoning, model_text)) |line| {
+        return allocator.dupe(u8, line);
+    }
+
+    return buildToolWhyLine(allocator, tool_name, arguments_json);
+}
+
+fn isMarkdownTableSeparatorRow(line: []const u8) bool {
+    var text = std.mem.trim(u8, line, " \t");
+    if (text.len == 0) return false;
+    if (text[0] == '|') text = text[1..];
+    if (text.len > 0 and text[text.len - 1] == '|') text = text[0 .. text.len - 1];
+    if (text.len == 0) return false;
+
+    var seen_dash = false;
+    for (text) |ch| {
+        switch (ch) {
+            '-', ':' => seen_dash = true,
+            '|', ' ', '\t' => {},
+            else => return false,
+        }
+    }
+    return seen_dash;
+}
+
+fn renderMarkdownTableRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8, use_color: bool) !bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len < 3) return false;
+    if (trimmed[0] != '|' and std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
+    if (isMarkdownTableSeparatorRow(trimmed)) return true;
+
+    var row = trimmed;
+    if (row.len > 0 and row[0] == '|') row = row[1..];
+    if (row.len > 0 and row[row.len - 1] == '|') row = row[0 .. row.len - 1];
+
+    var cells = std.mem.splitScalar(u8, row, '|');
+    var first = true;
+    while (cells.next()) |cell_raw| {
+        const cell = std.mem.trim(u8, cell_raw, " \t");
+        if (cell.len == 0) continue;
+        if (!first) try out.appendSlice(allocator, " | ");
+        first = false;
+        if (use_color) {
+            try out.writer(allocator).print("{s}{s}{s}", .{ C_CYAN, cell, C_RESET });
+        } else {
+            try out.appendSlice(allocator, cell);
+        }
+    }
+    try out.append(allocator, '\n');
+    return true;
+}
+
 fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, use_color: bool) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -2647,6 +3282,10 @@ fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, us
         const trimmed_left = std.mem.trimLeft(u8, line, " \t");
         if (std.mem.startsWith(u8, trimmed_left, "```")) {
             in_code_block = !in_code_block;
+            continue;
+        }
+
+        if (try renderMarkdownTableRow(allocator, &out, line, use_color)) {
             continue;
         }
 
@@ -2760,6 +3399,15 @@ fn containsPath(paths: []const []u8, candidate: []const u8) bool {
         if (std.mem.eql(u8, p, candidate)) return true;
     }
     return false;
+}
+
+fn describeModelQueryError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ModelProviderError => "upstream provider returned an error (see debug log for details)",
+        error.ModelResponseParseError => "upstream model response JSON parse failed",
+        error.ModelResponseMissingChoices => "upstream model response missing choices/content",
+        else => @errorName(err),
+    };
 }
 
 fn writeJsonString(w: anytype, s: []const u8) !void {
@@ -3130,10 +3778,11 @@ fn runModel(
     user_input: []const u8,
     todo_list: *todo.TodoList,
 ) !RunTurnResult {
-    _ = raw_user_request;
+    const mutation_request = isLikelyFileMutationRequest(raw_user_request);
 
     // Check API key
     if (active.api_key == null and !std.mem.eql(u8, active.provider_id, "opencode")) {
+        try stdout.print("{s}Stop:{s} no API key is configured for provider {s}.\n", .{ C_DIM, C_RESET, active.provider_id });
         return .{
             .response = try allocator.dupe(u8, "No API key configured for this provider. Run /connect to set it up."),
             .reasoning = try allocator.dupe(u8, ""),
@@ -3151,24 +3800,35 @@ fn runModel(
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent, an AI coding assistant. Use tools to help. Prefer bash with rg first to locate files/symbols. For read_file/read, always include explicit offset and limit; use bisection-style bounded chunks for large files instead of full-file reads. Say DONE when finished.");
+    try writeJsonString(w, "You are zagent, an AI coding assistant. Every response should include exactly one short rationale line prefixed with 'WHY:' and exactly one tool call. If no more external tools are needed, use the 'respond_text' tool call with your final answer text. Prefer bash with rg first to locate files/symbols. For read_file/read, always include explicit offset and limit; use bisection-style bounded chunks for large files instead of full-file reads. Avoid repeating the same tool call (especially identical bash commands); if the state has not changed, choose a different next step or finish with respond_text. Do not call todo_list; the current todo state is already provided to you every step.");
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");
 
     var tool_calls: usize = 0;
+    var mutating_tools_executed: usize = 0;
+    var no_tool_retries: usize = 0;
+    var last_tool_name: ?[]u8 = null;
+    defer if (last_tool_name) |v| allocator.free(v);
+    var last_tool_args: ?[]u8 = null;
+    defer if (last_tool_args) |v| allocator.free(v);
+    var repeated_tool_calls: usize = 0;
+    var consecutive_empty_rg: usize = 0;
+    var last_todo_guidance: ?[]u8 = null;
+    defer if (last_todo_guidance) |v| allocator.free(v);
     var paths = std.ArrayList([]u8).empty;
     defer {
         for (paths.items) |p| allocator.free(p);
         paths.deinit(allocator);
     }
 
-    const max_iterations: usize = 15;
+    const max_iterations: usize = 30;
     var iteration: usize = 0;
 
     while (iteration < max_iterations) : (iteration += 1) {
         // Check for cancellation
         if (isCancelled()) {
+            try stdout.print("{s}Stop:{s} cancelled by user interrupt.\n", .{ C_DIM, C_RESET });
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
                 .reasoning = try allocator.dupe(u8, ""),
@@ -3178,7 +3838,25 @@ fn runModel(
             };
         }
 
-        try stdout.print("{s}Step {d}:{s} ", .{ C_DIM, iteration + 1, C_RESET });
+        try stdout.print("{s}Step {d}:{s}\n", .{ C_DIM, iteration + 1, C_RESET });
+
+        // Keep the model grounded with live todo state, but avoid spamming the prompt when it hasn't changed.
+        const todo_snapshot = try todo_list.list(allocator);
+        defer allocator.free(todo_snapshot);
+        const todo_guidance = try std.fmt.allocPrint(
+            allocator,
+            "Todo status: {s}\nCurrent todos:\n{s}\nGuidance: choose the next action based on pending/in_progress todos; update todo status as you complete work.",
+            .{ todo_list.summary(), todo_snapshot },
+        );
+        defer allocator.free(todo_guidance);
+        const todo_changed = if (last_todo_guidance) |prev| !std.mem.eql(u8, prev, todo_guidance) else true;
+        if (todo_changed) {
+            if (last_todo_guidance) |prev| allocator.free(prev);
+            last_todo_guidance = try allocator.dupe(u8, todo_guidance);
+            try w.writeAll(",{\"role\":\"user\",\"content\":");
+            try w.print("{f}", .{std.json.fmt(todo_guidance, .{})});
+            try w.writeAll("}");
+        }
 
         // Send current messages (add closing bracket)
         const messages_json = try std.fmt.allocPrint(allocator, "{s}]", .{messages.items});
@@ -3231,19 +3909,116 @@ fn runModel(
 
         // Execute all tool calls
         if (response.tool_calls.len == 0) {
-            // No tools - we're done
+            const pseudo_tool = hasPseudoToolCallText(response.text);
+            if (no_tool_retries < 2) {
+                no_tool_retries += 1;
+                if (pseudo_tool) {
+                    try stdout.print("{s}Stop:{s} model returned pseudo tool text (Tool: ...); requesting strict tool-call format.\n", .{ C_DIM, C_RESET });
+                } else {
+                    try stdout.print("{s}Stop:{s} model returned no tool call; requesting required tool-call format.\n", .{ C_DIM, C_RESET });
+                }
+                try w.writeAll(",{\"role\":\"user\",\"content\":");
+                if (pseudo_tool) {
+                    try w.print(
+                        "{f}",
+                        .{std.json.fmt("Do not output pseudo calls like 'Tool: bash {...}'. Return an actual tool call only via the function-call interface, plus one WHY line. If done, call respond_text.", .{})},
+                    );
+                } else {
+                    try w.print(
+                        "{f}",
+                        .{std.json.fmt("Return exactly one rationale line starting with 'WHY:' and exactly one tool call. If you are ready to answer finally, call respond_text with {\"text\":\"...\"}. Do not reply with plain text outside tool calls.", .{})},
+                    );
+                }
+                try w.writeAll("}");
+                continue;
+            }
+            const finish_reason = if (response.finish_reason.len > 0) response.finish_reason else "none";
+            try stdout.print("{s}Stop:{s} model failed protocol: no tool call after retries (finish_reason={s}).\n", .{ C_DIM, C_RESET, finish_reason });
             return .{
-                .response = try allocator.dupe(u8, response.text),
+                .response = try allocator.dupe(u8, "Model did not return required tool-call format. Try again or switch model/provider."),
                 .reasoning = try allocator.dupe(u8, response.reasoning),
                 .tool_calls = tool_calls,
-                .error_count = 0,
+                .error_count = 1,
                 .files_touched = try joinPaths(allocator, paths.items),
             };
         }
+        no_tool_retries = 0;
+
+        if (extractModelWhyLine(response.reasoning, response.text) == null) {
+            try stdout.print("{s}Note:{s} model omitted WHY; using inferred rationale for this step.\n", .{ C_DIM, C_RESET });
+            try w.writeAll(",{\"role\":\"user\",\"content\":");
+            try w.print(
+                "{f}",
+                .{std.json.fmt("Reminder: include one short line starting with 'WHY:' before each tool call in subsequent responses.", .{})},
+            );
+            try w.writeAll("}");
+        }
 
         for (response.tool_calls) |tc| {
+            const is_same_as_prev = blk: {
+                if (last_tool_name == null or last_tool_args == null) break :blk false;
+                break :blk std.mem.eql(u8, last_tool_name.?, tc.tool) and std.mem.eql(u8, last_tool_args.?, tc.args);
+            };
+            if (is_same_as_prev) {
+                repeated_tool_calls += 1;
+            } else {
+                repeated_tool_calls = 0;
+                if (last_tool_name) |v| allocator.free(v);
+                if (last_tool_args) |v| allocator.free(v);
+                last_tool_name = try allocator.dupe(u8, tc.tool);
+                last_tool_args = try allocator.dupe(u8, tc.args);
+            }
+
+            const repeat_threshold: usize = if (std.mem.eql(u8, tc.tool, "bash")) 1 else 3;
+            if (repeated_tool_calls >= repeat_threshold) {
+                try stdout.print("{s}Note:{s} repeated identical tool call detected; requesting a different next action.\n", .{ C_DIM, C_RESET });
+                try w.writeAll(",{\"role\":\"user\",\"content\":");
+                try w.print(
+                    "{f}",
+                    .{std.json.fmt("You are repeating the exact same tool call. Do not repeat it again. Either choose a different tool/action based on previous results, or finish with respond_text.", .{})},
+                );
+                try w.writeAll("}");
+                continue;
+            }
+
             tool_calls += 1;
-            try stdout.print("{s}Tool: {s}{s} {s}{s}{s}\n", .{ C_YELLOW, tc.tool, C_RESET, C_DIM, tc.args, C_RESET });
+            const why = try buildModelWhyLine(allocator, response.reasoning, response.text, tc.tool, tc.args);
+            defer allocator.free(why);
+            try stdout.print("  {s}Why:{s} {s}\n", .{ C_DIM, C_RESET, why });
+            try stdout.print("{s}Tool:{s} {s}{s}\n", .{ C_YELLOW, C_RESET, C_YELLOW, tc.tool });
+            try stdout.print("  {s}Args:{s} {s}{s}{s}\n", .{ C_DIM, C_RESET, C_DIM, tc.args, C_RESET });
+
+            if (std.mem.eql(u8, tc.tool, "respond_text")) {
+                if (mutation_request and mutating_tools_executed == 0) {
+                    try stdout.print("{s}Stop:{s} respond_text rejected: edit request requires at least one mutating tool execution first.\n", .{ C_DIM, C_RESET });
+                    try w.writeAll(",{\"role\":\"user\",\"content\":");
+                    try w.print(
+                        "{f}",
+                        .{std.json.fmt("You must run at least one mutating tool (write_file/replace_in_file/edit/write/apply_patch) before respond_text for this request.", .{})},
+                    );
+                    try w.writeAll("}");
+                    continue;
+                }
+                const final_text = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
+                    try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
+                    return .{
+                        .response = try allocator.dupe(u8, "respond_text arguments were invalid."),
+                        .reasoning = try allocator.dupe(u8, response.reasoning),
+                        .tool_calls = tool_calls,
+                        .error_count = 1,
+                        .files_touched = try joinPaths(allocator, paths.items),
+                    };
+                };
+                try stdout.print("{s}Stop:{s} model finalized with respond_text tool.\n", .{ C_DIM, C_RESET });
+                return .{
+                    .response = final_text,
+                    .reasoning = try allocator.dupe(u8, response.reasoning),
+                    .tool_calls = tool_calls,
+                    .error_count = 0,
+                    .files_touched = try joinPaths(allocator, paths.items),
+                };
+            }
+            if (isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
 
             const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
                 try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
@@ -3277,6 +4052,38 @@ fn runModel(
             try w.print("{f}", .{std.json.fmt(result, .{})});
             try w.writeAll("}");
 
+            // Optimization: if the model keeps running rg with no matches, nudge it to stop burning steps.
+            if (std.mem.eql(u8, tc.tool, "bash")) {
+                const A = struct { command: ?[]const u8 = null };
+                if (std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true })) |p| {
+                    defer p.deinit();
+                    if (p.value.command) |cmd_raw| {
+                        const cmd = std.mem.trim(u8, cmd_raw, " \t\r\n");
+                        const is_rg = std.mem.eql(u8, cmd, "rg") or std.mem.startsWith(u8, cmd, "rg ");
+                        if (is_rg) {
+                            const out_trimmed = std.mem.trim(u8, result, " \t\r\n");
+                            if (out_trimmed.len == 0) {
+                                consecutive_empty_rg += 1;
+                                if (consecutive_empty_rg >= 2) {
+                                    try w.writeAll(",{\"role\":\"user\",\"content\":");
+                                    try w.print(
+                                        "{f}",
+                                        .{std.json.fmt("rg returned no matches multiple times. Do not keep varying the pattern. Instead, inspect likely files (e.g. list src/, open README/config), or ask the user for the exact symbol/file to change.", .{})},
+                                    );
+                                    try w.writeAll("}");
+                                }
+                            } else {
+                                consecutive_empty_rg = 0;
+                            }
+                        } else {
+                            consecutive_empty_rg = 0;
+                        }
+                    }
+                } else |_| {}
+            } else {
+                consecutive_empty_rg = 0;
+            }
+
             // Track paths
             if (parsePrimaryPathFromArgs(allocator, tc.args)) |p| {
                 if (!containsPath(paths.items, p)) {
@@ -3288,6 +4095,7 @@ fn runModel(
         }
     }
 
+    try stdout.print("{s}Stop:{s} reached maximum step limit ({d}).\n", .{ C_DIM, C_RESET, max_iterations });
     return .{
         .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
         .reasoning = try allocator.dupe(u8, ""),

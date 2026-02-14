@@ -106,7 +106,7 @@ pub const TodoList = struct {
 
     pub fn list(self: *const TodoList, allocator: std.mem.Allocator) ![]u8 {
         var result = std.ArrayList(u8).empty;
-        defer result.deinit(allocator);
+        errdefer result.deinit(allocator);
         const w = result.writer(allocator);
 
         if (self.items.items.len == 0) {
