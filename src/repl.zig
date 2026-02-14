@@ -3816,6 +3816,7 @@ fn runModel(
     var consecutive_empty_rg: usize = 0;
     var last_todo_guidance: ?[]u8 = null;
     defer if (last_todo_guidance) |v| allocator.free(v);
+    var rejected_repeated_calls: usize = 0;
     var paths = std.ArrayList([]u8).empty;
     defer {
         for (paths.items) |p| allocator.free(p);
@@ -3972,12 +3973,29 @@ fn runModel(
             const repeat_threshold: usize = if (std.mem.eql(u8, tc.tool, "bash")) 1 else 3;
             if (repeated_tool_calls >= repeat_threshold) {
                 try stdout.print("{s}Note:{s} repeated identical tool call detected; requesting a different next action.\n", .{ C_DIM, C_RESET });
-                try w.writeAll(",{\"role\":\"user\",\"content\":");
+                // Important: always "answer" tool calls in the transcript. If we reject a tool call
+                // without adding a tool-result message, the conversation ends up with unresolved
+                // tool calls and models tend to spin repeating the same action.
+                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.writeAll(",\"content\":");
                 try w.print(
                     "{f}",
-                    .{std.json.fmt("You are repeating the exact same tool call. Do not repeat it again. Either choose a different tool/action based on previous results, or finish with respond_text.", .{})},
+                    .{std.json.fmt("Tool call rejected: repeated identical tool call. Reuse the previous result and choose a different next action (or finish with respond_text).", .{})},
                 );
                 try w.writeAll("}");
+
+                rejected_repeated_calls += 1;
+                if (rejected_repeated_calls >= 6) {
+                    try stdout.print("{s}Stop:{s} model is stuck repeating the same tool call.\n", .{ C_DIM, C_RESET });
+                    return .{
+                        .response = try allocator.dupe(u8, "Model kept repeating the same tool call even after rejection. Try rephrasing the request, or switch model/provider."),
+                        .reasoning = try allocator.dupe(u8, response.reasoning),
+                        .tool_calls = tool_calls,
+                        .error_count = 1,
+                        .files_touched = try joinPaths(allocator, paths.items),
+                    };
+                }
                 continue;
             }
 
