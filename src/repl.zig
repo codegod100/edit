@@ -3816,7 +3816,8 @@ fn runModel(
     var consecutive_empty_rg: usize = 0;
     var last_todo_guidance: ?[]u8 = null;
     defer if (last_todo_guidance) |v| allocator.free(v);
-    var rejected_repeated_calls: usize = 0;
+    var rejected_repeated_bash: usize = 0;
+    var rejected_repeated_other: usize = 0;
     var paths = std.ArrayList([]u8).empty;
     defer {
         for (paths.items) |p| allocator.free(p);
@@ -3970,7 +3971,8 @@ fn runModel(
                 last_tool_args = try allocator.dupe(u8, tc.args);
             }
 
-            const repeat_threshold: usize = if (std.mem.eql(u8, tc.tool, "bash")) 1 else 3;
+            const is_bash = std.mem.eql(u8, tc.tool, "bash");
+            const repeat_threshold: usize = if (is_bash) 1 else 3;
             if (repeated_tool_calls >= repeat_threshold) {
                 try stdout.print("{s}Note:{s} repeated identical tool call detected; requesting a different next action.\n", .{ C_DIM, C_RESET });
                 // Important: always "answer" tool calls in the transcript. If we reject a tool call
@@ -3985,8 +3987,15 @@ fn runModel(
                 );
                 try w.writeAll("}");
 
-                rejected_repeated_calls += 1;
-                if (rejected_repeated_calls >= 6) {
+                if (is_bash) {
+                    rejected_repeated_bash += 1;
+                } else {
+                    rejected_repeated_other += 1;
+                }
+
+                // If the model repeats the same bash command even after rejection, it's effectively stuck.
+                // Stop early instead of burning the full iteration budget.
+                if (rejected_repeated_bash >= 2 or rejected_repeated_other >= 6) {
                     try stdout.print("{s}Stop:{s} model is stuck repeating the same tool call.\n", .{ C_DIM, C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "Model kept repeating the same tool call even after rejection. Try rephrasing the request, or switch model/provider."),
@@ -4080,7 +4089,8 @@ fn runModel(
                         const is_rg = std.mem.eql(u8, cmd, "rg") or std.mem.startsWith(u8, cmd, "rg ");
                         if (is_rg) {
                             const out_trimmed = std.mem.trim(u8, result, " \t\r\n");
-                            if (out_trimmed.len == 0) {
+                            const effectively_empty = out_trimmed.len == 0 or std.mem.eql(u8, out_trimmed, "[exit 1]");
+                            if (effectively_empty) {
                                 consecutive_empty_rg += 1;
                                 if (consecutive_empty_rg >= 2) {
                                     try w.writeAll(",{\"role\":\"user\",\"content\":");

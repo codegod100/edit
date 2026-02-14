@@ -834,8 +834,38 @@ fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
         .argv = &.{ "sh", "-c", command },
         .max_output_bytes = 512 * 1024,
     });
+    defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
-    return result.stdout;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    // Include exit status when non-zero; models often re-run commands when output is empty.
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0) try w.print("[exit {d}]\n", .{code});
+        },
+        .Signal => |sig| {
+            try w.print("[signal {d}]\n", .{sig});
+        },
+        .Stopped => |sig| {
+            try w.print("[stopped {d}]\n", .{sig});
+        },
+        .Unknown => {},
+    }
+
+    if (result.stdout.len > 0) {
+        try w.writeAll(result.stdout);
+        if (result.stdout[result.stdout.len - 1] != '\n') try w.writeByte('\n');
+    }
+    if (result.stderr.len > 0) {
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try w.writeByte('\n');
+        try w.writeAll("[stderr]\n");
+        try w.writeAll(result.stderr);
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 test "edit fails on ambiguous single replace" {
