@@ -1470,8 +1470,32 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 }
                 const p = parsed.?;
                 if (!providerHasModel(providers, p.provider_id, p.model_id)) {
-                    try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
-                    continue;
+                    // OpenRouter's model catalog changes frequently; if it's not in our local
+                    // models.dev.json, check the live /models endpoint before rejecting.
+                    if (std.mem.eql(u8, p.provider_id, "openrouter")) {
+                        const st = findConnectedProvider(provider_states, "openrouter");
+                        if (st != null and st.?.key != null) {
+                            const ids = ai_bridge.fetchModelIDsDirect(allocator, st.?.key.?, "openrouter") catch null;
+                            if (ids) |live| {
+                                defer ai_bridge.freeModelIDs(allocator, live);
+                                if (hasModelID(live, p.model_id)) {
+                                    // ok: accept live model id
+                                } else {
+                                    try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
+                                    continue;
+                                }
+                            } else {
+                                try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
+                                continue;
+                            }
+                        } else {
+                            try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
+                            continue;
+                        }
+                    } else {
+                        try stdout.print("Unknown model: {s}/{s}\n", .{ p.provider_id, p.model_id });
+                        continue;
+                    }
                 }
                 if (std.mem.eql(u8, p.provider_id, "openai")) {
                     const st = findConnectedProvider(provider_states, "openai");
@@ -2601,6 +2625,9 @@ fn findConnectedProvider(connected: []const pm.ProviderState, provider_id: []con
 }
 
 fn providerHasModel(providers: []const pm.ProviderSpec, provider_id: []const u8, model_id: []const u8) bool {
+    // OpenRouter is an aggregator and its model catalog changes frequently; don't hard-fail on
+    // stale local catalogs. `/model` already does an optional live check for OpenRouter.
+    if (std.mem.eql(u8, provider_id, "openrouter")) return true;
     const provider = findProviderSpecByID(providers, provider_id) orelse return false;
     for (provider.models) |model| {
         if (std.mem.eql(u8, model.id, model_id)) return true;

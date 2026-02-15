@@ -1247,11 +1247,26 @@ fn httpRequest(
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
 
+    // Avoid compressed responses: Zig stdlib decompressor may require Writer.rebase support, and
+    // some writer adapters (or Zig versions) can still hit unreachableRebase. "identity" keeps
+    // the response uncompressed in practice.
+    var all_headers = std.ArrayList(std.http.Header).empty;
+    defer all_headers.deinit(allocator);
+    try all_headers.ensureTotalCapacity(allocator, extra_headers.len + 1);
+    var has_ae = false;
+    for (extra_headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) has_ae = true;
+        try all_headers.append(allocator, h);
+    }
+    if (!has_ae) {
+        try all_headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" });
+    }
+
     _ = try client.fetch(.{
         .location = .{ .url = url },
         .method = method,
         .headers = headers,
-        .extra_headers = extra_headers,
+        .extra_headers = all_headers.items,
         .payload = payload,
         .response_writer = &out.writer,
     });
