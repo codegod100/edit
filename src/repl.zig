@@ -4256,14 +4256,17 @@ fn runModel(
                 continue;
             }
 
-            // Compact tool output: • Ran tool args
+            // Compact tool output
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 if (parseBashCommandFromArgs(allocator, tc.args)) |cmd| {
                     defer allocator.free(cmd);
-                    try stdout.print("• Ran {s}\n", .{cmd});
-
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
+                    if (is_rg) {
+                        try stdout.print("• Search {s}\n", .{cmd});
+                    } else {
+                        try stdout.print("• Ran {s}\n", .{cmd});
+                    }
                     if (is_rg) has_searched = true;
                 } else {
                     try stdout.print("• Ran {s}\n", .{tc.tool});
@@ -4332,34 +4335,9 @@ fn runModel(
             };
             defer allocator.free(result);
 
-            // Show read tool output with truncation (first few lines only)
-            if (isReadToolName(tc.tool)) {
-                const max_lines: usize = 10;
-                var lines_shown: usize = 0;
-                var pos: usize = 0;
-                
-                // Find position after max_lines
-                while (pos < result.len and lines_shown < max_lines) {
-                    if (result[pos] == '\n') {
-                        lines_shown += 1;
-                    }
-                    pos += 1;
-                }
-                
-                if (pos < result.len) {
-                    // Truncated - show first max_lines with indicator
-                    var total_lines: usize = 1;
-                    for (result) |ch| {
-                        if (ch == '\n') total_lines += 1;
-                    }
-                    try stdout.print("{s}", .{C_GREY});
-                    try stdout.print("{s}", .{result[0..pos]});
-                    try stdout.print("  [...truncated, showing {d} of {d} lines]{s}\n", .{ max_lines, total_lines, C_RESET });
-                } else {
-                    // Show all content
-                    try stdout.print("{s}{s}{s}\n", .{ C_GREY, result, C_RESET });
-                }
-            } else if (result.len > 0) {
+            // Don't print file contents for reads. Keep output compact; the model still gets the
+            // full content via the tool-result message in the transcript.
+            if (!isReadToolName(tc.tool) and result.len > 0) {
                 var it = std.mem.splitScalar(u8, result, '\n');
                 while (it.next()) |line| {
                     if (line.len == 0) continue;

@@ -978,7 +978,7 @@ test "edit fails on ambiguous single replace" {
 
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
-    const out = executeNamed(allocator, "edit", args, &todo_list);
+    const out = executeNamed(allocator, "edit", args, &todo_list, null);
     try std.testing.expectError(NamedToolError.InvalidArguments, out);
 }
 
@@ -986,7 +986,7 @@ test "apply_patch rejects empty patch" {
     const allocator = std.testing.allocator;
     var todo_list2 = todo.TodoList.init(allocator);
     defer todo_list2.deinit();
-    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}", &todo_list2);
+    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}", &todo_list2, null);
     defer allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "empty patch") != null);
 }
@@ -995,7 +995,7 @@ test "path guard rejects parent traversal" {
     const allocator = std.testing.allocator;
     var todo_list3 = todo.TodoList.init(allocator);
     defer todo_list3.deinit();
-    const out = executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3);
+    const out = executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3, null);
     try std.testing.expectError(NamedToolError.InvalidArguments, out);
 }
 
