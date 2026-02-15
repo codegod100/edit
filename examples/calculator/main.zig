@@ -9,7 +9,11 @@ pub fn multiply(a: i32, b: i32) i32 {
 }
 
 pub fn main() !void {
-    var stdout = std.fs.File.stdout().writer(&.{ });
+    const stdout_file = std.fs.File.stdout();
+    const stdout = if (@hasDecl(std.fs.File, "deprecatedWriter"))
+        stdout_file.deprecatedWriter()
+    else
+        stdout_file.writer();
     try stdout.print("10 + 5 = {d}\n", .{add(10, 5)});
     try stdout.print("10 * 5 = {d}\n", .{multiply(10, 5)});
 }

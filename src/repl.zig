@@ -2327,9 +2327,10 @@ test "tool result event line includes status and bytes" {
     const allocator = std.testing.allocator;
     const line = try buildToolResultEventLine(allocator, 2, "toolcall-2", "read_file", "ok", 42, 12, "src/main.zig");
     defer allocator.free(line);
-    try std.testing.expect(std.mem.indexOf(u8, line, "tool-result") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "status=ok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line, "bytes=42") != null);
+    // New compact format: ✓ tool_name path (duration_ms)
+    try std.testing.expect(std.mem.indexOf(u8, line, "✓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "src/main.zig") != null);
 }
 
 test "infer tool call spec for system time prompt" {
@@ -2676,6 +2677,9 @@ fn chooseDefaultModelForConnected(provider: pm.ProviderState) ?[]const u8 {
             if (best == null) best = m.id else if (std.mem.lessThan(u8, best.?, m.id)) best = m.id;
         }
         if (best) |b| return b;
+        // No codex model found - return first available model for OAuth fallback
+        if (provider.models.len > 0) return provider.models[0].id;
+        return null;
     }
     return pm.ProviderManager.defaultModelIDForProvider(provider.id, provider.models);
 }
@@ -3162,41 +3166,41 @@ fn buildToolResultEventLine(
     duration_ms: i64,
     file_path: ?[]const u8,
 ) ![]u8 {
+    _ = step;
+    _ = call_id;
+    _ = bytes;
+    
     // Colorize status
     const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
+    const status_symbol = if (std.mem.eql(u8, status, "ok")) "✓" else "✗";
 
-    // Build colored output using ArrayList
+    // Build compact output: • tool_name path ✓
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
-    try w.print("{s}event=tool-result{s} ", .{ C_BLUE, C_RESET });
-    try w.print("{s}step={d}{s} ", .{ C_CYAN, step, C_RESET });
-    try w.print("{s}call_id={s}{s} ", .{ C_DIM, call_id, C_RESET });
-    try w.print("{s}tool={s}{s} ", .{ C_YELLOW, tool_name, C_RESET });
+    try w.print("{s}{s}{s} ", .{ status_color, status_symbol, C_RESET });
     if (file_path) |fp| {
-        try w.print("{s}file={s}{s} ", .{ C_CYAN, fp, C_RESET });
+        try w.print("{s} {s}", .{ tool_name, fp });
+    } else {
+        try w.print("{s}", .{tool_name});
     }
-    try w.print("{s}status={s}{s} ", .{ status_color, status, C_RESET });
-    try w.print("{s}bytes={d}{s} ", .{ C_DIM, bytes, C_RESET });
-    try w.print("{s}duration_ms={d}{s}", .{ C_DIM, duration_ms, C_RESET });
+    try w.print(" {s}({d}ms){s}", .{ C_DIM, duration_ms, C_RESET });
 
     return out.toOwnedSlice(allocator);
 }
 
-// Helper to print colored tool events
+// Helper to print colored tool events (simplified - single line)
 fn printColoredToolEvent(stdout: anytype, event_type: []const u8, step: ?usize, call_id: ?[]const u8, tool_name: ?[]const u8) !void {
-    try stdout.print("{s}event={s}{s}{s}", .{ C_BLUE, C_RESET, event_type, C_RESET });
-    if (step) |s| {
-        try stdout.print(" {s}step={d}{s}", .{ C_CYAN, s, C_RESET });
-    }
-    if (call_id) |cid| {
-        try stdout.print(" {s}call_id={s}{s}", .{ C_DIM, cid, C_RESET });
-    }
+    // Only print for tool-call events, skip verbose intermediate events
+    if (!std.mem.eql(u8, event_type, "tool-call")) return;
+    
+    // Compact format: • tool_name
     if (tool_name) |tname| {
-        try stdout.print(" {s}tool={s}{s}", .{ C_YELLOW, tname, C_RESET });
+        try stdout.print("• {s}\n", .{tname});
     }
-    try stdout.print("\n", .{});
+    _ = step;
+    _ = call_id;
 }
 
 // Execute tool calls embedded in model response (TOOL_CALL format)
@@ -3761,11 +3765,11 @@ fn runModelTurnWithTools(
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
 
-        try stdout.print("{s}thinking...{s} ", .{ C_DIM, C_RESET });
+        try stdout.print("{s}··{s} ", .{ C_DIM, C_RESET });
         var routed = try inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
-            try stdout.print("{s}re-analyzing...{s} ", .{ C_DIM, C_RESET });
+            try stdout.print("{s}»{s} ", .{ C_DIM, C_RESET });
             const strict_prompt = try buildStrictToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_prompt);
             routed = try inferToolCallWithModel(allocator, stdout, active, strict_prompt, true);
@@ -3773,14 +3777,14 @@ fn runModelTurnWithTools(
 
         if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
             forced_mutation_probe_done = true;
-            try stdout.print("{s}checking edit requirements...{s} ", .{ C_DIM, C_RESET });
+            try stdout.print("{s}✎{s} ", .{ C_DIM, C_RESET });
             const strict_mutation_prompt = try buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_mutation_prompt);
             routed = try inferToolCallWithModel(allocator, stdout, active, strict_mutation_prompt, true);
         }
 
         if (routed == null and step == 0 and mutation_request) {
-            try stdout.print("{s}fallback parsing...{s} ", .{ C_DIM, C_RESET });
+            try stdout.print("{s}ƒ{s} ", .{ C_DIM, C_RESET });
             routed = try inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
@@ -3809,7 +3813,7 @@ fn runModelTurnWithTools(
         }
 
         if (routed == null) {
-            try stdout.print("{s}no tool selected{s}\n", .{ C_YELLOW, C_RESET });
+            try stdout.print("{s}—{s}\n", .{ C_YELLOW, C_RESET });
 
             if (mutation_request and tool_calls == 0) {
                 allocator.free(context_prompt);
@@ -3939,7 +3943,6 @@ fn runModelTurnWithTools(
             };
         }
 
-        try stdout.print("{s}→ {s}{s}\n", .{ C_GREEN, routed.?.tool, C_RESET });
         tool_calls += 1;
         if (parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
             if (!containsPath(paths.items, p)) {
@@ -4247,9 +4250,32 @@ fn runModel(
             tool_calls += 1;
             const why = try buildModelWhyLine(allocator, response.reasoning, response.text, tc.tool, tc.args);
             defer allocator.free(why);
-            try stdout.print("  {s}Why:{s} {s}\n", .{ C_DIM, C_RESET, why });
-            try stdout.print("{s}Tool:{s} {s}{s}\n", .{ C_YELLOW, C_RESET, C_YELLOW, tc.tool });
-            try stdout.print("  {s}Args:{s} {s}{s}{s}\n", .{ C_DIM, C_RESET, C_DIM, tc.args, C_RESET });
+            // Compact tool output: • Ran tool args
+            if (std.mem.eql(u8, tc.tool, "bash")) {
+                if (parseBashCommandFromArgs(allocator, tc.args)) |cmd| {
+                    defer allocator.free(cmd);
+                    try stdout.print("• Ran {s}\n", .{cmd});
+                } else {
+                    try stdout.print("• Ran {s}\n", .{tc.tool});
+                }
+            } else if (parsePrimaryPathFromArgs(allocator, tc.args)) |path| {
+                defer allocator.free(path);
+                if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
+                    if (try parseReadParamsFromArgs(allocator, tc.args)) |params| {
+                        if (params.offset) |off| {
+                            try stdout.print("• {s} {s} [{d}:{d}]\n", .{ tc.tool, path, off, params.limit orelse 0 });
+                        } else {
+                            try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                        }
+                    } else {
+                        try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                    }
+                } else {
+                    try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                }
+            } else {
+                try stdout.print("• {s}\n", .{tc.tool});
+            }
 
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 if (mutation_request and mutating_tools_executed == 0) {
