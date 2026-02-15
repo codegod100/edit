@@ -35,7 +35,8 @@ fn httpRequestThread(ctx: *HttpRequestContext) void {
         .response_writer = &allocating_writer.writer,
     });
 
-    if (result) |_| {
+    if (result) |res| {
+        std.log.debug("HTTP status: {d}", .{@intFromEnum(res.status)});
         const data = out.toOwnedSlice(ctx.allocator) catch {
             out.deinit(ctx.allocator);
             ctx.result = .{ .err = types.QueryError.OutOfMemory };

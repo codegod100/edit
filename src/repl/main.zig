@@ -183,8 +183,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try state.context_window.append(allocator, .user, line, .{});
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
+        // Arena for per-turn allocations (context prompt, model result, etc.)
+        var turn_arena = std.heap.ArenaAllocator.init(allocator);
+        defer turn_arena.deinit();
+        const turn_alloc = turn_arena.allocator();
+
+        const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
+        
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            try context.buildContextPrompt(allocator, &state.context_window, line), // context built here?
+            ctx_prompt,
             stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
         ) catch |err| {
             try stdout.print("Model run failed: {s}\n", .{@errorName(err)});
