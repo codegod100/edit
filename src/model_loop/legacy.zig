@@ -39,14 +39,12 @@ pub fn runModel(
     const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text.";
 
     try w.writer(allocator).print(
-        "{{\"system\":{f},\"messages\":[]}}",
+        "{{\"system\":{f},\"messages\":[",
         .{std.json.fmt(system_prompt, .{})},
     );
 
-    try w.replaceRange(allocator, w.items.len - 2, 2, "");
-
     try w.writer(allocator).print(
-        ",{{\"role\":\"user\",\"content\":{f}}}",
+        "{{\"role\":\"user\",\"content\":{f}}}",
         .{std.json.fmt(user_input, .{})},
     );
 
