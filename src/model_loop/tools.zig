@@ -1,0 +1,102 @@
+const std = @import("std");
+const tools = @import("../tools.zig");
+const display = @import("../display.zig");
+const subagent = @import("../subagent.zig");
+const todo = @import("../todo.zig");
+
+pub fn executeInlineToolCalls(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    response: []const u8,
+    paths: *std.ArrayList([]u8),
+    tool_calls: *usize,
+    todo_list: *todo.TodoList,
+    subagent_manager: ?*subagent.SubagentManager,
+) !?[]u8 {
+    var result_buf: std.ArrayList(u8) = .empty;
+    defer result_buf.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
+
+        // Parse: TOOL_CALL name args
+        const after_prefix = trimmed[10..]; // Skip "TOOL_CALL "
+        const space_idx = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse continue;
+        const tool_name = after_prefix[0..space_idx];
+        const args = std.mem.trim(u8, after_prefix[space_idx..], " \t");
+
+        if (!tools.isKnownToolName(tool_name)) continue;
+
+        tool_calls.* += 1;
+
+        // Track path
+        if (tools.parsePrimaryPathFromArgs(allocator, args)) |p| {
+            var found = false;
+            for (paths.items) |existing| {
+                if (std.mem.eql(u8, existing, p)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try paths.append(allocator, p);
+            } else {
+                allocator.free(p);
+            }
+        }
+
+        // Extract file path, bash command, or read params from args for display
+        const file_path = tools.parsePrimaryPathFromArgs(allocator, args);
+        defer if (file_path) |fp| allocator.free(fp);
+        const bash_cmd = if (std.mem.eql(u8, tool_name, "bash"))
+            tools.parseBashCommandFromArgs(allocator, args)
+        else
+            null;
+        defer if (bash_cmd) |bc| allocator.free(bc);
+        const read_params = if (std.mem.eql(u8, tool_name, "read") or std.mem.eql(u8, tool_name, "read_file"))
+            try tools.parseReadParamsFromArgs(allocator, args)
+        else
+            null;
+
+        // Execute tool
+        try stdout.print("• {s}", .{tool_name});
+        if (file_path) |fp| {
+            try stdout.print(" {s}file={s}{s}", .{ display.C_CYAN, fp, display.C_RESET });
+        }
+        if (bash_cmd) |bc| {
+            // Truncate long commands
+            const max_cmd_len = 60;
+            const display_cmd = if (bc.len > max_cmd_len) bc[0..max_cmd_len] else bc;
+            const suffix = if (bc.len > max_cmd_len) "..." else "";
+            try stdout.print(" {s}cmd=\"{s}{s}\"{s}", .{ display.C_CYAN, display_cmd, suffix, display.C_RESET });
+        }
+        if (read_params) |rp| {
+            if (rp.offset) |off| {
+                try stdout.print(" {s}offset={d}{s}", .{ display.C_DIM, off, display.C_RESET });
+            }
+            if (rp.limit) |lim| {
+                try stdout.print(" {s}limit={d}{s}", .{ display.C_DIM, lim, display.C_RESET });
+            }
+        }
+        try stdout.print("\n", .{});
+
+        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list, subagent_manager) catch |err| {
+            try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
+            continue;
+        };
+        defer allocator.free(tool_out);
+
+        // For mutating tools, print diff to stdout for user visibility
+        if (tools.isMutatingToolName(tool_name)) {
+            try stdout.print("{s}\n", .{tool_out});
+        }
+
+        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, tool_out });
+    }
+
+    if (result_buf.items.len == 0) return null;
+    const value = try result_buf.toOwnedSlice(allocator);
+    return @as(?[]u8, value);
+}
