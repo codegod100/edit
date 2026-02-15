@@ -46,14 +46,44 @@ The primary goal is to refactor and organize the codebase by breaking down monol
 ### Build Status
 ✅ **BUILD SUCCESS** - All compilation errors resolved. The project now compiles successfully with Zig 0.15.x.
 
+### Cleanup Status
+✅ **BACKUP FILES REMOVED** - Deleted 32 untracked backup and test files.
+
+### Next Phase: Further Modularization
+
+Current file sizes vs 500-line target:
+- `src/ai_bridge.zig`: **1268 lines** (2.5x target) - needs splitting
+- `src/model_loop.zig`: **1105 lines** (2.2x target) - needs splitting
+
+#### Proposed `src/ai_bridge/` module structure:
+| File | Contents | Est. Lines |
+|------|----------|------------|
+| `types.zig` | ToolCall, ChatResponse, ProviderConfig structs | ~100 |
+| `auth.zig` | OAuth, JWT handling, token exchange | ~150 |
+| `json.zig` | JSON utilities (writeJsonStringEscaped) | ~50 |
+| `http.zig` | httpRequest helper | ~50 |
+| `chat.zig` | chatDirect, chatDirectOpenAICodexResponses, chatDirectCopilotResponses | ~300 |
+| `models.zig` | listModelsDirect, fetchModelIDsDirect | ~200 |
+| `body.zig` | buildCodexResponsesBody, buildChatBody | ~100 |
+| `parser.zig` | parseCodexResponsesStream, parseChatResponse | ~250 |
+| `main.zig` | Public exports, error handling | ~50 |
+
+#### Proposed `src/model_loop/` module structure:
+| File | Contents | Est. Lines |
+|------|----------|------------|
+| `types.zig` | SubagentThreadArgs struct | ~50 |
+| `turn.zig` | runModelTurnWithTools (main tool loop) | ~350 |
+| `legacy.zig` | runModel (alternative model runner) | ~450 |
+| `tools.zig` | executeInlineToolCalls | ~100 |
+| `subagent.zig` | Subagent thread handling | ~150 |
+
 ### Next Steps
-1.  **Test Functionality**: Verify the REPL works correctly with `src/repl/main.zig`.
-2.  **Clean Up**:
-    *   Remove `src/repl_*.zig` backup files.
-    *   Remove old `src/repl.zig` if still present.
-3.  **Refactor `ai_bridge` and `model_loop`**: Apply further modularization to these files if needed.
+1.  **Create `src/ai_bridge/` module**: Split 1268-line ai_bridge.zig into 9 focused files
+2.  **Create `src/model_loop/` module**: Split 1105-line model_loop.zig into 5 focused files
+3.  **Test after each split**: Ensure build continues to work
 
 ## References
 *   `src/repl/` directory: New home for REPL logic.
+*   `src/llm/` directory: Modular LLM provider implementations.
 *   `src/main.zig`: Entry point.
 *   `src/config_store.zig`, `src/provider_manager.zig`, `src/model_select.zig`: Core shared modules.
