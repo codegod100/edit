@@ -2001,6 +2001,87 @@ fn drainQueuedLinesFromStdin(
     }
 }
 
+fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
+    const HEAD: usize = 2;
+    const TAIL: usize = 2;
+
+    const Range = struct { start: usize, end: usize };
+    var head: [HEAD]Range = undefined;
+    var head_len: usize = 0;
+
+    var tail: [TAIL]Range = undefined;
+    var tail_seen: usize = 0;
+    var tail_len: usize = 0;
+
+    var total: usize = 0;
+
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i <= output.len) : (i += 1) {
+        if (i == output.len or output[i] == '\n') {
+            const raw = output[line_start..i];
+            const trimmed = std.mem.trimRight(u8, raw, "\r");
+            const start = line_start;
+            const end = start + trimmed.len;
+            line_start = i + 1;
+
+            if (trimmed.len == 0) continue;
+            total += 1;
+
+            const r: Range = .{ .start = start, .end = end };
+            if (head_len < HEAD) {
+                head[head_len] = r;
+                head_len += 1;
+            }
+
+            tail[tail_seen % TAIL] = r;
+            tail_seen += 1;
+            if (tail_len < TAIL) tail_len += 1;
+        }
+    }
+
+    if (total == 0) return;
+
+    const trunc = total > (HEAD + TAIL);
+    if (!trunc) {
+        var printed_any = false;
+        line_start = 0;
+        i = 0;
+        while (i <= output.len) : (i += 1) {
+            if (i == output.len or output[i] == '\n') {
+                const raw = output[line_start..i];
+                const trimmed = std.mem.trimRight(u8, raw, "\r");
+                line_start = i + 1;
+                if (trimmed.len == 0) continue;
+
+                const prefix = if (!printed_any) "  └ " else "    ";
+                printed_any = true;
+                try stdout.print("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+            }
+        }
+        return;
+    }
+
+    // Head
+    var printed_any = false;
+    for (head[0..HEAD]) |r| {
+        const prefix = if (!printed_any) "  └ " else "    ";
+        printed_any = true;
+        try stdout.print("{s}{s}{s}{s}\n", .{ prefix, C_GREY, output[r.start..r.end], C_RESET });
+    }
+
+    const omitted = total - HEAD - TAIL;
+    try stdout.print("    {s}… +{d} lines{s}\n", .{ C_GREY, omitted, C_RESET });
+
+    // Tail (chronological from ring buffer)
+    const first = tail_seen - tail_len;
+    var t: usize = 0;
+    while (t < tail_len) : (t += 1) {
+        const r = tail[(first + t) % TAIL];
+        try stdout.print("    {s}{s}{s}\n", .{ C_GREY, output[r.start..r.end], C_RESET });
+    }
+}
+
 test "parse command recognizes slash commands" {
     const list = parseCommand("/skills");
     try std.testing.expectEqual(CommandTag.list_skills, list.tag);
@@ -4338,10 +4419,15 @@ fn runModel(
             // Don't print file contents for reads. Keep output compact; the model still gets the
             // full content via the tool-result message in the transcript.
             if (!isReadToolName(tc.tool) and result.len > 0) {
+                if (std.mem.eql(u8, tc.tool, "bash")) {
+                    try printTruncatedCommandOutput(stdout, result);
+                    // Tool result is still added to the transcript below.
+                } else {
                 var it = std.mem.splitScalar(u8, result, '\n');
                 while (it.next()) |line| {
                     if (line.len == 0) continue;
                     try stdout.print("  {s}{s}{s}\n", .{ C_GREY, line, C_RESET });
+                }
                 }
             }
 
