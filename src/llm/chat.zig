@@ -116,8 +116,6 @@ pub fn inferToolCallWithThinking(
 
     // Simplification: assume standardized chat body for forcing tools.
     const body = try buildChatBodyForRouting(allocator, model_id, prompt, defs, force_tool);
-    defer allocator.free(body);
-
     const headers = std.http.Client.Request.Headers{
         .authorization = .{ .override = auth_value },
         .content_type = .{ .override = "application/json" },
@@ -154,11 +152,6 @@ fn chatGeneric(
 ) !types.ChatResponse {
     const config = providers.getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, tool_defs, reasoning_effort);
-    defer allocator.free(body);
-    
-    // Debug: log request
-    std.log.debug("REQUEST to {s}: {s}", .{config.endpoint, body});
-
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
 
@@ -175,6 +168,7 @@ fn chatGeneric(
 
     const raw = try client.httpRequest(allocator, .POST, config.endpoint, headers, extra_headers.items, body);
     defer allocator.free(raw);
+    allocator.free(body); // Free request body after use
     
     if (raw.len == 0) {
         std.log.err("Empty response from {s}", .{config.endpoint});
@@ -192,7 +186,6 @@ fn chatCodex(
     tool_defs: ?[]const types.ToolRouteDef,
 ) !types.ChatResponse {
     const body = try codex.buildCodexBody(allocator, model_id, messages_json, tool_defs);
-    defer allocator.free(body);
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
@@ -223,7 +216,6 @@ fn chatCopilotResponses(
     tool_defs: ?[]const types.ToolRouteDef,
 ) !types.ChatResponse {
     const body = try codex.buildCodexBody(allocator, model_id, messages_json, tool_defs);
-    defer allocator.free(body);
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
@@ -333,10 +325,13 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
     };
 
     var parsed = std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true }) catch |err| {
-        std.log.err("Failed to parse model response: {s}", .{@errorName(err)});
-        if (raw.len > 0) {
-            std.log.err("Raw response (first 500 chars): {s}", .{raw[0..@min(raw.len, 500)]});
+        // Check if this is an API error response
+        if (std.mem.indexOf(u8, raw, "\"error\"")) |_| {
+            std.log.err("API error: {s}", .{raw[0..@min(raw.len, 500)]});
+            return types.QueryError.ModelProviderError;
         }
+        std.log.err("Failed to parse model response: {s}", .{@errorName(err)});
+        std.log.err("Raw response: {s}", .{raw[0..@min(raw.len, 500)]});
         return types.QueryError.ModelResponseParseError;
     };
     defer parsed.deinit();
