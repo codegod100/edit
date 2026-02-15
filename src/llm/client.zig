@@ -83,7 +83,10 @@ pub fn httpRequest(
         return error.EmptyResponse;
     }
 
-    // Debug: log first 200 chars of response
+    // Debug: log response preview
+    if (stdout_arr.items.len > 0) {
+        std.log.debug("Response: {s}", .{stdout_arr.items[0..@min(stdout_arr.items.len, 200)]});
+    }
 
     return try stdout_arr.toOwnedSlice(allocator);
 }
