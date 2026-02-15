@@ -320,7 +320,11 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
                 return std.fmt.allocPrint(allocator, "Failed to create subagent task: {s}", .{@errorName(err)});
             };
             const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
-            return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":\"pending\",\"type\":\"{s}\",\"system_prompt\":\"{s}\"}}", .{ id, task_type_str, sys_prompt });
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"id\":\"{s}\",\"status\":\"pending\",\"type\":\"{s}\",\"system_prompt\":{f}}}",
+                .{ id, task_type_str, std.json.fmt(sys_prompt, .{}) },
+            );
         }
         return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
     }
@@ -334,8 +338,31 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         
         if (subagent_manager) |sm| {
             if (sm.getTask(id)) |task| {
-                const result_json = if (task.result) |r| r else "null";
-                return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":\"{s}\",\"result\":{s},\"tool_calls\":{d}}}", .{ task.id, @tagName(task.task_type), @tagName(task.status), task.description, result_json, task.tool_calls });
+                if (task.result) |r| {
+                    return std.fmt.allocPrint(
+                        allocator,
+                        "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":{f},\"result\":{f},\"tool_calls\":{d}}}",
+                        .{
+                            task.id,
+                            @tagName(task.task_type),
+                            @tagName(task.status),
+                            std.json.fmt(task.description, .{}),
+                            std.json.fmt(r, .{}),
+                            task.tool_calls,
+                        },
+                    );
+                }
+                return std.fmt.allocPrint(
+                    allocator,
+                    "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":{f},\"result\":null,\"tool_calls\":{d}}}",
+                    .{
+                        task.id,
+                        @tagName(task.task_type),
+                        @tagName(task.status),
+                        std.json.fmt(task.description, .{}),
+                        task.tool_calls,
+                    },
+                );
             }
             return std.fmt.allocPrint(allocator, "{{\"error\":\"Task not found: {s}\"}}", .{id});
         }

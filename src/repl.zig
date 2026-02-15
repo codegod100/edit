@@ -1143,8 +1143,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     defer todo_list.deinit();
     // Session-scoped todos: do not load/save across runs.
 
-    // Initialize subagent manager for task delegation
-    var subagent_manager = subagent.SubagentManager.init(allocator);
+    // Initialize subagent manager for task delegation.
+    // Use a thread-safe allocator because subagents can run in background threads.
+    var subagent_manager = subagent.SubagentManager.init(std.heap.c_allocator);
     defer subagent_manager.deinit();
     // Session-scoped subagents: do not persist across runs.
 
@@ -1681,7 +1682,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     try stdout.print("{s}queue>{s} ", .{ C_DIM, C_RESET });
                 }
 
-                const turn_val: RunTurnResult = runModel(allocator, stdout, active.?, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager) catch |err| blk: {
+                const turn_val: RunTurnResult = runModel(allocator, stdout, active.?, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager, null) catch |err| blk: {
                     if (prompt_todo_id) |id| {
                         _ = todo_list.update(id, .pending) catch false;
                     }
@@ -1720,7 +1721,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
                             const retry_active = chooseActiveModel(providers, provider_states, selected_model, current_effort);
                             if (retry_active) |ra| {
-                                const retry_turn = runModel(allocator, stdout, ra, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager) catch |retry_err| {
+                                const retry_turn = runModel(allocator, stdout, ra, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager, null) catch |retry_err| {
                                     if (retry_err == error.ModelProviderError or retry_err == error.ModelResponseMissingChoices) {
                                         if (ai_bridge.getLastProviderError()) |detail| {
                                             try stdout.print("Model query failed: {s} ({s})\n", .{ describeModelQueryError(retry_err), detail });
@@ -2080,6 +2081,111 @@ fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
         const r = tail[(first + t) % TAIL];
         try stdout.print("    {s}{s}{s}\n", .{ C_GREY, output[r.start..r.end], C_RESET });
     }
+}
+
+const SubagentThreadArgs = struct {
+    manager: *subagent.SubagentManager,
+    id: []u8,
+    task_type: subagent.SubagentType,
+    description: []u8,
+    parent_context: ?[]u8,
+    active: ActiveModel,
+
+    fn deinit(self: *SubagentThreadArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.description);
+        if (self.parent_context) |c| allocator.free(c);
+        allocator.free(self.active.provider_id);
+        allocator.free(self.active.model_id);
+        if (self.active.api_key) |k| allocator.free(k);
+        if (self.active.reasoning_effort) |e| allocator.free(e);
+    }
+};
+
+fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, task_type: subagent.SubagentType) ![]u8 {
+    const base = subagent.SubagentManager.getSystemPrompt(task_type);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n\nUse the function-call tool interface for any tool usage. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text.",
+        .{base},
+    );
+}
+
+fn subagentThreadMain(args_ptr: *SubagentThreadArgs) void {
+    const allocator = std.heap.c_allocator;
+    defer {
+        args_ptr.deinit(allocator);
+        allocator.destroy(args_ptr);
+    }
+    const args = args_ptr.*;
+
+    // Mark running ASAP.
+    _ = args.manager.updateStatus(args.id, .running);
+
+    var todo_list = todo.TodoList.init(allocator);
+    defer todo_list.deinit();
+    if (todo_list.add(args.description)) |new_id| {
+        _ = todo_list.update(new_id, .in_progress) catch {};
+    } else |_| {}
+
+    const sys_prompt = buildSubagentSystemPrompt(allocator, args.task_type) catch null;
+    defer if (sys_prompt) |s| allocator.free(s);
+
+    const input = blk: {
+        if (args.parent_context) |ctx| {
+            break :blk std.fmt.allocPrint(
+                allocator,
+                "Subagent task:\n{s}\n\nParent context:\n{s}",
+                .{ args.description, ctx },
+            ) catch null;
+        }
+        break :blk allocator.dupe(u8, args.description) catch null;
+    };
+    defer if (input) |s| allocator.free(s);
+
+    const NullOut = struct {
+        pub fn writeAll(_: *@This(), _: []const u8) !void {}
+        pub fn print(_: *@This(), comptime _: []const u8, _: anytype) !void {}
+    };
+    var out = NullOut{};
+
+    if (input == null) {
+        _ = args.manager.setError(args.id, "subagent: failed to allocate input") catch {};
+        _ = args.manager.updateStatus(args.id, .failed);
+        return;
+    }
+
+    const result = runModel(
+        allocator,
+        &out,
+        args.active,
+        args.description,
+        input.?,
+        false,
+        &todo_list,
+        null,
+        sys_prompt,
+    ) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "subagent: run failed: {s}", .{@errorName(err)}) catch null;
+        if (msg) |m| {
+            defer allocator.free(m);
+            _ = args.manager.setError(args.id, m) catch {};
+        } else {
+            _ = args.manager.setError(args.id, "subagent: run failed") catch {};
+        }
+        _ = args.manager.updateStatus(args.id, .failed);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    if (result.error_count == 0) {
+        _ = args.manager.setResult(args.id, result.response, result.tool_calls) catch {};
+        _ = args.manager.updateStatus(args.id, .completed);
+    } else {
+        _ = args.manager.setError(args.id, result.response) catch {};
+        _ = args.manager.updateStatus(args.id, .failed);
+    }
+
 }
 
 test "parse command recognizes slash commands" {
@@ -4109,6 +4215,7 @@ fn runModel(
     stdout_is_tty: bool,
     todo_list: *todo.TodoList,
     subagent_manager: ?*subagent.SubagentManager,
+    system_prompt_override: ?[]const u8,
 ) !RunTurnResult {
     const mutation_request = isLikelyFileMutationRequest(raw_user_request);
     const allow_read_first = containsIgnoreCase(raw_user_request, "src/") or
@@ -4130,12 +4237,16 @@ fn runModel(
     }
     const api_key = active.api_key orelse "";
 
+    const default_system_prompt =
+        "You are zagent, an AI coding assistant. Use the function-call tool interface for any tool usage. If no more external tools are needed, call the 'respond_text' tool with your final user-facing answer. For repository work: unless the user gives an explicit target file path, start with bash using rg to locate files/symbols; do not start by reading random files. After rg, read only the most relevant file(s) with explicit offset+limit and use bounded chunks for large files instead of broad scans. Avoid repeating identical tool calls; reuse prior results when possible. Do not call todo_list; the current todo state is already provided.";
+    const system_prompt = system_prompt_override orelse default_system_prompt;
+
     // Build initial messages
     var messages = std.ArrayList(u8).empty;
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent, an AI coding assistant. Use the function-call tool interface for any tool usage. If no more external tools are needed, call the 'respond_text' tool with your final user-facing answer. For repository work: unless the user gives an explicit target file path, start with bash using rg to locate files/symbols; do not start by reading random files. After rg, read only the most relevant file(s) with explicit offset+limit and use bounded chunks for large files instead of broad scans. Avoid repeating identical tool calls; reuse prior results when possible. Do not call todo_list; the current todo state is already provided.");
+    try writeJsonString(w, system_prompt);
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");
@@ -4333,6 +4444,120 @@ fn runModel(
                     "{f}",
                     .{std.json.fmt("Tool call rejected: run bash with rg to locate the right files/symbols first. Do not read files until after you have search results (unless the user provided an explicit file path).", .{})},
                 );
+                try w.writeAll("}");
+                continue;
+            }
+
+            if (std.mem.eql(u8, tc.tool, "subagent_spawn") and subagent_manager != null) {
+                const A = struct {
+                    @"type": ?[]const u8 = null,
+                    description: ?[]const u8 = null,
+                    context: ?[]const u8 = null,
+                };
+                var p = std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true }) catch {
+                    try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.writeAll(",\"content\":");
+                    try w.print("{f}", .{std.json.fmt("{\"error\":\"InvalidArguments\"}", .{})});
+                    try w.writeAll("}");
+                    continue;
+                };
+                defer p.deinit();
+
+                const task_type_str = p.value.@"type" orelse "coder";
+                const task_type = subagent.parseSubagentType(task_type_str) orelse subagent.SubagentType.coder;
+                const desc = p.value.description orelse "subagent task";
+
+                const id = subagent_manager.?.createTask(task_type, desc, p.value.context) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to create subagent task: {s}\"}}", .{@errorName(err)});
+                    defer allocator.free(msg);
+                    try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.writeAll(",\"content\":");
+                    try w.print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.writeAll("}");
+                    continue;
+                };
+
+                const args_ptr = std.heap.c_allocator.create(SubagentThreadArgs) catch null;
+                if (args_ptr == null) {
+                    const msg = "{\"error\":\"Failed to allocate subagent runner\"}";
+                    try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.writeAll(",\"content\":");
+                    try w.print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.writeAll("}");
+                    continue;
+                }
+
+                const id_owned = std.heap.c_allocator.dupe(u8, id) catch null;
+                const desc_owned = std.heap.c_allocator.dupe(u8, desc) catch null;
+                const ctx_owned = if (p.value.context) |c| std.heap.c_allocator.dupe(u8, c) catch null else null;
+                const prov_owned = std.heap.c_allocator.dupe(u8, active.provider_id) catch null;
+                const model_owned = std.heap.c_allocator.dupe(u8, active.model_id) catch null;
+                const key_owned = if (active.api_key) |k| std.heap.c_allocator.dupe(u8, k) catch null else null;
+                const effort_owned = if (active.reasoning_effort) |e| std.heap.c_allocator.dupe(u8, e) catch null else null;
+
+                if (id_owned == null or desc_owned == null or prov_owned == null or model_owned == null) {
+                    if (id_owned) |v| std.heap.c_allocator.free(v);
+                    if (desc_owned) |v| std.heap.c_allocator.free(v);
+                    if (ctx_owned) |v| std.heap.c_allocator.free(v);
+                    if (prov_owned) |v| std.heap.c_allocator.free(v);
+                    if (model_owned) |v| std.heap.c_allocator.free(v);
+                    if (key_owned) |v| std.heap.c_allocator.free(v);
+                    if (effort_owned) |v| std.heap.c_allocator.free(v);
+                    std.heap.c_allocator.destroy(args_ptr.?);
+                    const msg = "{\"error\":\"Failed to allocate subagent strings\"}";
+                    try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.writeAll(",\"content\":");
+                    try w.print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.writeAll("}");
+                    continue;
+                }
+
+                args_ptr.?.* = .{
+                    .manager = subagent_manager.?,
+                    .id = id_owned.?,
+                    .task_type = task_type,
+                    .description = desc_owned.?,
+                    .parent_context = ctx_owned,
+                    .active = .{
+                        .provider_id = prov_owned.?,
+                        .model_id = model_owned.?,
+                        .api_key = key_owned,
+                        .reasoning_effort = effort_owned,
+                    },
+                };
+
+                const th = std.Thread.spawn(.{}, subagentThreadMain, .{args_ptr.?}) catch |err| {
+                    args_ptr.?.deinit(std.heap.c_allocator);
+                    std.heap.c_allocator.destroy(args_ptr.?);
+                    const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to start subagent thread: {s}\"}}", .{@errorName(err)});
+                    defer allocator.free(msg);
+                    try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.writeAll(",\"content\":");
+                    try w.print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.writeAll("}");
+                    continue;
+                };
+                th.detach();
+
+                try stdout.print("• subagent {s} {s}\n", .{ task_type_str, id });
+
+                const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
+                const out = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"id\":\"{s}\",\"status\":\"running\",\"type\":\"{s}\",\"system_prompt\":{f}}}",
+                    .{ id, task_type_str, std.json.fmt(sys_prompt, .{}) },
+                );
+                defer allocator.free(out);
+
+                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.writeAll(",\"content\":");
+                try w.print("{f}", .{std.json.fmt(out, .{})});
                 try w.writeAll("}");
                 continue;
             }

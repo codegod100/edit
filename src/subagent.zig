@@ -48,6 +48,7 @@ pub const SubagentTask = struct {
 /// Subagent manager - handles creation, tracking, and execution of subagents
 pub const SubagentManager = struct {
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
     tasks: std.ArrayList(SubagentTask),
     next_id: usize,
     max_concurrent: usize,
@@ -68,6 +69,8 @@ pub const SubagentManager = struct {
 
     /// Clean up all tasks
     pub fn deinit(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.tasks.items) |*task| {
             task.deinit(self.allocator);
         }
@@ -81,6 +84,9 @@ pub const SubagentManager = struct {
         description: []const u8,
         parent_context: ?[]const u8,
     ) ![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Generate ID
         const id = try std.fmt.allocPrint(self.allocator, "sub_{d}", .{self.next_id});
         self.next_id += 1;
@@ -115,6 +121,8 @@ pub const SubagentManager = struct {
 
     /// Update task status
     pub fn updateStatus(self: *Self, id: []const u8, status: SubagentStatus) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.tasks.items) |*task| {
             if (std.mem.eql(u8, task.id, id)) {
                 task.status = status;
@@ -129,6 +137,8 @@ pub const SubagentManager = struct {
 
     /// Set task result
     pub fn setResult(self: *Self, id: []const u8, result: []const u8, tool_calls: usize) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.tasks.items) |*task| {
             if (std.mem.eql(u8, task.id, id)) {
                 if (task.result) |r| self.allocator.free(r);
@@ -145,6 +155,8 @@ pub const SubagentManager = struct {
 
     /// Set task error
     pub fn setError(self: *Self, id: []const u8, error_msg: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.tasks.items) |*task| {
             if (std.mem.eql(u8, task.id, id)) {
                 if (task.error_msg) |e| self.allocator.free(e);
@@ -159,6 +171,8 @@ pub const SubagentManager = struct {
 
     /// Get task by ID
     pub fn getTask(self: *Self, id: []const u8) ?SubagentTask {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.tasks.items) |task| {
             if (std.mem.eql(u8, task.id, id)) {
                 return task;
@@ -169,6 +183,8 @@ pub const SubagentManager = struct {
 
     /// List all tasks
     pub fn listTasks(self: *Self, allocator: std.mem.Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var result = std.ArrayList(u8).empty;
         defer result.deinit(allocator);
         const w = result.writer(allocator);
@@ -214,6 +230,8 @@ pub const SubagentManager = struct {
 
     /// Get summary of current subagent state
     pub fn summary(self: *Self) []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.tasks.items.len == 0) {
             return "no subagents";
         }
@@ -260,6 +278,8 @@ pub const SubagentManager = struct {
 
     /// Clear completed/failed tasks
     pub fn clearDone(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var i: usize = 0;
         var cleared: usize = 0;
         while (i < self.tasks.items.len) {
