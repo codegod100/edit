@@ -52,8 +52,8 @@ The primary goal is to refactor and organize the codebase by breaking down monol
 ### Next Phase: Further Modularization
 
 Current file sizes vs 500-line target:
-- `src/ai_bridge.zig`: **1268 lines** (2.5x target) - needs splitting
-- `src/model_loop.zig`: **1105 lines** (2.2x target) - needs splitting
+- `src/ai_bridge.zig`: **~1268 lines -> 9 files** ✅ **COMPLETE** - modularized into ai_bridge/
+- `src/model_loop.zig`: **1105 lines** (2.2x target) - 🔄 IN PROGRESS - structure created, code migration pending
 
 #### Proposed `src/ai_bridge/` module structure:
 | File | Contents | Est. Lines |
@@ -77,9 +77,44 @@ Current file sizes vs 500-line target:
 | `tools.zig` | executeInlineToolCalls | ~100 |
 | `subagent.zig` | Subagent thread handling | ~150 |
 
+### Completed Modularization (2026-02-15)
+
+#### `src/ai_bridge/` - COMPLETED ✅
+Successfully split 1,268-line ai_bridge.zig into 9 focused files (~140 lines each):
+
+| File | Contents | Lines |
+|------|----------|-------|
+| `types.zig` | ToolCall, ChatResponse, ProviderConfig structs | ~100 |
+| `auth.zig` | OAuth/JWT token handling for Copilot | ~150 |
+| `json.zig` | JSON escaping utilities | ~50 |
+| `http.zig` | HTTP request helper | ~50 |
+| `config.zig` | Provider configuration | ~100 |
+| `body.zig` | Request body builders (Codex, OpenAI) | ~100 |
+| `parser.zig` | SSE and JSON response parsers | ~250 |
+| `chat.zig` | Chat API implementations | ~300 |
+| `models.zig` | Model listing functions | ~200 |
+| `main.zig` | Public module exports | ~50 |
+
+- Original `ai_bridge.zig` now serves as backward-compatible wrapper
+- All imports updated to use correct relative paths (`../` for parent modules)
+- Build passes with Zig 0.15.x
+
+#### `src/model_loop/` - IN PROGRESS 🔄
+Created initial module structure (4 files):
+
+| File | Contents | Status |
+|------|----------|--------|
+| `types.zig` | SubagentThreadArgs struct | ✅ Created |
+| `subagent.zig` | Subagent thread handling | ✅ Created |
+| `tools.zig` | Tool execution utilities | ✅ Created |
+| `main.zig` | Module documentation | ✅ Created |
+
+**Note**: Full code migration from `model_loop.zig` pending due to complex
+interdependencies between `runModel()` and `runModelTurnWithTools()`.
+
 ### Next Steps
-1.  **Create `src/ai_bridge/` module**: Split 1268-line ai_bridge.zig into 9 focused files
-2.  **Create `src/model_loop/` module**: Split 1105-line model_loop.zig into 5 focused files
+1.  ✅ ~~Create `src/ai_bridge/` module~~ - **COMPLETED**
+2.  🔄 **Complete `src/model_loop/` module**: Migrate code from model_loop.zig to module files
 3.  **Test after each split**: Ensure build continues to work
 
 ## References
