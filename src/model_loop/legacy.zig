@@ -38,8 +38,11 @@ pub fn runModel(
 
     const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text.";
 
+    // Build messages array (without system field - that goes in separate system param for most APIs)
+    try w.appendSlice(allocator, "[");
+
     try w.writer(allocator).print(
-        "{{\"system\":{f},\"messages\":[",
+        "{{\"role\":\"system\",\"content\":{f}}},",
         .{std.json.fmt(system_prompt, .{})},
     );
 
