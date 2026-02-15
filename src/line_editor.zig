@@ -1,0 +1,254 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const cancel = @import("cancel.zig");
+const mentions = @import("mentions.zig");
+const context = @import("context.zig");
+
+pub const EditKey = enum {
+    tab,
+    backspace,
+    enter,
+    character,
+    left,
+    right,
+    home,
+    end,
+    delete,
+};
+
+pub fn stdInFile() std.fs.File {
+    if (@hasDecl(std.fs.File, "stdin")) {
+        return std.fs.File.stdin();
+    }
+    if (@hasDecl(std.io, "getStdIn")) {
+        return std.io.getStdIn();
+    }
+    @compileError("No supported stdin API in this Zig version");
+}
+
+pub fn stdOutFile() std.fs.File {
+    if (@hasDecl(std.fs.File, "stdout")) {
+        return std.fs.File.stdout();
+    }
+    if (@hasDecl(std.io, "getStdOut")) {
+        return std.io.getStdOut();
+    }
+    @compileError("No supported stdout API in this Zig version");
+}
+
+pub fn applyEditKey(
+    allocator: std.mem.Allocator,
+    current: []const u8,
+    key: EditKey,
+    character: u8,
+    autocompleteCommandFn: *const fn ([]const u8) []const u8,
+) ![]u8 {
+    return switch (key) {
+        .tab => allocator.dupe(u8, autocompleteCommandFn(current)),
+        .backspace => {
+            if (current.len == 0) return allocator.dupe(u8, current);
+            return allocator.dupe(u8, current[0 .. current.len - 1]);
+        },
+        .character => {
+            if (character < 32 or character == 127) return allocator.dupe(u8, current);
+            var out = try allocator.alloc(u8, current.len + 1);
+            @memcpy(out[0..current.len], current);
+            out[current.len] = character;
+            return out;
+        },
+        .enter => allocator.dupe(u8, current),
+        else => allocator.dupe(u8, current),
+    };
+}
+
+pub fn applyEditKeyAtCursor(
+    allocator: std.mem.Allocator,
+    current: []const u8,
+    key: EditKey,
+    character: u8,
+    cursor_pos: usize,
+    autocompleteCommandFn: *const fn ([]const u8) []const u8,
+) !mentions.LineEditResult {
+    const pos = @min(cursor_pos, current.len);
+
+    return switch (key) {
+        .tab => {
+            if (try mentions.autocompleteMentionAtCursor(allocator, current, pos)) |completed| {
+                return completed;
+            }
+            const text = try allocator.dupe(u8, autocompleteCommandFn(current));
+            return .{ .text = text, .cursor_pos = text.len };
+        },
+        .backspace => {
+            if (pos == 0) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = 0 };
+            }
+            const new_len = current.len - 1;
+            const text = try allocator.alloc(u8, new_len);
+            @memcpy(text[0 .. pos - 1], current[0 .. pos - 1]);
+            @memcpy(text[pos - 1 ..], current[pos..]);
+            return .{ .text = text, .cursor_pos = pos - 1 };
+        },
+        .delete => {
+            if (pos >= current.len) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = pos };
+            }
+            const new_len = current.len - 1;
+            const text = try allocator.alloc(u8, new_len);
+            @memcpy(text[0..pos], current[0..pos]);
+            @memcpy(text[pos..], current[pos + 1 ..]);
+            return .{ .text = text, .cursor_pos = pos };
+        },
+        .character => {
+            if (character < 32 or character == 127) {
+                const text = try allocator.dupe(u8, current);
+                return .{ .text = text, .cursor_pos = pos };
+            }
+            const text = try allocator.alloc(u8, current.len + 1);
+            @memcpy(text[0..pos], current[0..pos]);
+            text[pos] = character;
+            @memcpy(text[pos + 1 ..], current[pos..]);
+            return .{ .text = text, .cursor_pos = pos + 1 };
+        },
+        .left => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = if (pos > 0) pos - 1 else 0 };
+        },
+        .right => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = if (pos < current.len) pos + 1 else current.len };
+        },
+        .home => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = 0 };
+        },
+        .end => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = current.len };
+        },
+        .enter => {
+            const text = try allocator.dupe(u8, current);
+            return .{ .text = text, .cursor_pos = pos };
+        },
+    };
+}
+
+pub fn readPromptLine(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    stdin_reader: anytype,
+    stdout: anytype,
+    prompt: []const u8,
+    history: *context.CommandHistory,
+) !?[]u8 {
+    _ = history;
+
+    const original = std.posix.tcgetattr(stdin_file.handle) catch {
+        try stdout.writeAll(prompt);
+        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    };
+
+    var raw = original;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.ISIG = false;
+    if (builtin.os.tag == .linux) {
+        raw.cc[6] = 1;
+        raw.cc[5] = 0;
+    } else if (builtin.os.tag == .macos) {
+        raw.cc[16] = 1;
+        raw.cc[17] = 0;
+    }
+    try std.posix.tcsetattr(stdin_file.handle, .NOW, raw);
+    defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
+
+    try stdout.print("{s}", .{prompt});
+
+    var line = try allocator.alloc(u8, 0);
+    defer allocator.free(line);
+    var buf: [1]u8 = undefined;
+
+    while (true) {
+        const n = try stdin_file.read(&buf);
+        if (n == 0) {
+            if (line.len == 0) return null;
+            return try allocator.dupe(u8, line);
+        }
+
+        const ch = buf[0];
+
+        if (ch == 27) {
+            cancel.setCancelled();
+            try stdout.print("\n^C (cancelled)\n", .{});
+            return try allocator.dupe(u8, "");
+        }
+
+        if (ch == 3) {
+            return null;
+        }
+
+        if (ch == '\n' or ch == '\r') {
+            try stdout.print("\n", .{});
+            return try allocator.dupe(u8, line);
+        }
+
+        if (ch == 127 or ch == 8) {
+            if (line.len > 0) {
+                line = try allocator.realloc(line, line.len - 1);
+                _ = try stdout.writeAll("\x08 \x08");
+            }
+            continue;
+        }
+
+        if (ch >= 32 and ch < 127) {
+            line = try allocator.realloc(line, line.len + 1);
+            line[line.len - 1] = ch;
+            try stdout.print("{c}", .{ch});
+        }
+    }
+}
+
+pub fn drainQueuedLinesFromStdin(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    partial: *std.ArrayList(u8),
+    out_lines: *std.ArrayList([]u8),
+) void {
+    if (!stdin_file.isTty()) return;
+
+    const O_NONBLOCK = if (builtin.os.tag == .linux)
+        @as(u32, 0o4000)
+    else if (builtin.os.tag == .macos)
+        @as(u32, 0x0004)
+    else
+        @as(u32, 0);
+
+    const original_flags = std.posix.fcntl(stdin_file.handle, std.posix.F.GETFL, 0) catch return;
+    _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
+    defer _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(stdin_file.handle, &buf) catch 0;
+        if (n == 0) break;
+
+        partial.appendSlice(allocator, buf[0..n]) catch break;
+        while (std.mem.indexOfScalar(u8, partial.items, '\n')) |idx| {
+            const raw = partial.items[0..idx];
+            const no_cr = std.mem.trimRight(u8, raw, "\r");
+            const trimmed = std.mem.trim(u8, no_cr, " \t\r\n");
+            if (trimmed.len > 0) {
+                const owned = allocator.dupe(u8, trimmed) catch null;
+                if (owned) |line| {
+                    out_lines.append(allocator, line) catch allocator.free(line);
+                }
+            }
+
+            const rest = partial.items[idx + 1 ..];
+            std.mem.copyForwards(u8, partial.items[0..rest.len], rest);
+            partial.items = partial.items[0..rest.len];
+        }
+    }
+}

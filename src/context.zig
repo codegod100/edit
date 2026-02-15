@@ -1,0 +1,419 @@
+const std = @import("std");
+const llm = @import("llm.zig");
+const tools = @import("tools.zig");
+const utils = @import("utils.zig");
+
+pub const Role = enum {
+    user,
+    assistant,
+};
+
+pub const ContextTurn = struct {
+    role: Role,
+    content: []u8,
+    tool_calls: usize,
+    error_count: usize,
+    files_touched: ?[]u8,
+
+    pub fn deinit(self: *ContextTurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        if (self.files_touched) |f| allocator.free(f);
+    }
+};
+
+pub const TurnMeta = struct {
+    tool_calls: usize = 0,
+    error_count: usize = 0,
+    files_touched: ?[]const u8 = null,
+};
+
+pub const RunTurnResult = struct {
+    response: []u8,
+    reasoning: []u8,
+    tool_calls: usize,
+    error_count: usize,
+    files_touched: ?[]u8,
+
+    pub fn deinit(self: *RunTurnResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.response);
+        allocator.free(self.reasoning);
+        if (self.files_touched) |f| allocator.free(f);
+    }
+};
+
+pub const ContextWindow = struct {
+    turns: std.ArrayListUnmanaged(ContextTurn),
+    summary: ?[]u8,
+    max_chars: usize,
+    keep_recent_turns: usize,
+
+    pub fn init(max_chars: usize, keep_recent_turns: usize) ContextWindow {
+        return .{
+            .turns = .{},
+            .summary = null,
+            .max_chars = max_chars,
+            .keep_recent_turns = keep_recent_turns,
+        };
+    }
+
+    pub fn deinit(self: *ContextWindow, allocator: std.mem.Allocator) void {
+        for (self.turns.items) |*turn| turn.deinit(allocator);
+        self.turns.deinit(allocator);
+        if (self.summary) |s| allocator.free(s);
+    }
+
+    pub fn append(self: *ContextWindow, allocator: std.mem.Allocator, role: Role, content: []const u8, meta: TurnMeta) !void {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len == 0) return;
+        try self.turns.append(allocator, .{
+            .role = role,
+            .content = try allocator.dupe(u8, trimmed),
+            .tool_calls = meta.tool_calls,
+            .error_count = meta.error_count,
+            .files_touched = if (meta.files_touched) |f| try allocator.dupe(u8, f) else null,
+        });
+    }
+};
+
+pub const CommandHistory = struct {
+    items: std.ArrayListUnmanaged([]u8),
+
+    pub fn init() CommandHistory {
+        return .{ .items = .{} };
+    }
+
+    pub fn deinit(self: *CommandHistory, allocator: std.mem.Allocator) void {
+        for (self.items.items) |entry| allocator.free(entry);
+        self.items.deinit(allocator);
+    }
+
+    pub fn append(self: *CommandHistory, allocator: std.mem.Allocator, line: []const u8) !void {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (self.items.items.len > 0 and std.mem.eql(u8, self.items.items[self.items.items.len - 1], trimmed)) return;
+        try self.items.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+};
+
+pub const ActiveModel = struct {
+    provider_id: []const u8,
+    model_id: []const u8,
+    api_key: ?[]const u8,
+    reasoning_effort: ?[]const u8 = null,
+};
+
+pub const HistoryNav = enum { up, down };
+
+pub fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
+    if (entries.len == 0) return null;
+    return switch (nav) {
+        .up => if (current) |idx| if (idx > 0) idx - 1 else 0 else entries.len - 1,
+        .down => if (current) |idx| if (idx + 1 < entries.len) idx + 1 else null else null,
+    };
+}
+
+// --- History persistence ---
+
+pub fn historyPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, "history" });
+}
+
+pub fn loadHistory(allocator: std.mem.Allocator, base_path: []const u8, history: *CommandHistory) !void {
+    const path = try historyPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const text = try file.readToEndAlloc(allocator, 2 * 1024 * 1024);
+    defer allocator.free(text);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try history.append(allocator, line);
+    }
+}
+
+pub fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, line: []const u8) !void {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    const path = try historyPathAlloc(allocator, base_path);
+    defer allocator.free(path);
+
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => try std.fs.createFileAbsolute(path, .{}),
+        else => return err,
+    };
+    defer file.close();
+
+    try file.seekFromEnd(0);
+    try file.writeAll(trimmed);
+    try file.writeAll("\n");
+}
+
+// --- Context window persistence ---
+
+pub fn hashProjectPath(cwd: []const u8) u64 {
+    return std.hash.Crc32.hash(cwd);
+}
+
+pub fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{project_hash});
+    defer allocator.free(filename);
+    return std.fs.path.join(allocator, &.{ base_path, filename });
+}
+
+pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, project_hash: u64) !void {
+    const path = try contextPathAlloc(allocator, base_path, project_hash);
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close();
+
+    const text = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    defer allocator.free(text);
+
+    const TurnJson = struct {
+        role: []const u8,
+        content: []const u8,
+        tool_calls: ?usize = null,
+        error_count: ?usize = null,
+        files_touched: ?[]const u8 = null,
+    };
+    const ContextJson = struct {
+        summary: ?[]const u8 = null,
+        turns: []const TurnJson = &.{},
+    };
+
+    var parsed = std.json.parseFromSlice(ContextJson, allocator, text, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value.summary) |s| {
+        if (window.summary) |existing| allocator.free(existing);
+        window.summary = try allocator.dupe(u8, s);
+    }
+
+    for (parsed.value.turns) |turn| {
+        const role: Role = if (std.mem.eql(u8, turn.role, "assistant")) .assistant else .user;
+        try window.append(allocator, role, turn.content, .{
+            .tool_calls = turn.tool_calls orelse 0,
+            .error_count = turn.error_count orelse 0,
+            .files_touched = turn.files_touched,
+        });
+    }
+}
+
+pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow, project_hash: u64) !void {
+    const path = try contextPathAlloc(allocator, base_path, project_hash);
+    defer allocator.free(path);
+
+    const dir_path = std.fs.path.dirname(path) orelse return;
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const TurnJson = struct {
+        role: []const u8,
+        content: []const u8,
+        tool_calls: usize,
+        error_count: usize,
+        files_touched: ?[]const u8,
+    };
+    const ContextJson = struct {
+        summary: ?[]const u8,
+        turns: []TurnJson,
+    };
+
+    var turns: std.ArrayList(TurnJson) = .empty;
+    defer turns.deinit(allocator);
+    for (window.turns.items) |turn| {
+        try turns.append(allocator, .{
+            .role = if (turn.role == .assistant) "assistant" else "user",
+            .content = turn.content,
+            .tool_calls = turn.tool_calls,
+            .error_count = turn.error_count,
+            .files_touched = turn.files_touched,
+        });
+    }
+
+    const payload = ContextJson{ .summary = window.summary, .turns = turns.items };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
+
+    var file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(out.items);
+}
+
+// --- Context compaction and summarization ---
+
+pub fn estimateContextChars(window: *const ContextWindow) usize {
+    var total: usize = if (window.summary) |s| s.len else 0;
+    for (window.turns.items) |turn| total += turn.content.len + 20;
+    return total;
+}
+
+pub fn compactContextWindow(allocator: std.mem.Allocator, window: *ContextWindow, active: ?ActiveModel) !void {
+    if (window.turns.items.len <= window.keep_recent_turns) return;
+    if (estimateContextChars(window) <= window.max_chars) return;
+
+    const compact_count = window.turns.items.len - window.keep_recent_turns;
+    const new_summary = if (active) |a|
+        (summarizeTurnsWithModel(allocator, window, compact_count, a) catch null)
+    else
+        null;
+
+    const fallback_summary = if (new_summary == null)
+        try buildHeuristicSummary(allocator, window, compact_count)
+    else
+        null;
+    const final_summary = if (new_summary) |s| s else fallback_summary.?;
+
+    if (window.summary) |old| allocator.free(old);
+    window.summary = final_summary;
+
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        var first = window.turns.orderedRemove(0);
+        first.deinit(allocator);
+    }
+}
+
+pub fn buildHeuristicSummary(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize) ![]u8 {
+    var summary_buf: std.ArrayList(u8) = .empty;
+    defer summary_buf.deinit(allocator);
+
+    if (window.summary) |existing| {
+        try summary_buf.writer(allocator).print("{s}\n", .{existing});
+    }
+    try summary_buf.appendSlice(allocator, "Compacted context notes:\n");
+
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        const turn = window.turns.items[idx];
+        const prefix = if (turn.role == .assistant) "A" else "U";
+        const cap_len = @min(turn.content.len, 220);
+        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null)) {
+            try summary_buf.writer(allocator).print(
+                "- {s}: {s} [tools={d} errors={d}{s}]\n",
+                .{ prefix, turn.content[0..cap_len], turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
+            );
+        } else {
+            try summary_buf.writer(allocator).print("- {s}: {s}\n", .{ prefix, turn.content[0..cap_len] });
+        }
+    }
+    return summary_buf.toOwnedSlice(allocator);
+}
+
+fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize, active: ActiveModel) !?[]u8 {
+    var turns_buf: std.ArrayList(u8) = .empty;
+    defer turns_buf.deinit(allocator);
+    const w = turns_buf.writer(allocator);
+    var idx: usize = 0;
+    while (idx < compact_count) : (idx += 1) {
+        const turn = window.turns.items[idx];
+        const role = if (turn.role == .assistant) "assistant" else "user";
+        try w.print("- {s}: {s}", .{ role, turn.content });
+        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
+            try w.print(" [tools={d} errors={d}", .{ turn.tool_calls, turn.error_count });
+            if (turn.files_touched) |f| try w.print(" files={s}", .{f});
+            try w.print("]", .{});
+        }
+        try w.print("\n", .{});
+    }
+
+    const prompt = try std.fmt.allocPrint(
+        allocator,
+        "Summarize these prior chat turns for future coding assistance. Keep it concise (6-10 bullets), include decisions, files touched, errors/fixes, and unresolved tasks.\n\nExisting summary:\n{s}\n\nTurns to compact:\n{s}",
+        .{ if (window.summary) |s| s else "(none)", turns_buf.items },
+    );
+    defer allocator.free(prompt);
+
+    const text = llm.query(allocator, active.provider_id, active.api_key, active.model_id, prompt, utils.toolDefsToLlm(tools.definitions[0..])) catch return null;
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
+        allocator.free(text);
+        return null;
+    }
+    return text;
+}
+
+pub fn buildRelevantTurnIndices(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8, max_turns: usize) ![]usize {
+    const ScoredTurn = struct { idx: usize, score: usize };
+    var scored: std.ArrayList(ScoredTurn) = .empty;
+    defer scored.deinit(allocator);
+
+    for (window.turns.items, 0..) |turn, idx| {
+        var score: usize = 0;
+        if (utils.containsIgnoreCase(turn.content, user_input)) score += 4;
+        if (utils.containsIgnoreCase(user_input, "file") and turn.files_touched != null) score += 2;
+        if (turn.role == .assistant and turn.tool_calls > 0) score += 1;
+        const recency = window.turns.items.len - idx;
+        if (recency <= 4) score += 3;
+        if (score > 0) try scored.append(allocator, .{ .idx = idx, .score = score });
+    }
+
+    std.mem.sort(ScoredTurn, scored.items, {}, struct {
+        fn lessThan(_: void, a: ScoredTurn, b: ScoredTurn) bool {
+            if (a.score == b.score) return a.idx > b.idx;
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    const take = @min(max_turns, scored.items.len);
+    var selected: std.ArrayList(usize) = .empty;
+    defer selected.deinit(allocator);
+    var i: usize = 0;
+    while (i < take) : (i += 1) {
+        try selected.append(allocator, scored.items[i].idx);
+    }
+
+    std.mem.sort(usize, selected.items, {}, std.sort.asc(usize));
+    return selected.toOwnedSlice(allocator);
+}
+
+pub fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("You are continuing an existing coding conversation. Use prior context when relevant, but prioritize correctness and current repository state.\n", .{});
+    if (window.summary) |s| {
+        try w.print("\nConversation summary:\n{s}\n", .{s});
+    }
+
+    if (window.turns.items.len > 0) {
+        try w.print("\nRelevant turns:\n", .{});
+        const indices = try buildRelevantTurnIndices(allocator, window, user_input, 8);
+        defer allocator.free(indices);
+        for (indices) |idx| {
+            const turn = window.turns.items[idx];
+            const tag = if (turn.role == .assistant) "Assistant" else "User";
+            if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
+                try w.print(
+                    "{s}: {s} [tools={d} errors={d}{s}]\n",
+                    .{ tag, turn.content, turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
+                );
+            } else {
+                try w.print("{s}: {s}\n", .{ tag, turn.content });
+            }
+        }
+    }
+
+    try w.print("\nCurrent user request:\n{s}", .{user_input});
+    return out.toOwnedSlice(allocator);
+}

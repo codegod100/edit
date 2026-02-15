@@ -234,8 +234,6 @@ pub fn chatDirect(
     return parseChatResponse(allocator, raw);
 }
 
-
-
 fn chatDirectOpenAICodexResponses(
     allocator: std.mem.Allocator,
     api_key: []const u8,
@@ -374,7 +372,7 @@ fn buildCodexResponsesBody(
         try w_in.writeAll(content_type);
         try w_in.writeAll("\",\"text\":\"");
         try writeJsonStringEscaped(w_in, content);
-        try w_in.writeAll("\"}]}" );
+        try w_in.writeAll("\"}]}");
     }
 
     try w_in.writeAll("]");
@@ -480,7 +478,7 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
 
                         if (out_text.items.len == 0) {
                             if (root_parsed.value.object.get("output_text")) |ot| {
-                                if (ot == .string) try out_text.appendSlice(allocator, ot.string);
+                                if (ot == .string) try out_text.appendSlice(ot.string);
                             }
                         }
 
@@ -513,12 +511,12 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
         return error.ModelResponseParseError;
     }
 
-    var out_text = std.ArrayList(u8).empty;
+    var out_text: std.ArrayList(u8) = .empty;
     defer out_text.deinit(allocator);
 
     var current_name: ?[]u8 = null;
     defer if (current_name) |n| allocator.free(n);
-    var args = std.ArrayList(u8).empty;
+    var args: std.ArrayList(u8) = .empty;
     defer args.deinit(allocator);
     var saw_args_delta: bool = false;
 
@@ -551,7 +549,7 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
                 current_name = if (item.name) |n| try allocator.dupe(u8, n) else null;
                 args.clearRetainingCapacity();
                 saw_args_delta = false;
-                if (item.arguments) |a| try args.appendSlice(allocator, a);
+                if (item.arguments) |a| try args.appendSlice(a);
             }
         }
         if (ev.value.type) |t| {
@@ -562,12 +560,12 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
                     saw_args_delta = true;
                     if (args.items.len > 0) args.clearRetainingCapacity();
                 }
-                if (ev.value.delta) |d| try args.appendSlice(allocator, d);
+                if (ev.value.delta) |d| try args.appendSlice(d);
                 continue;
             }
             if (std.mem.endsWith(u8, t, ".delta")) {
                 const piece = ev.value.delta orelse ev.value.text orelse ev.value.output_text;
-                if (piece) |p| try out_text.appendSlice(allocator, p);
+                if (piece) |p| try out_text.appendSlice(p);
             }
         }
     }
@@ -778,7 +776,7 @@ fn buildChatBody(
     messages_json: []const u8,
     reasoning_effort: ?[]const u8,
 ) ![]u8 {
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -837,8 +835,6 @@ fn getProviderConfig(provider_id: []const u8) ProviderConfig {
         };
     }
 }
-
-
 
 fn getModelsEndpoint(provider_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_id, "openai")) {
@@ -996,7 +992,7 @@ pub fn listModelsDirect(
 
     const q = std.mem.trim(u8, filter, " \t\r\n");
 
-    var out = try std.ArrayList(u8).initCapacity(allocator, 0);
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -1076,7 +1072,6 @@ pub fn listModelsDirect(
     return out.toOwnedSlice(allocator);
 }
 
-
 pub fn fetchModelIDsDirect(
     allocator: std.mem.Allocator,
     api_key: []const u8,
@@ -1110,7 +1105,7 @@ pub fn fetchModelIDsDirect(
     };
     if (config.user_agent) |ua| headers.user_agent = .{ .override = ua };
 
-    var extra_headers = std.ArrayList(std.http.Header).empty;
+    var extra_headers: std.ArrayList(std.http.Header) = .empty;
     defer extra_headers.deinit(allocator);
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
@@ -1179,7 +1174,7 @@ pub fn fetchModelIDsDirect(
         return error.ModelProviderError;
     }
 
-    var out = std.ArrayList([]u8).empty;
+    var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |s| allocator.free(s);
         out.deinit(allocator);
@@ -1242,17 +1237,15 @@ fn httpRequest(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    // Use an allocating writer that supports `rebase`, which the stdlib HTTP decompressor requires.
-    // (ArrayList writer adapters may panic with unreachableRebase during gzip/deflate.)
-    var out = std.Io.Writer.Allocating.init(allocator);
-    errdefer out.deinit();
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
 
-    // Avoid compressed responses: Zig stdlib decompressor may require Writer.rebase support, and
-    // some writer adapters (or Zig versions) can still hit unreachableRebase. "identity" keeps
-    // the response uncompressed in practice.
-    var all_headers = std.ArrayList(std.http.Header).empty;
+    var allocating_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
+
+    var all_headers: std.ArrayList(std.http.Header) = .empty;
     defer all_headers.deinit(allocator);
     try all_headers.ensureTotalCapacity(allocator, extra_headers.len + 1);
+
     var has_ae = false;
     for (extra_headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) has_ae = true;
@@ -1268,8 +1261,8 @@ fn httpRequest(
         .headers = headers,
         .extra_headers = all_headers.items,
         .payload = payload,
-        .response_writer = &out.writer,
+        .response_writer = &allocating_writer.writer,
     });
 
-    return out.toOwnedSlice();
+    return out.toOwnedSlice(allocator);
 }

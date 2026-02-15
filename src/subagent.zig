@@ -185,7 +185,7 @@ pub const SubagentManager = struct {
     pub fn listTasks(self: *Self, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var result = std.ArrayList(u8).empty;
+        var result: std.ArrayList(u8) = .empty;
         defer result.deinit(allocator);
         const w = result.writer(allocator);
 
@@ -298,46 +298,46 @@ pub const SubagentManager = struct {
     /// Generate specialized system prompt for a subagent type
     pub fn getSystemPrompt(task_type: SubagentType) []const u8 {
         return switch (task_type) {
-            .coder => 
-                \\You are a specialized coding subagent. Focus on:
-                \\- Reading and understanding code structure
-                \\- Implementing requested changes
-                \\- Following existing code patterns
-                \\- Writing clean, idiomatic code
-                \\- Running tests to verify changes
-                \\Provide concise summaries of what you changed and why.
+            .coder =>
+            \\You are a specialized coding subagent. Focus on:
+            \\- Reading and understanding code structure
+            \\- Implementing requested changes
+            \\- Following existing code patterns
+            \\- Writing clean, idiomatic code
+            \\- Running tests to verify changes
+            \\Provide concise summaries of what you changed and why.
             ,
-            .researcher => 
-                \\You are a specialized research subagent. Focus on:
-                \\- Searching for relevant files and code
-                \\- Reading and summarizing code sections
-                \\- Finding patterns and relationships
-                \\- Gathering information efficiently
-                \\Provide clear, structured summaries of findings.
+            .researcher =>
+            \\You are a specialized research subagent. Focus on:
+            \\- Searching for relevant files and code
+            \\- Reading and summarizing code sections
+            \\- Finding patterns and relationships
+            \\- Gathering information efficiently
+            \\Provide clear, structured summaries of findings.
             ,
-            .editor => 
-                \\You are a specialized editing subagent. Focus on:
-                \\- Making precise, targeted edits
-                \\- Preserving existing code style
-                \\- Minimal, focused changes
-                \\- Verifying edits don't break things
-                \\Report exactly what was changed in each file.
+            .editor =>
+            \\You are a specialized editing subagent. Focus on:
+            \\- Making precise, targeted edits
+            \\- Preserving existing code style
+            \\- Minimal, focused changes
+            \\- Verifying edits don't break things
+            \\Report exactly what was changed in each file.
             ,
-            .tester => 
-                \\You are a specialized testing subagent. Focus on:
-                \\- Running existing tests
-                \\- Identifying test failures
-                \\- Suggesting fixes for failures
-                \\- Verifying code correctness
-                \\Report test results clearly with pass/fail status.
+            .tester =>
+            \\You are a specialized testing subagent. Focus on:
+            \\- Running existing tests
+            \\- Identifying test failures
+            \\- Suggesting fixes for failures
+            \\- Verifying code correctness
+            \\Report test results clearly with pass/fail status.
             ,
-            .git => 
-                \\You are a specialized git subagent. Focus on:
-                \\- Checking repository status
-                \\- Staging and committing changes
-                \\- Reviewing diffs
-                \\- Branch management
-                \\Report git operations clearly with status updates.
+            .git =>
+            \\You are a specialized git subagent. Focus on:
+            \\- Checking repository status
+            \\- Staging and committing changes
+            \\- Reviewing diffs
+            \\- Branch management
+            \\Report git operations clearly with status updates.
             ,
         };
     }
@@ -363,7 +363,7 @@ pub const SubagentManager = struct {
 pub fn parseSubagentType(str: []const u8) ?SubagentType {
     const lower = std.ascii.allocLowerString(std.heap.page_allocator, str) catch return null;
     defer std.heap.page_allocator.free(lower);
-    
+
     if (std.mem.eql(u8, lower, "coder") or std.mem.eql(u8, lower, "code") or std.mem.eql(u8, lower, "c")) {
         return .coder;
     }

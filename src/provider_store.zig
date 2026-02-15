@@ -88,7 +88,7 @@ const SanitizedValue = struct {
 };
 
 fn sanitizeEnvValue(allocator: std.mem.Allocator, value: []const u8) !SanitizedValue {
-    var out = std.ArrayList(u8).empty;
+    var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit(allocator);
     var stripped = false;
     for (value) |ch| {

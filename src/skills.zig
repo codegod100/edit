@@ -13,7 +13,7 @@ pub const Skill = struct {
 };
 
 pub fn discover(allocator: std.mem.Allocator, project_root: []const u8, home_dir: []const u8) ![]Skill {
-    var out = try std.ArrayList(Skill).initCapacity(allocator, 0);
+    var out = try std.ArrayListUnmanaged(Skill).initCapacity(allocator, 16);
     errdefer {
         for (out.items) |*s| s.deinit(allocator);
         out.deinit(allocator);
@@ -49,7 +49,7 @@ const SkillSource = enum {
     home,
 };
 
-fn scanBase(allocator: std.mem.Allocator, base_path: []const u8, out: *std.ArrayList(Skill), source: SkillSource) !void {
+fn scanBase(allocator: std.mem.Allocator, base_path: []const u8, out: *std.ArrayListUnmanaged(Skill), source: SkillSource) !void {
     var dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,

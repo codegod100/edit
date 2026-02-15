@@ -18,6 +18,11 @@ pub const ProviderState = struct {
     key: ?[]const u8,
     connected: bool,
     models: []const Model,
+
+    pub fn deinit(self: *ProviderState, allocator: std.mem.Allocator) void {
+        _ = self;
+        _ = allocator;
+    }
 };
 
 pub const EnvPair = struct {

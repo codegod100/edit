@@ -1,8 +1,9 @@
 // zagent was here
 // zagent was here
 const std = @import("std");
-const repl = @import("repl.zig");
+const repl = @import("repl/main.zig");
 const logger = @import("logger.zig");
+const cancel = @import("cancel.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,6 +19,9 @@ pub fn main() !void {
     try logger.init(allocator, .info, log_path);
     defer logger.deinit();
 
+    cancel.init();
+    defer cancel.deinit();
+
     logger.info("zagent starting up", .{});
 
     try repl.run(allocator);
@@ -30,7 +34,7 @@ test {
     _ = @import("llm.zig");
     _ = @import("models_catalog.zig");
     _ = @import("skills.zig");
-    _ = @import("repl.zig");
+    _ = @import("repl/main.zig");
     _ = @import("provider_manager.zig");
     _ = @import("provider_store.zig");
     _ = @import("logger.zig");

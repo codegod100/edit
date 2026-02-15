@@ -74,15 +74,15 @@ pub fn saveSelectedModel(allocator: std.mem.Allocator, base_path: []const u8, mo
     };
 
     const payload: Payload = if (model) |m|
-        .{ .selected_model = .{ 
-            .provider_id = m.provider_id, 
+        .{ .selected_model = .{
+            .provider_id = m.provider_id,
             .model_id = m.model_id,
             .reasoning_effort = m.reasoning_effort,
         } }
     else
         .{ .selected_model = null };
 
-    var buf = std.ArrayList(u8).empty;
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     try buf.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
     try file.writeAll(buf.items);
@@ -103,9 +103,9 @@ test "save and load selected model" {
     try saveSelectedModel(allocator, root, .{ .provider_id = "openai", .model_id = "gpt-5.3-codex" });
     const loaded = try loadSelectedModel(allocator, root);
     try std.testing.expect(loaded != null);
-    defer {
-        var owned = loaded.?;
-        owned.deinit(allocator);
+    if (loaded) |persisted| {
+        var p = persisted;
+        defer p.deinit(allocator);
     }
     try std.testing.expectEqualStrings("openai", loaded.?.provider_id);
     try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.?.model_id);

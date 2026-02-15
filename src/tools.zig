@@ -1,9 +1,57 @@
 const std = @import("std");
 const todo = @import("todo.zig");
 const subagent = @import("subagent.zig");
+const cancel = @import("cancel.zig");
+
+/// Parse the bash command from tool arguments JSON
+pub fn parseBashCommandFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) ?[]u8 {
+    const A = struct { command: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const cmd = parsed.value.command orelse return null;
+    return allocator.dupe(u8, cmd) catch null;
+}
+
+/// Parse the primary path (path or filePath) from tool arguments JSON
+pub fn parsePrimaryPathFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) ?[]u8 {
+    const A = struct { path: ?[]const u8 = null, filePath: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const p = parsed.value.path orelse parsed.value.filePath orelse return null;
+    return allocator.dupe(u8, p) catch null;
+}
+
+pub const ReadParams = struct {
+    offset: ?usize = null,
+    limit: ?usize = null,
+};
+
+/// Check if a tool name is a mutating (file-modifying) tool
+pub fn isMutatingToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "write_file") or
+        std.mem.eql(u8, name, "replace_in_file") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "apply_patch");
+}
+
+/// Parse read file parameters from tool arguments JSON
+pub fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []const u8) !?ReadParams {
+    const A = struct { offset: ?usize = null, limit: ?usize = null };
+    var parsed = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    const value = parsed.value;
+    if (value.offset == null and value.limit == null) return null;
+
+    return ReadParams{
+        .offset = value.offset,
+        .limit = value.limit,
+    };
+}
 
 pub const ToolError = error{InvalidToolCommand};
-pub const NamedToolError = error{ InvalidToolName, InvalidArguments, IoError };
+pub const NamedToolError = error{ InvalidToolName, InvalidArguments, IoError, Cancelled };
 
 pub const ToolDef = struct {
     name: []const u8,
@@ -59,6 +107,10 @@ pub fn list() []const []const u8 {
     var names: [definitions.len][]const u8 = undefined;
     for (definitions, 0..) |d, i| names[i] = d.name;
     return names[0..];
+}
+
+pub fn isReadToolName(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read");
 }
 
 pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
@@ -300,21 +352,21 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
 
     // Subagent tools
     if (std.mem.eql(u8, name, "subagent_spawn")) {
-        const A = struct { 
-            @"type": ?[]const u8 = null,
+        const A = struct {
+            type: ?[]const u8 = null,
             description: ?[]const u8 = null,
             context: ?[]const u8 = null,
         };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
-        
-        const task_type_str = p.value.@"type" orelse return NamedToolError.InvalidArguments;
+
+        const task_type_str = p.value.type orelse return NamedToolError.InvalidArguments;
         const desc = p.value.description orelse return NamedToolError.InvalidArguments;
-        
+
         const task_type = subagent.parseSubagentType(task_type_str) orelse {
             return std.fmt.allocPrint(allocator, "Invalid subagent type: '{s}'. Valid types: coder, researcher, editor, tester, git", .{task_type_str});
         };
-        
+
         if (subagent_manager) |sm| {
             const id = sm.createTask(task_type, desc, p.value.context) catch |err| {
                 return std.fmt.allocPrint(allocator, "Failed to create subagent task: {s}", .{@errorName(err)});
@@ -333,9 +385,9 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const A = struct { id: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
-        
+
         const id = p.value.id orelse return NamedToolError.InvalidArguments;
-        
+
         if (subagent_manager) |sm| {
             if (sm.getTask(id)) |task| {
                 if (task.result) |r| {
@@ -383,9 +435,9 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const A = struct { id: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
-        
+
         const id = p.value.id orelse return NamedToolError.InvalidArguments;
-        
+
         if (subagent_manager) |sm| {
             if (sm.updateStatus(id, .cancelled)) {
                 return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":\"cancelled\"}}", .{id});
@@ -538,7 +590,7 @@ fn replaceTextStrict(allocator: std.mem.Allocator, original: []const u8, find: [
     }
     if (!replace_all and matches > 1) return NamedToolError.InvalidArguments;
 
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var cursor: usize = 0;
@@ -553,9 +605,9 @@ fn replaceTextStrict(allocator: std.mem.Allocator, original: []const u8, find: [
 }
 
 fn replaceByTrimmedLines(allocator: std.mem.Allocator, original: []const u8, find: []const u8, repl: []const u8) !?[]u8 {
-    var original_lines = std.ArrayList([]const u8).empty;
+    var original_lines: std.ArrayList([]const u8) = .empty;
     defer original_lines.deinit(allocator);
-    var find_lines = std.ArrayList([]const u8).empty;
+    var find_lines: std.ArrayList([]const u8) = .empty;
     defer find_lines.deinit(allocator);
 
     var oit = std.mem.splitScalar(u8, original, '\n');
@@ -625,7 +677,7 @@ fn zigFmtDiagnostics(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
 }
 
 fn collectPatchDiagnostics(allocator: std.mem.Allocator, patch_text: []const u8) !?[]u8 {
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, patch_text, '\n');
@@ -666,7 +718,7 @@ const HunkLine = struct {
 };
 
 fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
-    var lines = std.ArrayList([]const u8).empty;
+    var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, patch_text, '\n');
@@ -687,7 +739,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
     if (end_idx == null or end_idx.? <= 0) return NamedToolError.InvalidArguments;
 
     var i: usize = 1;
-    var summary = std.ArrayList(u8).empty;
+    var summary: std.ArrayList(u8) = .empty;
     defer summary.deinit(allocator);
 
     while (i < end_idx.?) {
@@ -701,7 +753,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
             const path = std.mem.trim(u8, line[14..], " \t");
             i += 1;
 
-            var content_lines = std.ArrayList([]const u8).empty;
+            var content_lines: std.ArrayList([]const u8) = .empty;
             defer content_lines.deinit(allocator);
             while (i < end_idx.? and !std.mem.startsWith(u8, lines.items[i], "*** ")) : (i += 1) {
                 const cl = lines.items[i];
@@ -738,7 +790,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
             defer allocator.free(original);
             const original_trailing_nl = original.len > 0 and original[original.len - 1] == '\n';
 
-            var original_lines = std.ArrayList([]const u8).empty;
+            var original_lines: std.ArrayList([]const u8) = .empty;
             defer original_lines.deinit(allocator);
             var oit = std.mem.splitScalar(u8, original, '\n');
             while (oit.next()) |raw| {
@@ -748,7 +800,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
                 _ = original_lines.pop();
             }
 
-            var out_lines = std.ArrayList([]const u8).empty;
+            var out_lines: std.ArrayList([]const u8) = .empty;
             defer out_lines.deinit(allocator);
             var cursor: usize = 0;
 
@@ -760,7 +812,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
                 if (!std.mem.startsWith(u8, lines.items[i], "@@")) return NamedToolError.InvalidArguments;
                 i += 1;
 
-                var hunk = std.ArrayList(HunkLine).empty;
+                var hunk: std.ArrayList(HunkLine) = .empty;
                 defer hunk.deinit(allocator);
                 while (i < end_idx.? and !std.mem.startsWith(u8, lines.items[i], "@@") and !std.mem.startsWith(u8, lines.items[i], "*** ")) : (i += 1) {
                     const hl = lines.items[i];
@@ -841,7 +893,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
 }
 
 fn joinLines(allocator: std.mem.Allocator, lines: []const []const u8, trailing_newline: bool) ![]u8 {
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     for (lines, 0..) |line, idx| {
         try out.appendSlice(allocator, line);
@@ -858,9 +910,9 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
         return allocator.dupe(u8, "(no textual change)\n");
     }
 
-    var before_lines = std.ArrayList([]const u8).empty;
+    var before_lines: std.ArrayList([]const u8) = .empty;
     defer before_lines.deinit(allocator);
-    var after_lines = std.ArrayList([]const u8).empty;
+    var after_lines: std.ArrayList([]const u8) = .empty;
     defer after_lines.deinit(allocator);
 
     var bit = std.mem.splitScalar(u8, before, '\n');
@@ -885,7 +937,7 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
         as -= 1;
     }
 
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     const c_reset = "\x1b[0m";
@@ -910,9 +962,9 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
 fn countEditedLines(before: []const u8, after: []const u8) usize {
     if (std.mem.eql(u8, before, after)) return 0;
 
-    var before_lines = std.ArrayList([]const u8).empty;
+    var before_lines: std.ArrayList([]const u8) = .empty;
     defer before_lines.deinit(std.heap.page_allocator);
-    var after_lines = std.ArrayList([]const u8).empty;
+    var after_lines: std.ArrayList([]const u8) = .empty;
     defer after_lines.deinit(std.heap.page_allocator);
 
     var bit = std.mem.splitScalar(u8, before, '\n');
@@ -951,7 +1003,7 @@ fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    var out = std.ArrayList(u8).empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     const w = out.writer(allocator);
 
