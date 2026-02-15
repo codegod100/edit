@@ -21,6 +21,12 @@ const cancel = @import("../cancel.zig");
 const line_editor = @import("../line_editor.zig");
 
 pub fn run(allocator: std.mem.Allocator) !void {
+    // Arena for provider specs that live for the entire session
+    var provider_arena = std.heap.ArenaAllocator.init(allocator);
+    defer provider_arena.deinit();
+    const provider_alloc = provider_arena.allocator();
+    // Arena for provider specs that live for the entire session
+
     const stdin_file = line_editor.stdInFile();
     const stdout_file = line_editor.stdOutFile();
     // Use reader/writer directly
@@ -42,7 +48,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     try std.fs.cwd().makePath(config_dir);
 
     // Load initial data
-    const providers = try catalog.loadProviderSpecs(allocator, config_dir);
+    const providers = try catalog.loadProviderSpecs(provider_alloc, config_dir);
     // Providers are static configuration, but we might want them in state.
     // Spec says []const ProviderSpec. We can keep it.
 
