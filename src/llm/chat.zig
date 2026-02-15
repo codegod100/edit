@@ -155,9 +155,6 @@ fn chatGeneric(
     const config = providers.getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, tool_defs, reasoning_effort);
     defer allocator.free(body);
-    
-    // Debug: print request body
-    std.debug.print("DEBUG: Request body (first 500 chars): {s}\n", .{body[0..@min(body.len, 500)]});
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
@@ -306,9 +303,6 @@ fn buildChatBodyForRouting(
 }
 
 fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatResponse {
-    // Debug: print raw response
-    std.debug.print("DEBUG: Raw response (first 500 chars): {s}\n", .{raw[0..@min(raw.len, 500)]});
-    
     const Resp = struct {
         choices: ?[]const struct {
             message: struct {
