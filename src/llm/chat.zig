@@ -155,6 +155,8 @@ fn chatGeneric(
     const config = providers.getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, tool_defs, reasoning_effort);
     defer allocator.free(body);
+    
+    std.log.debug("Request to {s}: {s}", .{config.endpoint, body});
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
@@ -172,6 +174,11 @@ fn chatGeneric(
 
     const raw = try client.httpRequest(allocator, .POST, config.endpoint, headers, extra_headers.items, body);
     defer allocator.free(raw);
+    
+    if (raw.len == 0) {
+        std.log.err("Empty response from {s}", .{config.endpoint});
+        return types.QueryError.ModelProviderError;
+    }
 
     return parseChatResponse(allocator, raw);
 }
@@ -324,7 +331,13 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
         } = null,
     };
 
-    var parsed = std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true }) catch return types.QueryError.ModelResponseParseError;
+    var parsed = std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true }) catch |err| {
+        std.log.err("Failed to parse model response: {s}", .{@errorName(err)});
+        if (raw.len > 0) {
+            std.log.err("Raw response (first 500 chars): {s}", .{raw[0..@min(raw.len, 500)]});
+        }
+        return types.QueryError.ModelResponseParseError;
+    };
     defer parsed.deinit();
 
     if (parsed.value.@"error") |e| {
