@@ -155,8 +155,6 @@ fn chatGeneric(
     const config = providers.getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, tool_defs, reasoning_effort);
     defer allocator.free(body);
-    
-    std.log.debug("Request to {s}: {s}", .{config.endpoint, body});
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
