@@ -12,7 +12,9 @@ pub const ToolDef = struct {
 };
 
 const DEFAULT_READ_OFFSET: usize = 0;
-const DEFAULT_READ_LIMIT: usize = 4096;
+// Default to the maximum bounded chunk so the model doesn't accidentally
+// "read-spam" via tiny default chunks when it omits/zeros the limit.
+const DEFAULT_READ_LIMIT: usize = 16384;
 const MAX_READ_LIMIT: usize = 16384;
 const MAX_EDIT_LINES_WITHOUT_CONFIRM: usize = 100;
 

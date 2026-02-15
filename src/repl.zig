@@ -2962,6 +2962,7 @@ fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
 }
 
 fn inferToolCallWithModel(allocator: std.mem.Allocator, stdout: anytype, active: ActiveModel, input: []const u8, force: bool) !?llm.ToolRouteCall {
+    _ = stdout;
     var defs = try std.ArrayList(llm.ToolRouteDef).initCapacity(allocator, tools.definitions.len);
     defer defs.deinit(allocator);
 
@@ -2971,13 +2972,7 @@ fn inferToolCallWithModel(allocator: std.mem.Allocator, stdout: anytype, active:
 
     const result = try llm.inferToolCallWithThinking(allocator, active.provider_id, active.api_key, active.model_id, input, defs.items, force);
     if (result) |r| {
-        // Print thinking content if available
-        if (r.thinking) |thinking| {
-            defer allocator.free(thinking);
-            if (thinking.len > 0) {
-                try stdout.print("\x1b[90m[thinking: {s}]\x1b[0m ", .{thinking});
-            }
-        }
+        if (r.thinking) |thinking| allocator.free(thinking);
         return r.call;
     }
     return null;
@@ -4035,6 +4030,11 @@ fn runModel(
     subagent_manager: ?*subagent.SubagentManager,
 ) !RunTurnResult {
     const mutation_request = isLikelyFileMutationRequest(raw_user_request);
+    const allow_read_first = containsIgnoreCase(raw_user_request, "src/") or
+        containsIgnoreCase(raw_user_request, ".zig") or
+        containsIgnoreCase(raw_user_request, "build.zig") or
+        (std.mem.indexOfScalar(u8, raw_user_request, '@') != null) or
+        (std.mem.indexOfScalar(u8, raw_user_request, '/') != null and std.mem.indexOfScalar(u8, raw_user_request, '.') != null);
 
     // Check API key
     if (active.api_key == null and !std.mem.eql(u8, active.provider_id, "opencode")) {
@@ -4054,7 +4054,7 @@ fn runModel(
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent, an AI coding assistant. Use the function-call tool interface for any tool usage. If no more external tools are needed, call the 'respond_text' tool with your final user-facing answer. Prefer bash with rg first to locate files/symbols. For read_file/read, include explicit offset+limit and use bounded chunks for large files instead of full-file reads. Avoid repeating identical tool calls; reuse prior results when possible. Do not call todo_list; the current todo state is already provided.");
+    try writeJsonString(w, "You are zagent, an AI coding assistant. Use the function-call tool interface for any tool usage. If no more external tools are needed, call the 'respond_text' tool with your final user-facing answer. For repository work: unless the user gives an explicit target file path, start with bash using rg to locate files/symbols; do not start by reading random files. After rg, read only the most relevant file(s) with explicit offset+limit and use bounded chunks for large files instead of broad scans. Avoid repeating identical tool calls; reuse prior results when possible. Do not call todo_list; the current todo state is already provided.");
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");
@@ -4072,6 +4072,7 @@ fn runModel(
     defer if (last_todo_guidance) |v| allocator.free(v);
     var rejected_repeated_bash: usize = 0;
     var rejected_repeated_other: usize = 0;
+    var has_searched: bool = false;
     var paths = std.ArrayList([]u8).empty;
     defer {
         for (paths.items) |p| allocator.free(p);
@@ -4240,11 +4241,30 @@ fn runModel(
             }
 
             tool_calls += 1;
+
+            // Guardrail: if we don't have a concrete target file, don't let the model "blind read" files
+            // before a search. This is the main cause of read-spam on repo questions.
+            if (isReadToolName(tc.tool) and !has_searched and !allow_read_first) {
+                try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.writeAll(",\"content\":");
+                try w.print(
+                    "{f}",
+                    .{std.json.fmt("Tool call rejected: run bash with rg to locate the right files/symbols first. Do not read files until after you have search results (unless the user provided an explicit file path).", .{})},
+                );
+                try w.writeAll("}");
+                continue;
+            }
+
             // Compact tool output: • Ran tool args
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 if (parseBashCommandFromArgs(allocator, tc.args)) |cmd| {
                     defer allocator.free(cmd);
                     try stdout.print("• Ran {s}\n", .{cmd});
+
+                    const c = std.mem.trim(u8, cmd, " \t\r\n");
+                    const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
+                    if (is_rg) has_searched = true;
                 } else {
                     try stdout.print("• Ran {s}\n", .{tc.tool});
                 }
