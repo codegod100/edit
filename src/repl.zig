@@ -1145,7 +1145,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     // Initialize subagent manager for task delegation.
     // Use a thread-safe allocator because subagents can run in background threads.
-    var subagent_manager = subagent.SubagentManager.init(std.heap.c_allocator);
+    // Avoid c_allocator to keep the build libc-free.
+    var subagent_manager = subagent.SubagentManager.init(std.heap.page_allocator);
     defer subagent_manager.deinit();
     // Session-scoped subagents: do not persist across runs.
 
@@ -2112,7 +2113,7 @@ fn buildSubagentSystemPrompt(allocator: std.mem.Allocator, task_type: subagent.S
 }
 
 fn subagentThreadMain(args_ptr: *SubagentThreadArgs) void {
-    const allocator = std.heap.c_allocator;
+    const allocator = std.heap.page_allocator;
     defer {
         args_ptr.deinit(allocator);
         allocator.destroy(args_ptr);
@@ -2155,7 +2156,7 @@ fn subagentThreadMain(args_ptr: *SubagentThreadArgs) void {
         return;
     }
 
-    const result = runModel(
+    var result = runModel(
         allocator,
         &out,
         args.active,
@@ -4479,7 +4480,7 @@ fn runModel(
                     continue;
                 };
 
-                const args_ptr = std.heap.c_allocator.create(SubagentThreadArgs) catch null;
+                const args_ptr = std.heap.page_allocator.create(SubagentThreadArgs) catch null;
                 if (args_ptr == null) {
                     const msg = "{\"error\":\"Failed to allocate subagent runner\"}";
                     try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
@@ -4490,23 +4491,23 @@ fn runModel(
                     continue;
                 }
 
-                const id_owned = std.heap.c_allocator.dupe(u8, id) catch null;
-                const desc_owned = std.heap.c_allocator.dupe(u8, desc) catch null;
-                const ctx_owned = if (p.value.context) |c| std.heap.c_allocator.dupe(u8, c) catch null else null;
-                const prov_owned = std.heap.c_allocator.dupe(u8, active.provider_id) catch null;
-                const model_owned = std.heap.c_allocator.dupe(u8, active.model_id) catch null;
-                const key_owned = if (active.api_key) |k| std.heap.c_allocator.dupe(u8, k) catch null else null;
-                const effort_owned = if (active.reasoning_effort) |e| std.heap.c_allocator.dupe(u8, e) catch null else null;
+                const id_owned = std.heap.page_allocator.dupe(u8, id) catch null;
+                const desc_owned = std.heap.page_allocator.dupe(u8, desc) catch null;
+                const ctx_owned = if (p.value.context) |c| std.heap.page_allocator.dupe(u8, c) catch null else null;
+                const prov_owned = std.heap.page_allocator.dupe(u8, active.provider_id) catch null;
+                const model_owned = std.heap.page_allocator.dupe(u8, active.model_id) catch null;
+                const key_owned = if (active.api_key) |k| std.heap.page_allocator.dupe(u8, k) catch null else null;
+                const effort_owned = if (active.reasoning_effort) |e| std.heap.page_allocator.dupe(u8, e) catch null else null;
 
                 if (id_owned == null or desc_owned == null or prov_owned == null or model_owned == null) {
-                    if (id_owned) |v| std.heap.c_allocator.free(v);
-                    if (desc_owned) |v| std.heap.c_allocator.free(v);
-                    if (ctx_owned) |v| std.heap.c_allocator.free(v);
-                    if (prov_owned) |v| std.heap.c_allocator.free(v);
-                    if (model_owned) |v| std.heap.c_allocator.free(v);
-                    if (key_owned) |v| std.heap.c_allocator.free(v);
-                    if (effort_owned) |v| std.heap.c_allocator.free(v);
-                    std.heap.c_allocator.destroy(args_ptr.?);
+                    if (id_owned) |v| std.heap.page_allocator.free(v);
+                    if (desc_owned) |v| std.heap.page_allocator.free(v);
+                    if (ctx_owned) |v| std.heap.page_allocator.free(v);
+                    if (prov_owned) |v| std.heap.page_allocator.free(v);
+                    if (model_owned) |v| std.heap.page_allocator.free(v);
+                    if (key_owned) |v| std.heap.page_allocator.free(v);
+                    if (effort_owned) |v| std.heap.page_allocator.free(v);
+                    std.heap.page_allocator.destroy(args_ptr.?);
                     const msg = "{\"error\":\"Failed to allocate subagent strings\"}";
                     try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
                     try w.print("{f}", .{std.json.fmt(tc.id, .{})});
@@ -4531,8 +4532,8 @@ fn runModel(
                 };
 
                 const th = std.Thread.spawn(.{}, subagentThreadMain, .{args_ptr.?}) catch |err| {
-                    args_ptr.?.deinit(std.heap.c_allocator);
-                    std.heap.c_allocator.destroy(args_ptr.?);
+                    args_ptr.?.deinit(std.heap.page_allocator);
+                    std.heap.page_allocator.destroy(args_ptr.?);
                     const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to start subagent thread: {s}\"}}", .{@errorName(err)});
                     defer allocator.free(msg);
                     try w.writeAll(",{\"role\":\"tool\",\"tool_call_id\":");
