@@ -36,7 +36,11 @@ fn httpRequestThread(ctx: *HttpRequestContext) void {
     });
 
     if (result) |res| {
-        std.log.debug("HTTP status: {d}", .{@intFromEnum(res.status)});
+        const status = @intFromEnum(res.status);
+        std.log.debug("HTTP status: {d}, body len: {d}", .{status, out.items.len});
+        if (out.items.len > 0) {
+            std.log.debug("Response preview: {s}", .{out.items[0..@min(out.items.len, 200)]});
+        }
         const data = out.toOwnedSlice(ctx.allocator) catch {
             out.deinit(ctx.allocator);
             ctx.result = .{ .err = types.QueryError.OutOfMemory };
