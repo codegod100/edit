@@ -53,7 +53,7 @@ The primary goal is to refactor and organize the codebase by breaking down monol
 
 Current file sizes vs 500-line target:
 - `src/ai_bridge.zig`: **~1268 lines -> 9 files** ✅ **COMPLETE** - modularized into ai_bridge/
-- `src/model_loop.zig`: **1105 lines** (2.2x target) - 🔄 IN PROGRESS - structure created, code migration pending
+- `src/model_loop.zig`: **~1105 lines -> 6 files** ✅ **COMPLETE** - modularized into model_loop/
 
 #### Proposed `src/ai_bridge/` module structure:
 | File | Contents | Est. Lines |
@@ -99,29 +99,26 @@ Successfully split 1,268-line ai_bridge.zig into 9 focused files (~140 lines eac
 - All imports updated to use correct relative paths (`../` for parent modules)
 - Build passes with Zig 0.15.x
 
-#### `src/model_loop/` - IN PROGRESS 🔄
-Module structure created (5 files):
+#### `src/model_loop/` - COMPLETE ✅
+Module structure created (6 files):
 
 | File | Contents | Status |
 |------|----------|--------|
-| `types.zig` | SubagentThreadArgs, RunTurnResult types | ✅ Complete |
+| `types.zig` | SubagentThreadArgs type definition | ✅ Complete |
 | `turn.zig` | runModelTurnWithTools (~350 lines) | ✅ Complete |
-| `legacy.zig` | runModel function (~450 lines) | 🔄 Migrating |
-| `tools.zig` | executeInlineToolCalls | ✅ Complete |
+| `legacy.zig` | runModel function (~450 lines) | ✅ Complete |
+| `tools.zig` | executeInlineToolCalls utility | ✅ Complete |
 | `subagent.zig` | Subagent thread handling | ✅ Complete |
-| `main.zig` | Public module exports | 🔄 In Progress |
+| `main.zig` | Public module exports | ✅ Complete |
 
-**Migration Strategy**:
-1. ✅ Extract `runModelTurnWithTools` to `turn.zig` (DONE)
-2. 🔄 Extract `runModel` to `legacy.zig` (IN PROGRESS)
-3. 🔄 Update `model_loop.zig` to re-export from module files
-4. 🔄 Update `main.zig` with proper public exports
-5. ⏳ Test build and fix any import issues
+**Migration**: `model_loop.zig` now serves as backward-compatible wrapper.
 
 ### Next Steps
-1.  ✅ ~~Create `src/ai_bridge/` module~~ - **COMPLETED**
-2.  🔄 **Complete `src/model_loop/` module**: Migrate code from model_loop.zig to module files
-3.  **Test after each split**: Ensure build continues to work
+1.  ✅ ~~Create `src/ai_bridge/` module~~ - **COMPLETED** (9 files, ~140 lines each)
+2.  ✅ ~~Complete `src/model_loop/` module~~ - **COMPLETED** (6 files, ~150-450 lines each)
+3.  ✅ ~~Test after each split~~ - **BUILD PASSES**
+
+**Status**: All major modularization work complete. Both `ai_bridge` and `model_loop` have been successfully split from monolithic files into focused modules.
 
 ## References
 *   `src/repl/` directory: New home for REPL logic.
