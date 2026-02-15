@@ -1,5 +1,6 @@
 const std = @import("std");
 const todo = @import("todo.zig");
+const subagent = @import("subagent.zig");
 
 pub const ToolError = error{InvalidToolCommand};
 pub const NamedToolError = error{ InvalidToolName, InvalidArguments, IoError };
@@ -35,6 +36,12 @@ pub const definitions = [_]ToolDef{
     .{ .name = "todo_list", .description = "List all todo items with their current status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
     .{ .name = "todo_remove", .description = "Remove a todo item by ID.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID to remove\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
     .{ .name = "todo_clear_done", .description = "Clear all completed todo items.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
+    // Subagent tools for task delegation
+    .{ .name = "subagent_spawn", .description = "Spawn a specialized subagent to handle a specific task. Types: coder, researcher, editor, tester, git.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"description\":\"Subagent type: coder, researcher, editor, tester, or git\"},\"description\":{\"type\":\"string\",\"description\":\"Task description for the subagent\"},\"context\":{\"type\":\"string\",\"description\":\"Optional context from parent agent\"}},\"required\":[\"type\",\"description\"],\"additionalProperties\":false}" },
+    .{ .name = "subagent_status", .description = "Check the status of a subagent task.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Subagent task ID\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
+    .{ .name = "subagent_list", .description = "List all subagent tasks and their status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
+    .{ .name = "subagent_cancel", .description = "Cancel a running subagent task.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Subagent task ID to cancel\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
+    .{ .name = "subagent_clear", .description = "Clear completed or failed subagent tasks.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
 };
 
 pub fn list() []const []const u8 {
@@ -79,7 +86,7 @@ pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     return ToolError.InvalidToolCommand;
 }
 
-pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList) ![]u8 {
+pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList, subagent_manager: ?*subagent.SubagentManager) ![]u8 {
     if (std.mem.eql(u8, name, "bash")) {
         const A = struct { command: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
@@ -287,6 +294,84 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     if (std.mem.eql(u8, name, "todo_clear_done")) {
         todo_list.clearDone();
         return std.fmt.allocPrint(allocator, "Cleared all completed todos", .{});
+    }
+
+    // Subagent tools
+    if (std.mem.eql(u8, name, "subagent_spawn")) {
+        const A = struct { 
+            @"type": ?[]const u8 = null,
+            description: ?[]const u8 = null,
+            context: ?[]const u8 = null,
+        };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        
+        const task_type_str = p.value.@"type" orelse return NamedToolError.InvalidArguments;
+        const desc = p.value.description orelse return NamedToolError.InvalidArguments;
+        
+        const task_type = subagent.parseSubagentType(task_type_str) orelse {
+            return std.fmt.allocPrint(allocator, "Invalid subagent type: '{s}'. Valid types: coder, researcher, editor, tester, git", .{task_type_str});
+        };
+        
+        if (subagent_manager) |sm| {
+            const id = sm.createTask(task_type, desc, p.value.context) catch |err| {
+                return std.fmt.allocPrint(allocator, "Failed to create subagent task: {s}", .{@errorName(err)});
+            };
+            const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
+            return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":\"pending\",\"type\":\"{s}\",\"system_prompt\":\"{s}\"}}", .{ id, task_type_str, sys_prompt });
+        }
+        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
+    }
+
+    if (std.mem.eql(u8, name, "subagent_status")) {
+        const A = struct { id: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        
+        const id = p.value.id orelse return NamedToolError.InvalidArguments;
+        
+        if (subagent_manager) |sm| {
+            if (sm.getTask(id)) |task| {
+                const result_json = if (task.result) |r| r else "null";
+                return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":\"{s}\",\"result\":{s},\"tool_calls\":{d}}}", .{ task.id, @tagName(task.task_type), @tagName(task.status), task.description, result_json, task.tool_calls });
+            }
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"Task not found: {s}\"}}", .{id});
+        }
+        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
+    }
+
+    if (std.mem.eql(u8, name, "subagent_list")) {
+        if (subagent_manager) |sm| {
+            const tasks_json = sm.listTasks(allocator) catch |err| {
+                return std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to list tasks: {s}\"}}", .{@errorName(err)});
+            };
+            return tasks_json;
+        }
+        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
+    }
+
+    if (std.mem.eql(u8, name, "subagent_cancel")) {
+        const A = struct { id: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        
+        const id = p.value.id orelse return NamedToolError.InvalidArguments;
+        
+        if (subagent_manager) |sm| {
+            if (sm.updateStatus(id, .cancelled)) {
+                return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":\"cancelled\"}}", .{id});
+            }
+            return std.fmt.allocPrint(allocator, "{{\"error\":\"Task not found: {s}\"}}", .{id});
+        }
+        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
+    }
+
+    if (std.mem.eql(u8, name, "subagent_clear")) {
+        if (subagent_manager) |sm| {
+            const cleared = sm.clearDone();
+            return std.fmt.allocPrint(allocator, "{{\"cleared\":{d}}}", .{cleared});
+        }
+        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
     }
 
     return NamedToolError.InvalidToolName;

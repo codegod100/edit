@@ -10,6 +10,7 @@ const catalog = @import("models_catalog.zig");
 const logger = @import("logger.zig");
 const todo = @import("todo.zig");
 const ai_bridge = @import("ai_bridge.zig");
+const subagent = @import("subagent.zig");
 
 // Global cancellation flag for interrupting work
 var g_cancel_requested: bool = false;
@@ -1123,6 +1124,16 @@ pub fn run(allocator: std.mem.Allocator) !void {
     defer history.deinit(allocator);
     try loadHistory(allocator, config_dir, &history);
 
+    // When a model request is running, the user can type ahead. After the request completes,
+    // we non-blocking drain completed lines from stdin and process them before reprompting.
+    var queued_partial = std.ArrayList(u8).empty;
+    defer queued_partial.deinit(allocator);
+    var queued_lines = std.ArrayList([]u8).empty;
+    defer {
+        for (queued_lines.items) |l| allocator.free(l);
+        queued_lines.deinit(allocator);
+    }
+
     var context_window = ContextWindow.init(24 * 1024, 8);
     defer context_window.deinit(allocator);
     // Session-scoped context: start fresh each process run.
@@ -1131,6 +1142,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
     // Session-scoped todos: do not load/save across runs.
+
+    // Initialize subagent manager for task delegation
+    var subagent_manager = subagent.SubagentManager.init(allocator);
+    defer subagent_manager.deinit();
+    // Session-scoped subagents: do not persist across runs.
 
     var selected_model: ?OwnedModelSelection = null;
     defer if (selected_model) |*sel| sel.deinit(allocator);
@@ -1164,7 +1180,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const prompt_text = try buildPrompt(allocator, cwd, active_now, current_effort);
         defer allocator.free(prompt_text);
 
-        const line_opt = try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
+        const line_opt: ?[]u8 = if (queued_lines.items.len > 0)
+            queued_lines.orderedRemove(0)
+        else
+            try readPromptLine(allocator, stdin_file, stdin, stdout, prompt_text, &history);
         if (line_opt == null) {
             try stdout.print("\nExiting: input stream ended (EOF).\n", .{});
             break;
@@ -1657,7 +1676,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildPromptWithMentions(allocator, base_model_input, trimmed);
                 defer allocator.free(model_input);
 
-                const turn_val: RunTurnResult = runModel(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| blk: {
+                if (stdin_file.isTty() and stdout_file.isTty()) {
+                    // Let the user type ahead while the request is running.
+                    try stdout.print("{s}queue>{s} ", .{ C_DIM, C_RESET });
+                }
+
+                const turn_val: RunTurnResult = runModel(allocator, stdout, active.?, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager) catch |err| blk: {
                     if (prompt_todo_id) |id| {
                         _ = todo_list.update(id, .pending) catch false;
                     }
@@ -1696,7 +1720,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
                             const retry_active = chooseActiveModel(providers, provider_states, selected_model, current_effort);
                             if (retry_active) |ra| {
-                                const retry_turn = runModel(allocator, stdout, ra, trimmed, model_input, &todo_list) catch |retry_err| {
+                                const retry_turn = runModel(allocator, stdout, ra, trimmed, model_input, stdout_file.isTty(), &todo_list, &subagent_manager) catch |retry_err| {
                                     if (retry_err == error.ModelProviderError or retry_err == error.ModelResponseMissingChoices) {
                                         if (ai_bridge.getLastProviderError()) |detail| {
                                             try stdout.print("Model query failed: {s} ({s})\n", .{ describeModelQueryError(retry_err), detail });
@@ -1723,6 +1747,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 var turn = turn_val;
                 defer turn.deinit(allocator);
 
+                // Collect any queued commands the user entered while the request was running.
+                drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
+
                 if (prompt_todo_id) |id| {
                     if (turn.error_count == 0) {
                         _ = todo_list.update(id, .done) catch false;
@@ -1745,6 +1772,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     defer allocator.free(rendered);
                     try stdout.print("{s}\n", .{rendered});
                 }
+
+                // Drain again after printing, in case the user queued input during output/tool execution.
+                drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
             },
         }
     }
@@ -1923,6 +1953,51 @@ fn readPromptLineFallback(
         line = try allocator.dupe(u8, next.text);
         cursor_pos = next.cursor_pos;
         try renderLine(stdout, prompt, line, cursor_pos, &rendered_rows, &rendered_cursor_rows);
+    }
+}
+
+fn drainQueuedLinesFromStdin(
+    allocator: std.mem.Allocator,
+    stdin_file: std.fs.File,
+    partial: *std.ArrayList(u8),
+    out_lines: *std.ArrayList([]u8),
+) void {
+    if (!stdin_file.isTty()) return;
+
+    // If the user typed while a request was running, those bytes can be waiting in the kernel buffer.
+    // Drain full lines non-blocking and queue them for the next REPL turn(s).
+    const O_NONBLOCK = if (builtin.os.tag == .linux)
+        @as(u32, 0o4000)
+    else if (builtin.os.tag == .macos)
+        @as(u32, 0x0004)
+    else
+        @as(u32, 0);
+
+    const original_flags = std.posix.fcntl(stdin_file.handle, std.posix.F.GETFL, 0) catch return;
+    _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
+    defer _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
+
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(stdin_file.handle, &buf) catch 0;
+        if (n == 0) break;
+
+        partial.appendSlice(allocator, buf[0..n]) catch break;
+        while (std.mem.indexOfScalar(u8, partial.items, '\n')) |idx| {
+            const raw = partial.items[0..idx];
+            const no_cr = std.mem.trimRight(u8, raw, "\r");
+            const trimmed = std.mem.trim(u8, no_cr, " \t\r\n");
+            if (trimmed.len > 0) {
+                const owned = allocator.dupe(u8, trimmed) catch null;
+                if (owned) |line| {
+                    out_lines.append(allocator, line) catch allocator.free(line);
+                }
+            }
+
+            const rest = partial.items[idx + 1 ..];
+            std.mem.copyForwards(u8, partial.items[0..rest.len], rest);
+            partial.items = partial.items[0..rest.len];
+        }
     }
 }
 
@@ -3211,6 +3286,7 @@ fn executeInlineToolCalls(
     paths: *std.ArrayList([]u8),
     tool_calls: *usize,
     todo_list: *todo.TodoList,
+    subagent_manager: ?*subagent.SubagentManager,
 ) !?[]u8 {
     var result_buf = std.ArrayList(u8).empty;
     defer result_buf.deinit(allocator);
@@ -3260,10 +3336,7 @@ fn executeInlineToolCalls(
             null;
 
         // Execute tool
-        const why = try buildModelWhyLine(allocator, "", response, tool_name, args);
-        defer allocator.free(why);
-        try stdout.print("  {s}Why:{s} {s}\n", .{ C_DIM, C_RESET, why });
-        try printColoredToolEvent(stdout, "tool-inline", null, null, tool_name);
+        try stdout.print("• {s}", .{tool_name});
         if (file_path) |fp| {
             try stdout.print(" {s}file={s}{s}", .{ C_CYAN, fp, C_RESET });
         }
@@ -3284,7 +3357,7 @@ fn executeInlineToolCalls(
         }
         try stdout.print("\n", .{});
 
-        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list) catch |err| {
+        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list, subagent_manager) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
             continue;
         };
@@ -3336,87 +3409,6 @@ fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []const
         .offset = value.offset,
         .limit = value.limit,
     };
-}
-
-fn buildToolWhyLine(allocator: std.mem.Allocator, tool_name: []const u8, arguments_json: []const u8) ![]u8 {
-    if (isReadToolName(tool_name)) {
-        const path = parsePrimaryPathFromArgs(allocator, arguments_json);
-        defer if (path) |p| allocator.free(p);
-        const params = try parseReadParamsFromArgs(allocator, arguments_json);
-        if (path) |p| {
-            if (params) |rp| {
-                return std.fmt.allocPrint(
-                    allocator,
-                    "reading a bounded chunk from {s} (offset={d}, limit={d}) to inspect only relevant sections",
-                    .{ p, rp.offset orelse 0, rp.limit orelse 0 },
-                );
-            }
-            return std.fmt.allocPrint(allocator, "reading {s} to inspect relevant code", .{p});
-        }
-        return allocator.dupe(u8, "reading file content to inspect relevant code");
-    }
-
-    if (std.mem.eql(u8, tool_name, "bash")) {
-        const command = parseBashCommandFromArgs(allocator, arguments_json);
-        defer if (command) |c| allocator.free(c);
-        if (command) |c| {
-            if (std.mem.indexOf(u8, c, "rg ") != null) {
-                return allocator.dupe(u8, "running ripgrep search to quickly locate matching files or symbols");
-            }
-            if (std.mem.indexOf(u8, c, "zig build") != null or std.mem.indexOf(u8, c, "zig run") != null) {
-                return allocator.dupe(u8, "running Zig command to verify behavior and catch regressions");
-            }
-            return std.fmt.allocPrint(allocator, "running shell command to gather evidence: {s}", .{c});
-        }
-        return allocator.dupe(u8, "running shell command to gather evidence");
-    }
-
-    if (isMutatingToolName(tool_name)) {
-        const path = parsePrimaryPathFromArgs(allocator, arguments_json);
-        defer if (path) |p| allocator.free(p);
-        if (path) |p| {
-            return std.fmt.allocPrint(allocator, "modifying {s} to implement the requested change", .{p});
-        }
-        return allocator.dupe(u8, "modifying files to implement the requested change");
-    }
-
-    if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) {
-        return allocator.dupe(u8, "listing directory entries to discover candidate files");
-    }
-
-    return std.fmt.allocPrint(allocator, "executing tool {s} to progress the task", .{tool_name});
-}
-
-fn firstModelWhyLineFromText(text: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        if (std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
-        if (std.mem.eql(u8, trimmed, "DONE")) continue;
-        return trimmed;
-    }
-    return null;
-}
-
-fn extractModelWhyLine(model_reasoning: []const u8, model_text: []const u8) ?[]const u8 {
-    const reasoning = std.mem.trim(u8, model_reasoning, " \t\r\n");
-    if (reasoning.len > 0) return reasoning;
-    return firstModelWhyLineFromText(model_text);
-}
-
-fn buildModelWhyLine(
-    allocator: std.mem.Allocator,
-    model_reasoning: []const u8,
-    model_text: []const u8,
-    tool_name: []const u8,
-    arguments_json: []const u8,
-) ![]u8 {
-    if (extractModelWhyLine(model_reasoning, model_text)) |line| {
-        return allocator.dupe(u8, line);
-    }
-
-    return buildToolWhyLine(allocator, tool_name, arguments_json);
 }
 
 fn isMarkdownTableSeparatorRow(line: []const u8) bool {
@@ -3727,8 +3719,6 @@ fn runModelTurnWithTools(
         // Skip this check if we just received a TOOL_CALL (model wants to continue)
         if (step >= soft_limit and !just_received_tool_call) {
             const todo_summary = todo_list.summary();
-            try stdout.print("{s}[step {d}] Checking if more work needed... (todos: {s}){s}\n", .{ C_DIM, step, todo_summary, C_RESET });
-
             const continue_prompt = try std.fmt.allocPrint(
                 allocator,
                 "{s}\n\n[SYSTEM] You have completed {d} tool steps. Todo status: {s}.\n\nDo you need more steps to complete the task? If yes, make another tool call. If no, provide the final answer.",
@@ -3741,7 +3731,6 @@ fn runModelTurnWithTools(
 
             // If model returns TOOL_CALL, continue the loop
             if (std.mem.startsWith(u8, check_response, "TOOL_CALL ")) {
-                try stdout.print("{s}[step {d}] Model requests more steps{s}\n", .{ C_CYAN, step, C_RESET });
                 allocator.free(context_prompt);
                 context_prompt = try allocator.dupe(u8, check_response);
                 allocator.free(check_response);
@@ -3750,7 +3739,6 @@ fn runModelTurnWithTools(
             }
 
             // Model gave final answer, return it
-            try stdout.print("{s}[step {d}] Model provides final answer{s}\n", .{ C_GREEN, step, C_RESET });
             allocator.free(context_prompt);
             return .{
                 .response = check_response,
@@ -3760,12 +3748,9 @@ fn runModelTurnWithTools(
             };
         }
 
-        try stdout.print("{s}[step {d}]{s} ", .{ C_DIM, step, C_RESET });
-
         const route_prompt = try buildToolRoutingPrompt(allocator, context_prompt);
         defer allocator.free(route_prompt);
 
-        try stdout.print("{s}··{s} ", .{ C_DIM, C_RESET });
         var routed = try inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
@@ -3851,7 +3836,7 @@ fn runModelTurnWithTools(
             // Check if response contains inline tool calls (TOOL_CALL format)
             if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
                 // Execute inline tool calls from model response
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list, null);
                 allocator.free(final);
 
                 if (tool_result) |result| {
@@ -3897,7 +3882,7 @@ fn runModelTurnWithTools(
 
             // Check for inline tool calls
             if (std.mem.startsWith(u8, final, "TOOL_CALL ")) {
-                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list);
+                const tool_result = try executeInlineToolCalls(allocator, stdout, final, &paths, &tool_calls, todo_list, null);
                 allocator.free(final);
                 if (tool_result) |result| {
                     allocator.free(result);
@@ -3963,7 +3948,7 @@ fn runModelTurnWithTools(
         // Extract file path for file-related tools
         const file_path = parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
 
-        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
+        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list, null) catch |err| {
             const failed_ms = std.time.milliTimestamp();
             const duration_ms = failed_ms - started_ms;
             const err_line = try buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);
@@ -3995,6 +3980,36 @@ fn runModelTurnWithTools(
             // For mutating tools, show the full output including the colored diff
             try printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
             try stdout.print("{s}\n", .{tool_out});
+        } else if (isReadToolName(routed.?.tool)) {
+            // For read tools, show first few lines with truncation indicator
+            try printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
+            const max_lines: usize = 15;
+            var lines_shown: usize = 0;
+            var pos: usize = 0;
+            var truncated = false;
+            
+            // Find position after max_lines
+            while (pos < tool_out.len and lines_shown < max_lines) {
+                if (tool_out[pos] == '\n') {
+                    lines_shown += 1;
+                }
+                pos += 1;
+            }
+            
+            if (pos < tool_out.len) {
+                truncated = true;
+            }
+            
+            if (truncated) {
+                // Count total lines
+                var total_lines: usize = 1;
+                for (tool_out) |ch| {
+                    if (ch == '\n') total_lines += 1;
+                }
+                try stdout.print("{s}\n[...truncated, showing {d} of {d} lines]\n", .{ tool_out[0..pos], max_lines, total_lines });
+            } else {
+                try stdout.print("{s}\n", .{tool_out});
+            }
         }
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
@@ -4015,7 +4030,9 @@ fn runModel(
     active: ActiveModel,
     raw_user_request: []const u8,
     user_input: []const u8,
+    stdout_is_tty: bool,
     todo_list: *todo.TodoList,
+    subagent_manager: ?*subagent.SubagentManager,
 ) !RunTurnResult {
     const mutation_request = isLikelyFileMutationRequest(raw_user_request);
 
@@ -4032,14 +4049,12 @@ fn runModel(
     }
     const api_key = active.api_key orelse "";
 
-    try stdout.print("{s}Thinking...{s}\n", .{ C_DIM, C_RESET });
-
     // Build initial messages
     var messages = std.ArrayList(u8).empty;
     defer messages.deinit(allocator);
     const w = messages.writer(allocator);
     try w.writeAll("[{\"role\":\"system\",\"content\":\"");
-    try writeJsonString(w, "You are zagent, an AI coding assistant. Every response should include exactly one short rationale line prefixed with 'WHY:' and exactly one tool call. If no more external tools are needed, use the 'respond_text' tool call with your final answer text. Prefer bash with rg first to locate files/symbols. For read_file/read, always include explicit offset and limit; use bisection-style bounded chunks for large files instead of full-file reads. Avoid repeating the same tool call (especially identical bash commands); if the state has not changed, choose a different next step or finish with respond_text. Do not call todo_list; the current todo state is already provided to you every step.");
+    try writeJsonString(w, "You are zagent, an AI coding assistant. Use the function-call tool interface for any tool usage. If no more external tools are needed, call the 'respond_text' tool with your final user-facing answer. Prefer bash with rg first to locate files/symbols. For read_file/read, include explicit offset+limit and use bounded chunks for large files instead of full-file reads. Avoid repeating identical tool calls; reuse prior results when possible. Do not call todo_list; the current todo state is already provided.");
     try w.writeAll("\"},{\"role\":\"user\",\"content\":\"");
     try writeJsonString(w, user_input);
     try w.writeAll("\"}");
@@ -4067,20 +4082,6 @@ fn runModel(
     var iteration: usize = 0;
 
     while (iteration < max_iterations) : (iteration += 1) {
-        // Check for cancellation
-        if (isCancelled()) {
-            try stdout.print("{s}Stop:{s} cancelled by user interrupt.\n", .{ C_DIM, C_RESET });
-            return .{
-                .response = try allocator.dupe(u8, "Operation cancelled by user."),
-                .reasoning = try allocator.dupe(u8, ""),
-                .tool_calls = tool_calls,
-                .error_count = 0,
-                .files_touched = try joinPaths(allocator, paths.items),
-            };
-        }
-
-        try stdout.print("{s}Step {d}:{s}\n", .{ C_DIM, iteration + 1, C_RESET });
-
         // Keep the model grounded with live todo state, but avoid spamming the prompt when it hasn't changed.
         const todo_snapshot = try todo_list.list(allocator);
         defer allocator.free(todo_snapshot);
@@ -4124,8 +4125,9 @@ fn runModel(
             allocator.free(response.tool_calls);
         }
 
-        if (response.reasoning.len > 0) {
-            try stdout.print("{s}{s}{s}\n", .{ C_DIM, response.reasoning, C_RESET });
+        if (stdout_is_tty) {
+            // Keep model/tool output from landing on the user's type-ahead prompt line.
+            try stdout.print("\n", .{});
         }
 
         // Add assistant message to history
@@ -4162,12 +4164,12 @@ fn runModel(
                 if (pseudo_tool) {
                     try w.print(
                         "{f}",
-                        .{std.json.fmt("Do not output pseudo calls like 'Tool: bash {...}'. Return an actual tool call only via the function-call interface, plus one WHY line. If done, call respond_text.", .{})},
+                        .{std.json.fmt("Do not output pseudo calls like 'Tool: bash {...}'. Return an actual tool call only via the function-call interface. If done, call respond_text.", .{})},
                     );
                 } else {
                     try w.print(
                         "{f}",
-                        .{std.json.fmt("Return exactly one rationale line starting with 'WHY:' and exactly one tool call. If you are ready to answer finally, call respond_text with {\"text\":\"...\"}. Do not reply with plain text outside tool calls.", .{})},
+                        .{std.json.fmt("Return at least one tool call via the function-call interface. If you are ready to answer finally, call respond_text with {\"text\":\"...\"}. Do not reply with plain text outside tool calls.", .{})},
                     );
                 }
                 try w.writeAll("}");
@@ -4184,16 +4186,6 @@ fn runModel(
             };
         }
         no_tool_retries = 0;
-
-        if (extractModelWhyLine(response.reasoning, response.text) == null) {
-            try stdout.print("{s}Note:{s} model omitted WHY; using inferred rationale for this step.\n", .{ C_DIM, C_RESET });
-            try w.writeAll(",{\"role\":\"user\",\"content\":");
-            try w.print(
-                "{f}",
-                .{std.json.fmt("Reminder: include one short line starting with 'WHY:' before each tool call in subsequent responses.", .{})},
-            );
-            try w.writeAll("}");
-        }
 
         for (response.tool_calls) |tc| {
             const is_same_as_prev = blk: {
@@ -4248,8 +4240,6 @@ fn runModel(
             }
 
             tool_calls += 1;
-            const why = try buildModelWhyLine(allocator, response.reasoning, response.text, tc.tool, tc.args);
-            defer allocator.free(why);
             // Compact tool output: • Ran tool args
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 if (parseBashCommandFromArgs(allocator, tc.args)) |cmd| {
@@ -4288,7 +4278,7 @@ fn runModel(
                     try w.writeAll("}");
                     continue;
                 }
-                const final_text = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
+                const final_text = tools.executeNamed(allocator, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
                     try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "respond_text arguments were invalid."),
@@ -4298,7 +4288,6 @@ fn runModel(
                         .files_touched = try joinPaths(allocator, paths.items),
                     };
                 };
-                try stdout.print("{s}Stop:{s} model finalized with respond_text tool.\n", .{ C_DIM, C_RESET });
                 return .{
                     .response = final_text,
                     .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -4309,7 +4298,7 @@ fn runModel(
             }
             if (isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
 
-            const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list) catch |err| {
+            const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
                 try stdout.print("{s}  error: {s}{s}\n", .{ C_RED, @errorName(err), C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
@@ -4323,9 +4312,33 @@ fn runModel(
             };
             defer allocator.free(result);
 
-            // Avoid flooding terminal with file contents for read tools.
+            // Show read tool output with truncation (first few lines only)
             if (isReadToolName(tc.tool)) {
-                try stdout.print("  {s}[read output hidden]{s}\n", .{ C_GREY, C_RESET });
+                const max_lines: usize = 10;
+                var lines_shown: usize = 0;
+                var pos: usize = 0;
+                
+                // Find position after max_lines
+                while (pos < result.len and lines_shown < max_lines) {
+                    if (result[pos] == '\n') {
+                        lines_shown += 1;
+                    }
+                    pos += 1;
+                }
+                
+                if (pos < result.len) {
+                    // Truncated - show first max_lines with indicator
+                    var total_lines: usize = 1;
+                    for (result) |ch| {
+                        if (ch == '\n') total_lines += 1;
+                    }
+                    try stdout.print("{s}", .{C_GREY});
+                    try stdout.print("{s}", .{result[0..pos]});
+                    try stdout.print("  [...truncated, showing {d} of {d} lines]{s}\n", .{ max_lines, total_lines, C_RESET });
+                } else {
+                    // Show all content
+                    try stdout.print("{s}{s}{s}\n", .{ C_GREY, result, C_RESET });
+                }
             } else if (result.len > 0) {
                 var it = std.mem.splitScalar(u8, result, '\n');
                 while (it.next()) |line| {
