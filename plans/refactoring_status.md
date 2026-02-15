@@ -100,17 +100,23 @@ Successfully split 1,268-line ai_bridge.zig into 9 focused files (~140 lines eac
 - Build passes with Zig 0.15.x
 
 #### `src/model_loop/` - IN PROGRESS 🔄
-Created initial module structure (4 files):
+Module structure created (5 files):
 
 | File | Contents | Status |
 |------|----------|--------|
-| `types.zig` | SubagentThreadArgs struct | ✅ Created |
-| `subagent.zig` | Subagent thread handling | ✅ Created |
-| `tools.zig` | Tool execution utilities | ✅ Created |
-| `main.zig` | Module documentation | ✅ Created |
+| `types.zig` | SubagentThreadArgs, RunTurnResult types | ✅ Complete |
+| `turn.zig` | runModelTurnWithTools (~350 lines) | ✅ Complete |
+| `legacy.zig` | runModel function (~450 lines) | 🔄 Migrating |
+| `tools.zig` | executeInlineToolCalls | ✅ Complete |
+| `subagent.zig` | Subagent thread handling | ✅ Complete |
+| `main.zig` | Public module exports | 🔄 In Progress |
 
-**Note**: Full code migration from `model_loop.zig` pending due to complex
-interdependencies between `runModel()` and `runModelTurnWithTools()`.
+**Migration Strategy**:
+1. ✅ Extract `runModelTurnWithTools` to `turn.zig` (DONE)
+2. 🔄 Extract `runModel` to `legacy.zig` (IN PROGRESS)
+3. 🔄 Update `model_loop.zig` to re-export from module files
+4. 🔄 Update `main.zig` with proper public exports
+5. ⏳ Test build and fix any import issues
 
 ### Next Steps
 1.  ✅ ~~Create `src/ai_bridge/` module~~ - **COMPLETED**

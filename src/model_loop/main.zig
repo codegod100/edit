@@ -1,16 +1,37 @@
 // model_loop/main.zig - Model execution loop module
 //
 // This module handles the main model execution loop including:
-// - Running model turns with tool support
-// - Executing inline tool calls
-// - Managing subagent threads
-// - Building and processing responses
-//
-// Note: This module is currently being migrated from model_loop.zig.
-// The following files have been created:
-// - types.zig: Type definitions (SubagentThreadArgs)
-// - subagent.zig: Subagent thread handling
-// - tools.zig: Tool execution utilities
-//
-// For now, the main implementation remains in model_loop.zig.
-// This file will be populated as code is migrated incrementally.
+// - runModelTurnWithTools: Tool-based model execution with routing
+// - runModel: Bridge-based model execution using Bun AI SDK
+// - executeInlineToolCalls: Parse and execute inline TOOL_CALL format
+// - SubagentThreadArgs: Types for subagent execution
+
+const std = @import("std");
+
+// Types
+pub const SubagentThreadArgs = @import("types.zig").SubagentThreadArgs;
+
+// Core execution functions
+pub const runModelTurnWithTools = @import("turn.zig").runModelTurnWithTools;
+pub const runModel = @import("legacy.zig").runModel;
+pub const executeInlineToolCalls = @import("tools.zig").executeInlineToolCalls;
+
+// Helper functions
+pub const toolDefsToLlm = @import("turn.zig").toolDefsToLlm;
+pub const isCancelled = @import("turn.zig").isCancelled;
+
+// Subagent handling
+pub const subagentThreadMain = @import("subagent.zig").subagentThreadMain;
+
+// Convenience wrapper for direct model calls
+pub fn callModelDirect(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model_id: []const u8,
+    provider_id: []const u8,
+    messages_json: []const u8,
+    tool_defs: ?[]const @import("../llm.zig").ToolRouteDef,
+    reasoning_effort: ?[]const u8,
+) !@import("../llm.zig").ChatResponse {
+    return @import("../llm.zig").chat(allocator, api_key, model_id, provider_id, messages_json, tool_defs, reasoning_effort);
+}

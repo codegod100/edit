@@ -21,7 +21,6 @@ pub fn subagentThreadMain(args_ptr: *types.SubagentThreadArgs) void {
     }
     const args = args_ptr.*;
 
-    // Mark running ASAP.
     _ = args.manager.updateStatus(args.id, .running);
 
     var todo_list = todo.TodoList.init(allocator);
@@ -45,7 +44,6 @@ pub fn subagentThreadMain(args_ptr: *types.SubagentThreadArgs) void {
     };
     defer if (input) |s| allocator.free(s);
 
-    // Null output for subagent
     const NullOut = struct {
         pub fn writeAll(_: *@This(), _: []const u8) !void {}
         pub fn print(_: *@This(), comptime _: []const u8, _: anytype) !void {}
@@ -58,14 +56,18 @@ pub fn subagentThreadMain(args_ptr: *types.SubagentThreadArgs) void {
         return;
     }
 
-    // Call runModel from legacy module
-    const legacy = @import("legacy.zig");
-    var result = legacy.runModel(
+    // Import legacy to call runModel
+    var result = @import("legacy.zig").runModel(
         allocator,
         &out,
         args.active,
         args.description,
-        input.?,false,&todo_list,null,sys_prompt,) catch |err| {
+        input.?,
+        false,
+        &todo_list,
+        null,
+        sys_prompt,
+    ) catch |err| {
         const msg = std.fmt.allocPrint(allocator, "subagent: run failed: {s}", .{@errorName(err)}) catch null;
         if (msg) |m| {
             defer allocator.free(m);
