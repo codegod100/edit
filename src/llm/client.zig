@@ -59,6 +59,21 @@ pub fn httpRequest(
 
     try argv.append(allocator, url);
 
+    // Debug: log curl command
+    var cmd_buf: std.ArrayList(u8) = .empty;
+    defer cmd_buf.deinit(allocator);
+    const cmd_writer = cmd_buf.writer(allocator);
+    
+    for (argv.items, 0..) |arg, i| {
+        if (i > 0) try cmd_writer.writeAll(" ");
+        if (std.mem.indexOf(u8, arg, "Bearer")) |_| {
+            try cmd_writer.writeAll("-H 'Authorization: Bearer ...'");
+        } else {
+            try cmd_writer.writeAll(arg);
+        }
+    }
+    std.log.debug("Curl command: {s}", .{cmd_buf.items});
+
     var child = std.process.Child.init(argv.items, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
