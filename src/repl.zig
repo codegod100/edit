@@ -42,6 +42,7 @@ pub const CommandTag = enum {
     list_providers,
     default_model,
     connect_provider,
+    set_provider,
     set_model,
     list_models,
     set_effort,
@@ -96,6 +97,11 @@ pub fn parseCommand(line: []const u8) Command {
         var rest = trimmed[8..];
         rest = std.mem.trim(u8, rest, " \t");
         return .{ .tag = .connect_provider, .arg = rest };
+    }
+    if (std.mem.eql(u8, trimmed, "/provider") or std.mem.startsWith(u8, trimmed, "/provider ")) {
+        var rest = trimmed[9..];
+        rest = std.mem.trim(u8, rest, " \t");
+        return .{ .tag = .set_provider, .arg = rest };
     }
     if (std.mem.eql(u8, trimmed, "/stats")) {
         return .{ .tag = .stats, .arg = "" };
@@ -262,6 +268,11 @@ const AuthMethod = enum {
 
 const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_ISSUER = "https://auth.openai.com";
+const GITHUB_DEVICE_CLIENT_ID = "Iv1.b507a08c87ecfe98";
+const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
+const GITHUB_DEVICE_TOKEN_URL = "https://github.com/login/oauth/access_token";
+const GITHUB_DEVICE_VERIFY_URL = "https://github.com/login/device";
+const GITHUB_DEVICE_SCOPE = "read:user";
 
 const HistoryNav = enum {
     up,
@@ -1067,6 +1078,44 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var stored_pairs = try store.load(allocator, config_dir);
     defer store.free(allocator, stored_pairs);
 
+    // If Codex CLI has a Copilot token, prefer it by syncing it into zagent's providers.env.
+    // This avoids token drift across tools.
+    {
+        const codex_path = try std.fs.path.join(allocator, &.{ home, ".codex", "copilot_auth.json" });
+        defer allocator.free(codex_path);
+
+        const file = std.fs.openFileAbsolute(codex_path, .{}) catch null;
+        if (file) |f| {
+            defer f.close();
+            const raw = f.readToEndAlloc(allocator, 64 * 1024) catch null;
+            if (raw) |buf| {
+                defer allocator.free(buf);
+                const Parsed = struct { access_token: ?[]const u8 = null };
+                var parsed = std.json.parseFromSlice(Parsed, allocator, buf, .{ .ignore_unknown_fields = true }) catch null;
+                if (parsed) |*p| {
+                    defer p.deinit();
+                    if (p.value.access_token) |tok_raw| {
+                        const tok = std.mem.trim(u8, tok_raw, " \t\r\n");
+                        if (tok.len > 0) {
+                            var current: ?[]const u8 = null;
+                            for (stored_pairs) |pair| {
+                                if (std.mem.eql(u8, pair.name, "GITHUB_TOKEN")) {
+                                    current = pair.value;
+                                    break;
+                                }
+                            }
+                            if (current == null or !std.mem.eql(u8, current.?, tok)) {
+                                store.upsertFile(allocator, config_dir, "GITHUB_TOKEN", tok) catch {};
+                                store.free(allocator, stored_pairs);
+                                stored_pairs = try store.load(allocator, config_dir);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     var provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
     defer pm.ProviderManager.freeResolved(allocator, provider_states);
 
@@ -1103,7 +1152,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 
     try stdout.print(
-        "{s}══ zagent ══{s}\n{s}Commands:{s} /skills, /tools, /providers, /model <provider/model>, /models [provider] [filter], /todo, /stats, /quit\n\n",
+        "{s}══ zagent ══{s}\n{s}Commands:{s} /skills, /tools, /providers, /provider <provider-id>, /model <provider/model>, /models [provider] [filter], /todo, /stats, /quit\n\n",
         .{ C_BOLD, C_RESET, C_CYAN, C_RESET },
     );
     while (true) {
@@ -1271,6 +1320,47 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
                 pm.ProviderManager.freeResolved(allocator, provider_states);
                 provider_states = try resolveProviderStates(allocator, providers, stored_pairs);
+            },
+            .set_provider => {
+                if (command.arg.len == 0) {
+                    const active_provider = chooseActiveModel(providers, provider_states, selected_model, current_effort);
+                    if (active_provider) |a| {
+                        try stdout.print("Current provider: {s}\n", .{a.provider_id});
+                    } else {
+                        try stdout.print("No active provider. Use /providers then /connect <provider-id>.\n", .{});
+                    }
+                    try stdout.print("Usage: /provider <provider-id>\n", .{});
+                    continue;
+                }
+
+                const spec = findProviderSpecByID(providers, command.arg);
+                if (spec == null) {
+                    try stdout.print("Unknown provider: {s}\n", .{command.arg});
+                    continue;
+                }
+
+                const state = findConnectedProvider(provider_states, command.arg);
+                if (state == null) {
+                    try stdout.print("Provider not connected: {s}. Run /connect {s}.\n", .{ command.arg, command.arg });
+                    continue;
+                }
+
+                const default_model = chooseDefaultModelForConnected(state.?) orelse {
+                    try stdout.print("No models configured for {s}\n", .{command.arg});
+                    continue;
+                };
+
+                if (selected_model) |*old| old.deinit(allocator);
+                selected_model = .{
+                    .provider_id = try allocator.dupe(u8, command.arg),
+                    .model_id = try allocator.dupe(u8, default_model),
+                };
+                try config_store.saveSelectedModel(allocator, config_dir, .{
+                    .provider_id = command.arg,
+                    .model_id = default_model,
+                    .reasoning_effort = current_effort,
+                });
+                try stdout.print("Active provider set to {s} (default model: {s})\n", .{ command.arg, default_model });
             },
             .list_models => {
                 const active_cmd = chooseActiveModel(providers, provider_states, selected_model, current_effort);
@@ -1543,10 +1633,60 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 const model_input = try buildPromptWithMentions(allocator, base_model_input, trimmed);
                 defer allocator.free(model_input);
 
-                var turn = runModel(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| {
+                const turn_val: RunTurnResult = runModel(allocator, stdout, active.?, trimmed, model_input, &todo_list) catch |err| blk: {
                     if (prompt_todo_id) |id| {
                         _ = todo_list.update(id, .pending) catch false;
                     }
+
+                    // Copilot-specific self-heal: if selected model is unavailable for this token,
+                    // switch to the best live-supported fallback and retry once.
+                    if (err == error.ModelProviderError and
+                        std.mem.eql(u8, active.?.provider_id, "github-copilot") and
+                        active.?.api_key != null and
+                        ai_bridge.getLastProviderError() != null and
+                        isCopilotModelNotSupported(ai_bridge.getLastProviderError().?))
+                    {
+                        const not_supported_detail = ai_bridge.getLastProviderError().?;
+                        const not_supported_cap = if (not_supported_detail.len > 180) not_supported_detail[0..180] else not_supported_detail;
+                        const fallback = try pickBestCopilotModelFallback(allocator, active.?.api_key.?, active.?.model_id);
+                        if (fallback) |next_model| {
+                            defer allocator.free(next_model);
+                            const old_provider = try allocator.dupe(u8, active.?.provider_id);
+                            defer allocator.free(old_provider);
+                            const old_model = try allocator.dupe(u8, active.?.model_id);
+                            defer allocator.free(old_model);
+                            if (selected_model) |*old| old.deinit(allocator);
+                            selected_model = .{
+                                .provider_id = try allocator.dupe(u8, "github-copilot"),
+                                .model_id = try allocator.dupe(u8, next_model),
+                            };
+                            try config_store.saveSelectedModel(allocator, config_dir, .{
+                                .provider_id = "github-copilot",
+                                .model_id = next_model,
+                                .reasoning_effort = current_effort,
+                            });
+                            try stdout.print(
+                                "Model {s}/{s} is not supported by this Copilot token. Switched to github-copilot/{s} and retrying. ({s})\n",
+                                .{ old_provider, old_model, next_model, not_supported_cap },
+                            );
+
+                            const retry_active = chooseActiveModel(providers, provider_states, selected_model, current_effort);
+                            if (retry_active) |ra| {
+                                const retry_turn = runModel(allocator, stdout, ra, trimmed, model_input, &todo_list) catch |retry_err| {
+                                    if (retry_err == error.ModelProviderError or retry_err == error.ModelResponseMissingChoices) {
+                                        if (ai_bridge.getLastProviderError()) |detail| {
+                                            try stdout.print("Model query failed: {s} ({s})\n", .{ describeModelQueryError(retry_err), detail });
+                                            continue;
+                                        }
+                                    }
+                                    try stdout.print("Model query failed: {s}\n", .{describeModelQueryError(retry_err)});
+                                    continue;
+                                };
+                                break :blk retry_turn;
+                            }
+                        }
+                    }
+
                     if (err == error.ModelProviderError or err == error.ModelResponseMissingChoices) {
                         if (ai_bridge.getLastProviderError()) |detail| {
                             try stdout.print("Model query failed: {s} ({s})\n", .{ describeModelQueryError(err), detail });
@@ -1556,6 +1696,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                     try stdout.print("Model query failed: {s}\n", .{describeModelQueryError(err)});
                     continue;
                 };
+                var turn = turn_val;
                 defer turn.deinit(allocator);
 
                 if (prompt_todo_id) |id| {
@@ -1793,6 +1934,10 @@ test "parse command recognizes slash commands" {
     try std.testing.expectEqual(CommandTag.connect_provider, connect_with_arg.tag);
     try std.testing.expectEqualStrings("openai", connect_with_arg.arg);
 
+    const provider = parseCommand("/provider openrouter");
+    try std.testing.expectEqual(CommandTag.set_provider, provider.tag);
+    try std.testing.expectEqualStrings("openrouter", provider.arg);
+
     const model = parseCommand("/model openai/gpt-5");
     try std.testing.expectEqual(CommandTag.set_model, model.tag);
     try std.testing.expectEqualStrings("openai/gpt-5", model.arg);
@@ -1808,7 +1953,8 @@ test "parse command trims /skill argument" {
 }
 
 test "autocomplete expands unique command prefixes" {
-    try std.testing.expectEqualStrings("/providers", autocompleteCommand("/pro"));
+    try std.testing.expectEqualStrings("/providers", autocompleteCommand("/provides"));
+    try std.testing.expectEqualStrings("/provider", autocompleteCommand("/provide"));
     try std.testing.expectEqualStrings("/connect", autocompleteCommand("/con"));
 }
 
@@ -1839,9 +1985,9 @@ test "build prompt with mentions keeps base prompt when none provided" {
 
 test "apply edit key tab completes command" {
     const allocator = std.testing.allocator;
-    const next = try applyEditKey(allocator, "/pro", .tab, 0);
+    const next = try applyEditKey(allocator, "/provide", .tab, 0);
     defer allocator.free(next);
-    try std.testing.expectEqualStrings("/providers", next);
+    try std.testing.expectEqualStrings("/provider", next);
 }
 
 test "apply edit key backspace removes last character" {
@@ -1869,6 +2015,12 @@ test "choose auth method parses subscription and defaults to api" {
     try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("", true));
     try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("api", true));
     try std.testing.expectEqual(AuthMethod.api, chooseAuthMethod("subscription", false));
+}
+
+test "subscription support includes github-copilot" {
+    try std.testing.expect(supportsSubscription("openai"));
+    try std.testing.expect(supportsSubscription("github-copilot"));
+    try std.testing.expect(!supportsSubscription("openrouter"));
 }
 
 test "parse model selection supports provider/model format" {
@@ -2240,6 +2392,7 @@ fn commandNames() []const []const u8 {
         "/providers",
         "/default-model",
         "/connect",
+        "/provider",
         "/model",
         "/models",
         "/effort",
@@ -2587,7 +2740,8 @@ fn collectModelOptions(
         // only supports Codex models. Filter out non-codex models so /model can't select unsupported ids.
         const state = findConnectedProvider(connected, spec.id);
         const openai_oauth = std.mem.eql(u8, spec.id, "openai") and state != null and state.?.key != null and isLikelyOAuthToken(state.?.key.?);
-        if (openai_oauth) {
+        const copilot_live_allowlist = std.mem.eql(u8, spec.id, "github-copilot") and state != null and state.?.key != null;
+        if (openai_oauth or copilot_live_allowlist) {
             // Prefer live allowlist from the provider, but fall back to substring filter on failure.
             var allowed_ids: ?[][]u8 = null;
             if (state.?.key) |k| {
@@ -2619,6 +2773,13 @@ fn collectModelOptions(
                 }
                 continue;
             } else {
+                if (copilot_live_allowlist) {
+                    // If Copilot model listing fails, fall back to static catalog.
+                    for (spec.models) |m| {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+                    }
+                    continue;
+                }
                 for (spec.models) |m| {
                     if (isCodexModelId(m.id)) {
                         try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
@@ -3408,6 +3569,54 @@ fn describeModelQueryError(err: anyerror) []const u8 {
         error.ModelResponseMissingChoices => "upstream model response missing choices/content",
         else => @errorName(err),
     };
+}
+
+fn isCopilotModelNotSupported(detail: []const u8) bool {
+    return std.mem.indexOf(u8, detail, "model_not_supported") != null or
+        std.mem.indexOf(u8, detail, "not supported") != null;
+}
+
+fn hasModelID(ids: [][]u8, want: []const u8) bool {
+    for (ids) |id| {
+        if (std.mem.eql(u8, id, want)) return true;
+    }
+    return false;
+}
+
+fn pickBestCopilotModelFallback(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    current_model_id: []const u8,
+) !?[]u8 {
+    const ids = ai_bridge.fetchModelIDsDirect(allocator, api_key, "github-copilot") catch return null;
+    defer ai_bridge.freeModelIDs(allocator, ids);
+
+    const preferred = [_][]const u8{
+        "gpt-5.2",
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5.2-codex",
+        "gpt-5.1-codex-max",
+        "gpt-5.1-codex",
+        "gpt-5.1-codex-mini",
+        "gpt-5.3-codex",
+    };
+
+    for (preferred) |want| {
+        if (!std.mem.eql(u8, want, current_model_id) and hasModelID(ids, want)) {
+            return try allocator.dupe(u8, want);
+        }
+    }
+
+    // Last resort: any different model from the live allowlist.
+    for (ids) |id| {
+        if (!std.mem.eql(u8, id, current_model_id)) {
+            return try allocator.dupe(u8, id);
+        }
+    }
+
+    return null;
 }
 
 fn writeJsonString(w: anytype, s: []const u8) !void {
@@ -4264,7 +4473,7 @@ fn buildFilterPreviewLine(allocator: std.mem.Allocator, options: []const ModelOp
 }
 
 fn supportsSubscription(provider_id: []const u8) bool {
-    return std.mem.eql(u8, provider_id, "openai");
+    return std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "github-copilot");
 }
 
 fn callModelDirect(
@@ -4312,37 +4521,75 @@ fn connectSubscription(
     stdout: anytype,
     provider_id: []const u8,
 ) !?[]u8 {
-    if (!std.mem.eql(u8, provider_id, "openai")) {
-        try stdout.print("Subscription flow is currently supported only for openai.\n", .{});
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        const start = try openaiDeviceStart(allocator);
+        defer allocator.free(start.device_auth_id);
+        defer allocator.free(start.user_code);
+
+        try stdout.print("Open this URL in your browser: {s}/codex/device\n", .{OPENAI_ISSUER});
+        try stdout.print("Enter code: {s}\n", .{start.user_code});
+        const open_result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "sh", "-c", "xdg-open https://auth.openai.com/codex/device >/dev/null 2>&1 || true" },
+        });
+        allocator.free(open_result.stdout);
+        allocator.free(open_result.stderr);
+
+        const proceed = try promptLine(allocator, stdin, stdout, "Press Enter after authorization (or type cancel): ");
+        if (proceed) |p| {
+            defer allocator.free(p);
+            const t = std.mem.trim(u8, p, " \t\r\n");
+            if (std.mem.eql(u8, t, "cancel")) return null;
+        }
+
+        const token = try openaiPollAndExchange(allocator, stdout, start.device_auth_id, start.user_code, start.interval_sec);
+        if (token == null) {
+            try stdout.print("Subscription login failed.\n", .{});
+            return null;
+        }
+        return token;
+    }
+
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        const start = try githubDeviceStart(allocator);
+        defer allocator.free(start.device_code);
+        defer allocator.free(start.user_code);
+        defer allocator.free(start.verification_uri);
+
+        try stdout.print("To sign in to GitHub Copilot:\n", .{});
+        try stdout.print("1. Open: {s}\n", .{start.verification_uri});
+        try stdout.print("2. Enter code: {s}\n", .{start.user_code});
+        const open_cmd = try std.fmt.allocPrint(
+            allocator,
+            "xdg-open {s} >/dev/null 2>&1 || true",
+            .{start.verification_uri},
+        );
+        defer allocator.free(open_cmd);
+        const open_result = try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "sh", "-c", open_cmd },
+        });
+        allocator.free(open_result.stdout);
+        allocator.free(open_result.stderr);
+
+        try stdout.print("Waiting for authorization...\n", .{});
+        const token = try githubPollAndExchange(
+            allocator,
+            stdout,
+            start.device_code,
+            start.interval_sec,
+            start.expires_in_sec,
+        );
+        if (token) |t| {
+            try stdout.print("Subscription authorized successfully.\n", .{});
+            return t;
+        }
+        try stdout.print("GitHub OAuth login failed.\n", .{});
         return null;
     }
 
-    const start = try openaiDeviceStart(allocator);
-    defer allocator.free(start.device_auth_id);
-    defer allocator.free(start.user_code);
-
-    try stdout.print("Open this URL in your browser: {s}/codex/device\n", .{OPENAI_ISSUER});
-    try stdout.print("Enter code: {s}\n", .{start.user_code});
-    const open_result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "sh", "-c", "xdg-open https://auth.openai.com/codex/device >/dev/null 2>&1 || true" },
-    });
-    allocator.free(open_result.stdout);
-    allocator.free(open_result.stderr);
-
-    const proceed = try promptLine(allocator, stdin, stdout, "Press Enter after authorization (or type cancel): ");
-    if (proceed) |p| {
-        defer allocator.free(p);
-        const t = std.mem.trim(u8, p, " \t\r\n");
-        if (std.mem.eql(u8, t, "cancel")) return null;
-    }
-
-    const token = try openaiPollAndExchange(allocator, stdout, start.device_auth_id, start.user_code, start.interval_sec);
-    if (token == null) {
-        try stdout.print("Subscription login failed.\n", .{});
-        return null;
-    }
-    return token;
+    try stdout.print("Subscription flow is currently supported only for openai and github-copilot.\n", .{});
+    return null;
 }
 
 const OpenAIDeviceStart = struct {
@@ -4350,6 +4597,148 @@ const OpenAIDeviceStart = struct {
     user_code: []u8,
     interval_sec: u64,
 };
+
+const GitHubDeviceStart = struct {
+    device_code: []u8,
+    user_code: []u8,
+    verification_uri: []u8,
+    interval_sec: u64,
+    expires_in_sec: u64,
+};
+
+fn githubDeviceStart(allocator: std.mem.Allocator) !GitHubDeviceStart {
+    const form = try std.fmt.allocPrint(
+        allocator,
+        "client_id={s}&scope={s}",
+        .{ GITHUB_DEVICE_CLIENT_ID, GITHUB_DEVICE_SCOPE },
+    );
+    defer allocator.free(form);
+
+    const headers = std.http.Client.Request.Headers{
+        .content_type = .{ .override = "application/x-www-form-urlencoded" },
+        .user_agent = .{ .override = "zagent/0.1" },
+    };
+    const extra_headers = [_]std.http.Header{
+        .{ .name = "accept", .value = "application/json" },
+    };
+    const out = try httpRequest(
+        allocator,
+        .POST,
+        GITHUB_DEVICE_CODE_URL,
+        headers,
+        &extra_headers,
+        form,
+    );
+    defer allocator.free(out);
+
+    const StartResp = struct {
+        device_code: []const u8,
+        user_code: []const u8,
+        verification_uri: ?[]const u8 = null,
+        interval: ?u64 = null,
+        expires_in: ?u64 = null,
+        @"error": ?[]const u8 = null,
+        error_description: ?[]const u8 = null,
+    };
+
+    var parsed = try std.json.parseFromSlice(StartResp, allocator, out, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    if (parsed.value.@"error" != null) {
+        return error.CopilotDeviceAuthFailed;
+    }
+
+    return .{
+        .device_code = try allocator.dupe(u8, parsed.value.device_code),
+        .user_code = try allocator.dupe(u8, parsed.value.user_code),
+        .verification_uri = try allocator.dupe(u8, parsed.value.verification_uri orelse GITHUB_DEVICE_VERIFY_URL),
+        .interval_sec = parsed.value.interval orelse 5,
+        .expires_in_sec = parsed.value.expires_in orelse 900,
+    };
+}
+
+fn githubPollAndExchange(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    device_code: []const u8,
+    base_interval_sec: u64,
+    expires_in_sec: u64,
+) !?[]u8 {
+    var interval_sec = if (base_interval_sec == 0) @as(u64, 5) else base_interval_sec;
+    const start_ms = std.time.milliTimestamp();
+    const max_wait_ms: i64 = @intCast(expires_in_sec * std.time.ms_per_s);
+
+    while ((std.time.milliTimestamp() - start_ms) < max_wait_ms) {
+        const form = try std.fmt.allocPrint(
+            allocator,
+            "client_id={s}&device_code={s}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
+            .{ GITHUB_DEVICE_CLIENT_ID, device_code },
+        );
+        defer allocator.free(form);
+
+        const headers = std.http.Client.Request.Headers{
+            .content_type = .{ .override = "application/x-www-form-urlencoded" },
+            .user_agent = .{ .override = "zagent/0.1" },
+        };
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "accept", .value = "application/json" },
+        };
+        const out = try httpRequest(
+            allocator,
+            .POST,
+            GITHUB_DEVICE_TOKEN_URL,
+            headers,
+            &extra_headers,
+            form,
+        );
+        defer allocator.free(out);
+
+        const TokenResp = struct {
+            access_token: ?[]const u8 = null,
+            @"error": ?[]const u8 = null,
+            error_description: ?[]const u8 = null,
+        };
+        var parsed = std.json.parseFromSlice(TokenResp, allocator, out, .{ .ignore_unknown_fields = true }) catch {
+            std.Thread.sleep(interval_sec * std.time.ns_per_s);
+            continue;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value.access_token) |token| {
+            return try allocator.dupe(u8, token);
+        }
+
+        const err_code = parsed.value.@"error" orelse "";
+        if (std.mem.eql(u8, err_code, "authorization_pending")) {
+            std.Thread.sleep(interval_sec * std.time.ns_per_s);
+            continue;
+        }
+        if (std.mem.eql(u8, err_code, "slow_down")) {
+            interval_sec += 5;
+            std.Thread.sleep(interval_sec * std.time.ns_per_s);
+            continue;
+        }
+        if (std.mem.eql(u8, err_code, "expired_token")) {
+            try stdout.print("Copilot device code expired. Run /connect github-copilot again.\n", .{});
+            return null;
+        }
+        if (std.mem.eql(u8, err_code, "access_denied")) {
+            try stdout.print("Copilot authorization was denied.\n", .{});
+            return null;
+        }
+        if (err_code.len > 0) {
+            const detail = parsed.value.error_description orelse "no details";
+            try stdout.print("Copilot authorization failed: {s} ({s})\n", .{ err_code, detail });
+            return null;
+        }
+
+        try stdout.print("Copilot token response did not include an access token.\n", .{});
+        return null;
+    }
+
+    try stdout.print("Copilot device authorization timed out.\n", .{});
+    return null;
+}
 
 fn openaiDeviceStart(allocator: std.mem.Allocator) !OpenAIDeviceStart {
     const body = try std.fmt.allocPrint(allocator, "{{\"client_id\":\"{s}\"}}", .{OPENAI_CLIENT_ID});

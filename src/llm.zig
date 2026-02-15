@@ -488,6 +488,13 @@ fn getProviderConfig(provider_id: []const u8) ProviderConfig {
             .title = "zagent",
             .user_agent = null,
         };
+    } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        return .{
+            .endpoint = "https://api.githubcopilot.com/chat/completions",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
     } else {
         // Default to OpenAI format
         return .{

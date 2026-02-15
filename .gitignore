@@ -1,5 +1,7 @@
 examples
 .zagent
+.codex
+.config/zagent
 src/models.dev.json
 # Zig
 .zig-cache/

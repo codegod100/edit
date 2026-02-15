@@ -2,10 +2,60 @@ const std = @import("std");
 const logger = @import("logger.zig");
 
 const OPENAI_CODEX_RESPONSES_ENDPOINT: []const u8 = "https://chatgpt.com/backend-api/codex/responses";
+const COPILOT_RESPONSES_ENDPOINT: []const u8 = "https://api.githubcopilot.com/v1/responses";
+const COPILOT_GITHUB_TOKEN_EXCHANGE_ENDPOINT: []const u8 = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_EDITOR_VERSION: []const u8 = "vscode/1.85.0";
+const COPILOT_EDITOR_PLUGIN_VERSION: []const u8 = "github-copilot-chat/0.23.0";
 
 fn isLikelyOAuthToken(token: []const u8) bool {
     if (std.mem.startsWith(u8, token, "sk-")) return false;
     return std.mem.count(u8, token, ".") >= 2;
+}
+
+fn isLikelyJwtLike(token: []const u8) bool {
+    // Heuristic: JWTs are dot-separated base64url segments; GitHub OAuth tokens (ghu_/gho_)
+    // are short and typically do not contain multiple dots.
+    return std.mem.count(u8, token, ".") >= 2 or std.mem.startsWith(u8, token, "eyJ");
+}
+
+fn exchangeGitHubTokenForCopilotApiToken(allocator: std.mem.Allocator, github_token: []const u8) !?[]u8 {
+    // Copilot API often expects a short-lived JWT returned by GitHub's copilot_internal token endpoint.
+    // See: https://api.github.com/copilot_internal/v2/token
+    if (github_token.len == 0) return null;
+
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{github_token});
+    defer allocator.free(auth_value);
+
+    var headers = std.http.Client.Request.Headers{
+        .authorization = .{ .override = auth_value },
+        .content_type = .{ .override = "application/json" },
+    };
+    headers.user_agent = .{ .override = "zagent/0.1" };
+
+    const extra = [_]std.http.Header{
+        .{ .name = "accept", .value = "application/vnd.github+json" },
+        .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+    };
+
+    const raw = httpRequest(allocator, .GET, COPILOT_GITHUB_TOKEN_EXCHANGE_ENDPOINT, headers, &extra, null) catch return null;
+    defer allocator.free(raw);
+
+    const Resp = struct { token: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(Resp, allocator, raw, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    const tok = parsed.value.token orelse return null;
+    const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn effectiveCopilotBearerToken(allocator: std.mem.Allocator, api_key: []const u8) ![]u8 {
+    // If the configured key is already a JWT-like token, use it directly.
+    // Otherwise, treat it as a GitHub OAuth token and exchange it.
+    if (isLikelyJwtLike(api_key)) return try allocator.dupe(u8, api_key);
+    if (exchangeGitHubTokenForCopilotApiToken(allocator, api_key) catch null) |tok| return tok;
+    return try allocator.dupe(u8, api_key);
 }
 
 fn writeJsonStringEscaped(w: anytype, s: []const u8) !void {
@@ -106,6 +156,52 @@ pub fn chatDirect(
     if (std.mem.eql(u8, provider_id, "openai") and isLikelyOAuthToken(api_key)) {
         return chatDirectOpenAICodexResponses(allocator, api_key, model_id, messages_json);
     }
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        const bearer = try effectiveCopilotBearerToken(allocator, api_key);
+        defer allocator.free(bearer);
+
+        // Copilot can expose multiple OpenAI-compatible surfaces. In practice:
+        // - /v1/responses may be forbidden in some environments or for some models.
+        // - a model may be "not supported" on Responses but still work on Chat Completions.
+        // So we try Responses first, then fall back to Chat Completions for common provider errors.
+        const primary = chatDirectCopilotResponses(allocator, bearer, model_id, messages_json);
+        return primary catch |err| {
+            if (err != error.ModelProviderError) return err;
+            const detail = getLastProviderError() orelse return err;
+            const is_forbidden = std.mem.indexOf(u8, detail, "forbidden") != null or
+                std.mem.indexOf(u8, detail, "Terms of Service") != null;
+            const is_not_supported = std.mem.indexOf(u8, detail, "not supported") != null or
+                std.mem.indexOf(u8, detail, "model_not_supported") != null;
+
+            if (!is_forbidden and !is_not_supported) return err;
+
+            last_provider_error_len = 0;
+            const config = getProviderConfig(provider_id);
+            const body = try buildChatBody(allocator, model_id, messages_json, reasoning_effort);
+            defer allocator.free(body);
+
+            const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{bearer});
+            defer allocator.free(auth_value);
+
+            var headers = std.http.Client.Request.Headers{
+                .authorization = .{ .override = auth_value },
+                .content_type = .{ .override = "application/json" },
+            };
+            if (config.user_agent) |ua| headers.user_agent = .{ .override = ua };
+
+            const extra = [_]std.http.Header{
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "Editor-Version", .value = COPILOT_EDITOR_VERSION },
+                .{ .name = "Editor-Plugin-Version", .value = COPILOT_EDITOR_PLUGIN_VERSION },
+                .{ .name = "x-initiator", .value = "agent" },
+                .{ .name = "Openai-Intent", .value = "conversation-edits" },
+            };
+
+            const raw = try httpRequest(allocator, .POST, config.endpoint, headers, &extra, body);
+            defer allocator.free(raw);
+            return parseChatResponse(allocator, raw);
+        };
+    }
 
     const config = getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, reasoning_effort);
@@ -165,6 +261,46 @@ fn chatDirectOpenAICodexResponses(
         OPENAI_CODEX_RESPONSES_ENDPOINT,
         headers,
         &.{.{ .name = "originator", .value = "zagent" }},
+        body,
+    );
+    defer allocator.free(raw);
+
+    return parseCodexResponsesStream(allocator, raw);
+}
+
+fn chatDirectCopilotResponses(
+    allocator: std.mem.Allocator,
+    api_key: []const u8,
+    model_id: []const u8,
+    messages_json: []const u8,
+) !ChatResponse {
+    last_provider_error_len = 0;
+
+    const body = try buildCodexResponsesBody(allocator, model_id, messages_json);
+    defer allocator.free(body);
+
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    defer allocator.free(auth_value);
+
+    var headers = std.http.Client.Request.Headers{
+        .authorization = .{ .override = auth_value },
+        .content_type = .{ .override = "application/json" },
+    };
+    headers.user_agent = .{ .override = "zagent/0.1" };
+
+    const extra = [_]std.http.Header{
+        .{ .name = "accept", .value = "text/event-stream" },
+        .{ .name = "Editor-Version", .value = COPILOT_EDITOR_VERSION },
+        .{ .name = "Editor-Plugin-Version", .value = COPILOT_EDITOR_PLUGIN_VERSION },
+        .{ .name = "x-initiator", .value = "agent" },
+        .{ .name = "Openai-Intent", .value = "conversation-edits" },
+    };
+    const raw = try httpRequest(
+        allocator,
+        .POST,
+        COPILOT_RESPONSES_ENDPOINT,
+        headers,
+        &extra,
         body,
     );
     defer allocator.free(raw);
@@ -286,6 +422,76 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
                     }
                     return error.ModelProviderError;
                 }
+                // Some providers return non-stream JSON even when stream=true.
+                if (root_parsed.value.object.get("output")) |out_val| {
+                    if (out_val == .array) {
+                        var out_text = std.ArrayList(u8).empty;
+                        defer out_text.deinit(allocator);
+
+                        var tool_name: ?[]const u8 = null;
+                        var tool_args: ?[]const u8 = null;
+
+                        for (out_val.array.items) |item| {
+                            if (item != .object) continue;
+                            const obj = item.object;
+                            const typ = if (obj.get("type")) |t| if (t == .string) t.string else "" else "";
+
+                            if (std.mem.eql(u8, typ, "function_call")) {
+                                if (obj.get("name")) |n| {
+                                    if (n == .string) tool_name = n.string;
+                                }
+                                if (obj.get("arguments")) |a| {
+                                    if (a == .string) tool_args = a.string;
+                                }
+                                continue;
+                            }
+
+                            if (obj.get("text")) |txt| {
+                                if (txt == .string) {
+                                    try out_text.appendSlice(allocator, txt.string);
+                                }
+                            }
+                            if (obj.get("content")) |content| {
+                                if (content == .array) {
+                                    for (content.array.items) |part| {
+                                        if (part != .object) continue;
+                                        if (part.object.get("text")) |pt| {
+                                            if (pt == .string) try out_text.appendSlice(allocator, pt.string);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (tool_name != null and tool_args != null) {
+                            const calls = try allocator.alloc(ToolCall, 1);
+                            calls[0] = .{
+                                .id = try allocator.dupe(u8, "call_0"),
+                                .tool = try allocator.dupe(u8, tool_name.?),
+                                .args = try allocator.dupe(u8, tool_args.?),
+                            };
+                            return .{
+                                .text = try allocator.dupe(u8, ""),
+                                .reasoning = try allocator.dupe(u8, ""),
+                                .tool_calls = calls,
+                                .finish_reason = try allocator.dupe(u8, "tool_calls"),
+                            };
+                        }
+
+                        if (out_text.items.len == 0) {
+                            if (root_parsed.value.object.get("output_text")) |ot| {
+                                if (ot == .string) try out_text.appendSlice(allocator, ot.string);
+                            }
+                        }
+
+                        return .{
+                            .text = try allocator.dupe(u8, out_text.items),
+                            .reasoning = try allocator.dupe(u8, ""),
+                            .tool_calls = try allocator.alloc(ToolCall, 0),
+                            .finish_reason = try allocator.dupe(u8, "stop"),
+                        };
+                    }
+                }
                 if (root_parsed.value.object.get("detail")) |d| {
                     if (d == .string) {
                         setLastProviderError(d.string);
@@ -294,6 +500,14 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
                 }
             }
         } else |_| {}
+
+        // Plain-text provider errors (e.g. "Access to this endpoint is forbidden...")
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) {
+            const cap = @min(trimmed.len, 300);
+            setLastProviderError(trimmed[0..cap]);
+            return error.ModelProviderError;
+        }
 
         setLastProviderError("unexpected non-stream response from codex backend");
         return error.ModelResponseParseError;
@@ -383,6 +597,15 @@ fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) !Cha
 }
 fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !ChatResponse {
     last_provider_error_len = 0;
+
+    // Chat Completions should always return JSON. If we get plain text (common for 401/403 from some
+    // upstreams), surface it as a provider error instead of a JSON parse error.
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len > 0 and trimmed[0] != '{' and trimmed[0] != '[') {
+        const cap = @min(trimmed.len, 300);
+        setLastProviderError(trimmed[0..cap]);
+        return error.ModelProviderError;
+    }
 
     if (std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .ignore_unknown_fields = true })) |root_parsed| {
         defer root_parsed.deinit();
@@ -598,6 +821,13 @@ fn getProviderConfig(provider_id: []const u8) ProviderConfig {
             .title = "zagent",
             .user_agent = null,
         };
+    } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        return .{
+            .endpoint = "https://api.githubcopilot.com/chat/completions",
+            .referer = null,
+            .title = null,
+            .user_agent = "zagent/0.1",
+        };
     } else {
         return .{
             .endpoint = "https://api.openai.com/v1/chat/completions",
@@ -613,6 +843,8 @@ fn getProviderConfig(provider_id: []const u8) ProviderConfig {
 fn getModelsEndpoint(provider_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_id, "openai")) {
         return "https://api.openai.com/v1/models";
+    } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        return "https://api.githubcopilot.com/models";
     } else if (std.mem.eql(u8, provider_id, "opencode")) {
         return "https://opencode.ai/zen/v1/models";
     } else if (std.mem.eql(u8, provider_id, "openrouter")) {
@@ -652,6 +884,12 @@ pub fn listModelsDirect(
 ) ![]u8 {
     last_provider_error_len = 0;
 
+    const effective_key = if (std.mem.eql(u8, provider_id, "github-copilot"))
+        try effectiveCopilotBearerToken(allocator, api_key)
+    else
+        try allocator.dupe(u8, api_key);
+    defer allocator.free(effective_key);
+
     const use_codex_models = std.mem.eql(u8, provider_id, "openai") and isLikelyOAuthToken(api_key);
     const endpoint = if (use_codex_models)
         OPENAI_CODEX_MODELS_ENDPOINT
@@ -663,7 +901,7 @@ pub fn listModelsDirect(
 
     const config = getProviderConfig(provider_id);
 
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);
 
     var headers = std.http.Client.Request.Headers{
@@ -676,6 +914,13 @@ pub fn listModelsDirect(
     defer extra_headers.deinit(allocator);
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        try extra_headers.append(allocator, .{ .name = "accept", .value = "application/json" });
+        try extra_headers.append(allocator, .{ .name = "Editor-Version", .value = COPILOT_EDITOR_VERSION });
+        try extra_headers.append(allocator, .{ .name = "Editor-Plugin-Version", .value = COPILOT_EDITOR_PLUGIN_VERSION });
+        try extra_headers.append(allocator, .{ .name = "x-initiator", .value = "user" });
+        try extra_headers.append(allocator, .{ .name = "Openai-Intent", .value = "conversation-edits" });
+    }
 
     const raw = try httpRequest(allocator, .GET, endpoint, headers, extra_headers.items, null);
     defer allocator.free(raw);
@@ -839,6 +1084,12 @@ pub fn fetchModelIDsDirect(
 ) ![][]u8 {
     last_provider_error_len = 0;
 
+    const effective_key = if (std.mem.eql(u8, provider_id, "github-copilot"))
+        try effectiveCopilotBearerToken(allocator, api_key)
+    else
+        try allocator.dupe(u8, api_key);
+    defer allocator.free(effective_key);
+
     const use_codex_models = std.mem.eql(u8, provider_id, "openai") and isLikelyOAuthToken(api_key);
     const endpoint = if (use_codex_models)
         OPENAI_CODEX_MODELS_ENDPOINT
@@ -850,7 +1101,7 @@ pub fn fetchModelIDsDirect(
 
     const config = getProviderConfig(provider_id);
 
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
+    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);
 
     var headers = std.http.Client.Request.Headers{
@@ -863,6 +1114,13 @@ pub fn fetchModelIDsDirect(
     defer extra_headers.deinit(allocator);
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
+    if (std.mem.eql(u8, provider_id, "github-copilot")) {
+        try extra_headers.append(allocator, .{ .name = "accept", .value = "application/json" });
+        try extra_headers.append(allocator, .{ .name = "Editor-Version", .value = COPILOT_EDITOR_VERSION });
+        try extra_headers.append(allocator, .{ .name = "Editor-Plugin-Version", .value = COPILOT_EDITOR_PLUGIN_VERSION });
+        try extra_headers.append(allocator, .{ .name = "x-initiator", .value = "user" });
+        try extra_headers.append(allocator, .{ .name = "Openai-Intent", .value = "conversation-edits" });
+    }
 
     const raw = try httpRequest(allocator, .GET, endpoint, headers, extra_headers.items, null);
     defer allocator.free(raw);
