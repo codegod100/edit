@@ -978,8 +978,10 @@ test "edit fails on ambiguous single replace" {
 
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
-    const out = executeNamed(allocator, "edit", args, &todo_list, null);
-    try std.testing.expectError(NamedToolError.InvalidArguments, out);
+    const out = try executeNamed(allocator, "edit", args, &todo_list, null);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Replace failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "matched") != null);
 }
 
 test "apply_patch rejects empty patch" {
@@ -995,8 +997,9 @@ test "path guard rejects parent traversal" {
     const allocator = std.testing.allocator;
     var todo_list3 = todo.TodoList.init(allocator);
     defer todo_list3.deinit();
-    const out = executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3, null);
-    try std.testing.expectError(NamedToolError.InvalidArguments, out);
+    const out = try executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3, null);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "outside the workspace") != null);
 }
 
 test "edit supports trimmed line fallback replacement" {

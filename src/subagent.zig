@@ -413,9 +413,9 @@ test "SubagentManager summary" {
     _ = manager.updateStatus(id1, .running);
     try std.testing.expectEqualStrings("subagents active", manager.summary());
 
-    _ = try manager.createTask(.researcher, "Task 2", null);
+    const id2 = try manager.createTask(.researcher, "Task 2", null);
     try std.testing.expectEqualStrings("subagents running", manager.summary());
-
+    _ = manager.updateStatus(id2, .running);
     _ = try manager.setError(id1, "Something went wrong");
     try std.testing.expectEqualStrings("some subagents failed, others running", manager.summary());
 }

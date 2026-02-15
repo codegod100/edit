@@ -2052,9 +2052,9 @@ test "parse command trims /skill argument" {
 }
 
 test "autocomplete expands unique command prefixes" {
-    try std.testing.expectEqualStrings("/providers", autocompleteCommand("/provides"));
-    try std.testing.expectEqualStrings("/provider", autocompleteCommand("/provide"));
     try std.testing.expectEqualStrings("/connect", autocompleteCommand("/con"));
+    try std.testing.expectEqualStrings("/default-model", autocompleteCommand("/def"));
+    try std.testing.expectEqualStrings("/effort", autocompleteCommand("/eff"));
 }
 
 test "autocomplete keeps ambiguous and exact commands" {
@@ -2084,9 +2084,9 @@ test "build prompt with mentions keeps base prompt when none provided" {
 
 test "apply edit key tab completes command" {
     const allocator = std.testing.allocator;
-    const next = try applyEditKey(allocator, "/provide", .tab, 0);
+    const next = try applyEditKey(allocator, "/def", .tab, 0);
     defer allocator.free(next);
-    try std.testing.expectEqualStrings("/provider", next);
+    try std.testing.expectEqualStrings("/default-model", next);
 }
 
 test "apply edit key backspace removes last character" {
@@ -2294,8 +2294,8 @@ test "tool routing prompt includes codebase analysis guidance" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Use local tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "bash+rg") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "read_file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "list_files") != null);
 }
 
 test "tool routing prompt preserves original user request" {
@@ -2321,8 +2321,8 @@ test "strict routing prompt requires at least one read or list" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "must call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "rg") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "read_file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "list_files") != null);
 }
 
 test "repo specific detector catches codebase questions" {
@@ -3058,7 +3058,7 @@ fn buildToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) !
 fn buildStrictToolRoutingPrompt(allocator: std.mem.Allocator, user_text: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "This is a repository-specific question. You must call at least one local tool before giving the final answer. First call bash with rg to locate relevant files/symbols, then read_file/read only targeted files with explicit offset+limit; use bisection-style chunking for large files. Then answer using concrete file evidence or action results.\n\nUser request:\n{s}",
+        "This is a repository-specific question. You must call at least one local tool before giving the final answer. First call bash with rg to locate relevant files/symbols, then read_file/read only targeted files with explicit offset+limit; use bisection-style chunking for large files. If the user asked to change code, use write_file/replace_in_file/edit/apply_patch and do not claim success without running them. Then answer using concrete file evidence or action results.\n\nUser request:\n{s}",
         .{user_text},
     );
 }
