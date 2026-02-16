@@ -72,78 +72,6 @@ pub fn deinitProviderSpecs() void {
 }
 
 // ============================================================
-// Hardcoded Provider Specs (Fallbacks)
-// ============================================================
-
-fn loadDefaultSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
-    var specs = try std.ArrayListUnmanaged(ProviderSpec).initCapacity(allocator, 5);
-
-    // OpenAI
-    try specs.append(allocator, .{
-        .id = try allocator.dupe(u8, "openai"),
-        .env_vars = blk: {
-            const ev = try allocator.alloc([]const u8, 1);
-            ev[0] = try allocator.dupe(u8, "OPENAI_API_KEY");
-            break :blk ev;
-        },
-        .models = blk: {
-            const m = try allocator.alloc([]const u8, 2);
-            m[0] = try allocator.dupe(u8, "gpt-4o");
-            m[1] = try allocator.dupe(u8, "o3-mini");
-            break :blk m;
-        },
-        .endpoint = try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions"),
-        .models_endpoint = try allocator.dupe(u8, "https://api.openai.com/v1/models"),
-    });
-
-    // OpenRouter
-    try specs.append(allocator, .{
-        .id = try allocator.dupe(u8, "openrouter"),
-        .env_vars = blk: {
-            const ev = try allocator.alloc([]const u8, 1);
-            ev[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
-            break :blk ev;
-        },
-        .models = blk: {
-            const m = try allocator.alloc([]const u8, 6);
-            m[0] = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet");
-            m[1] = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet");
-            m[2] = try allocator.dupe(u8, "deepseek/deepseek-chat");
-            m[3] = try allocator.dupe(u8, "deepseek/deepseek-r1");
-            m[4] = try allocator.dupe(u8, "x-ai/grok-4.1-fast");
-            m[5] = try allocator.dupe(u8, "openai/gpt-oss-120b");
-            break :blk m;
-        },
-        .endpoint = try allocator.dupe(u8, "https://openrouter.ai/api/v1/chat/completions"),
-        .models_endpoint = try allocator.dupe(u8, "https://openrouter.ai/api/v1/models"),
-        .referer = try allocator.dupe(u8, "https://zagent.local/"),
-        .title = try allocator.dupe(u8, "zagent"),
-    });
-
-    // Z.AI
-    try specs.append(allocator, .{
-        .id = try allocator.dupe(u8, "zai"),
-        .env_vars = blk: {
-            const ev = try allocator.alloc([]const u8, 1);
-            ev[0] = try allocator.dupe(u8, "ZAI_API_KEY");
-            break :blk ev;
-        },
-        .models = blk: {
-            const m = try allocator.alloc([]const u8, 1);
-            m[0] = try allocator.dupe(u8, "glm-4.7");
-            break :blk m;
-        },
-        .endpoint = try allocator.dupe(u8, "https://api.z.ai/api/coding/paas/v4/chat/completions"),
-        .models_endpoint = try allocator.dupe(u8, "https://api.z.ai/api/coding/paas/v4/models"),
-        .referer = try allocator.dupe(u8, "https://z.ai/"),
-        .title = try allocator.dupe(u8, "zagent"),
-        .user_agent = try allocator.dupe(u8, "zagent/0.1"),
-    });
-
-    return specs.toOwnedSlice(allocator);
-}
-
-// ============================================================
 // Provider Config (JSON loading)
 // ============================================================
 
@@ -151,15 +79,7 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator, config_dir: []const u8) !
     const settings_path = try std.fs.path.join(allocator, &.{ config_dir, "settings.json" });
     defer allocator.free(settings_path);
 
-    const file = std.fs.openFileAbsolute(settings_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => {
-            const specs = try loadDefaultSpecs(allocator);
-            g_provider_specs = specs;
-            g_specs_allocator = allocator;
-            return specs;
-        },
-        else => return err,
-    };
+    const file = try std.fs.openFileAbsolute(settings_path, .{});
     defer file.close();
 
     const text = try file.readToEndAlloc(allocator, 1024 * 1024);
@@ -223,7 +143,7 @@ pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
         }
     }
     
-    // Hardcoded fallbacks if nothing loaded or found (unlikely in practice)
+    // Default fallback if requested provider not found in settings.json
     return .{
         .endpoint = "https://api.openai.com/v1/chat/completions",
         .models_endpoint = "https://api.openai.com/v1/models",
