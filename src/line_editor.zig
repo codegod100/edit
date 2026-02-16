@@ -170,18 +170,8 @@ pub fn readPromptLine(
         if (ch == 3) return null; // Ctrl+C
 
         if (ch == 13 or ch == 10) { // Enter
-            // Now draw the beautiful box!
-            // First, clear the current input line "> ..."
-            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
-            for (0..line.len + 2) |_| try stdout.writeAll("\x08 \x08");
-            try stdout.writeAll("\r\x1b[K"); // Extra clear
-
-            const wrapped_lines = [_][]const u8{ line };
-            const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
-            defer allocator.free(box);
-            try stdout.writeAll(box);
-            try stdout.writeAll("\n");
-
+            // Return to start of line and clear the prompt line completely
+            try stdout.writeAll("\r\x1b[K");
             return try allocator.dupe(u8, line);
         }
 

@@ -218,17 +218,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
-        // Read Line (it will draw its own box)
+        // Read Line
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
-            if (line_opt) |line| {
-                // To maintain UI consistency, draw a static box for queued lines
-                const display_lines = [_][]const u8{ line };
-                const box = try display.renderBox(allocator, "", &display_lines, 80);
-                defer allocator.free(box);
-                try stdout.writeAll(box);
-            }
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
         }
@@ -240,10 +233,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const line = line_opt.?;
         defer allocator.free(line);
 
-        // 4. Move cursor down past the box bottom to resume normal scrolling
-        try stdout.writeAll("\x1b[2B\r");
-
         if (line.len == 0) continue;
+
+        // Box the input in the timeline (for both manual and scripted runs)
+        const wrapped_lines = [_][]const u8{ line };
+        const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
+        defer allocator.free(box);
+        
+        display.addTimelineEntry("{s}\n", .{box});
 
         // History
         try history.append(allocator, line);
@@ -334,6 +331,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         try context.compactContextWindow(allocator, &state.context_window, active.?);
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
+
+        // Add a newline after turn completion
+        try stdout.writeAll("\n");
 
         // Drain inputs during run
         line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
