@@ -308,7 +308,7 @@ pub fn runModelTurnWithTools(
             }
         }
 
-        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list, null) catch |err| {
+        const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
             const failed_ms = std.time.milliTimestamp();
             const duration_ms = failed_ms - started_ms;
             const err_line = try display.buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);

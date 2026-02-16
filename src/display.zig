@@ -303,8 +303,10 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     const reserved_lines = prompt_lines + spinner_buffer;
     const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
 
-    // Clear screen and move to top for clean redraw
-    try stdout.writeAll("\x1b[2J\x1b[H");
+    // Move cursor to bottom to push content into scrollback, then clear visible area
+    try stdout.print("\x1b[{d}H", .{term_height}); // Move to bottom
+    try stdout.writeAll("\x1b[J"); // Clear from cursor to end (preserves scrollback above)
+    try stdout.writeAll("\x1b[H"); // Move to top to start drawing
 
     // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;

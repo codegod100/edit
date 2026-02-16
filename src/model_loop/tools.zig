@@ -1,7 +1,6 @@
 const std = @import("std");
 const tools = @import("../tools.zig");
 const display = @import("../display.zig");
-const subagent = @import("../subagent.zig");
 const todo = @import("../todo.zig");
 const legacy = @import("legacy.zig");
 
@@ -12,7 +11,6 @@ pub fn executeInlineToolCalls(
     paths: *std.ArrayList([]u8),
     tool_calls: *usize,
     todo_list: *todo.TodoList,
-    subagent_manager: ?*subagent.SubagentManager,
 ) !?[]u8 {
     _ = stdout; // Still needed for printTruncatedCommandOutput
     var result_buf: std.ArrayList(u8) = .empty;
@@ -92,7 +90,7 @@ pub fn executeInlineToolCalls(
         }
         legacy.toolOutput("{s}", .{tool_desc_buf[0..tool_desc_pos]});
 
-        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list, subagent_manager) catch |err| {
+        const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
             continue;
         };

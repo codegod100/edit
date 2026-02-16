@@ -174,7 +174,7 @@ pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     return ToolError.InvalidToolCommand;
 }
 
-pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList, subagent_manager: ?*subagent.SubagentManager) ![]u8 {
+pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList) ![]u8 {
     if (std.mem.eql(u8, name, "bash")) {
         const A = struct { command: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
@@ -376,109 +376,9 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         return std.fmt.allocPrint(allocator, "Cleared all completed todos", .{});
     }
 
-    // Subagent tools
-    if (std.mem.eql(u8, name, "subagent_spawn")) {
-        const A = struct {
-            type: ?[]const u8 = null,
-            description: ?[]const u8 = null,
-            context: ?[]const u8 = null,
-        };
-        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
-        defer p.deinit();
-
-        const task_type_str = p.value.type orelse return NamedToolError.InvalidArguments;
-        const desc = p.value.description orelse return NamedToolError.InvalidArguments;
-
-        const task_type = subagent.parseSubagentType(task_type_str) orelse {
-            return std.fmt.allocPrint(allocator, "Invalid subagent type: '{s}'. Valid types: coder, researcher, editor, tester, git", .{task_type_str});
-        };
-
-        if (subagent_manager) |sm| {
-            const id = sm.createTask(task_type, desc, p.value.context) catch |err| {
-                return std.fmt.allocPrint(allocator, "Failed to create subagent task: {s}", .{@errorName(err)});
-            };
-            const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
-            return std.fmt.allocPrint(
-                allocator,
-                "{{\"id\":\"{s}\",\"status\":\"pending\",\"type\":\"{s}\",\"system_prompt\":{f}}}",
-                .{ id, task_type_str, std.json.fmt(sys_prompt, .{}) },
-            );
-        }
-        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
-    }
-
-    if (std.mem.eql(u8, name, "subagent_status")) {
-        const A = struct { id: ?[]const u8 = null };
-        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
-        defer p.deinit();
-
-        const id = p.value.id orelse return NamedToolError.InvalidArguments;
-
-        if (subagent_manager) |sm| {
-            if (sm.getTask(id)) |task| {
-                if (task.result) |r| {
-                    return std.fmt.allocPrint(
-                        allocator,
-                        "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":{f},\"result\":{f},\"tool_calls\":{d}}}",
-                        .{
-                            task.id,
-                            @tagName(task.task_type),
-                            @tagName(task.status),
-                            std.json.fmt(task.description, .{}),
-                            std.json.fmt(r, .{}),
-                            task.tool_calls,
-                        },
-                    );
-                }
-                return std.fmt.allocPrint(
-                    allocator,
-                    "{{\"id\":\"{s}\",\"type\":\"{s}\",\"status\":\"{s}\",\"description\":{f},\"result\":null,\"tool_calls\":{d}}}",
-                    .{
-                        task.id,
-                        @tagName(task.task_type),
-                        @tagName(task.status),
-                        std.json.fmt(task.description, .{}),
-                        task.tool_calls,
-                    },
-                );
-            }
-            return std.fmt.allocPrint(allocator, "{{\"error\":\"Task not found: {s}\"}}", .{id});
-        }
-        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
-    }
-
-    if (std.mem.eql(u8, name, "subagent_list")) {
-        if (subagent_manager) |sm| {
-            const tasks_json = sm.listTasks(allocator) catch |err| {
-                return std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to list tasks: {s}\"}}", .{@errorName(err)});
-            };
-            return tasks_json;
-        }
-        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
-    }
-
-    if (std.mem.eql(u8, name, "subagent_cancel")) {
-        const A = struct { id: ?[]const u8 = null };
-        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
-        defer p.deinit();
-
-        const id = p.value.id orelse return NamedToolError.InvalidArguments;
-
-        if (subagent_manager) |sm| {
-            if (sm.updateStatus(id, .cancelled)) {
-                return std.fmt.allocPrint(allocator, "{{\"id\":\"{s}\",\"status\":\"cancelled\"}}", .{id});
-            }
-            return std.fmt.allocPrint(allocator, "{{\"error\":\"Task not found: {s}\"}}", .{id});
-        }
-        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
-    }
-
-    if (std.mem.eql(u8, name, "subagent_clear")) {
-        if (subagent_manager) |sm| {
-            const cleared = sm.clearDone();
-            return std.fmt.allocPrint(allocator, "{{\"cleared\":{d}}}", .{cleared});
-        }
-        return allocator.dupe(u8, "{\"error\":\"Subagent manager not available\"}");
+    // Subagent tools removed
+    if (std.mem.startsWith(u8, name, "subagent_")) {
+        return allocator.dupe(u8, "{\"error\":\"Subagent support has been removed\"}");
     }
 
     return NamedToolError.InvalidToolName;
@@ -1083,7 +983,7 @@ test "edit fails on ambiguous single replace" {
 
     var todo_list = todo.TodoList.init(allocator);
     defer todo_list.deinit();
-    const out = try executeNamed(allocator, "edit", args, &todo_list, null);
+    const out = try executeNamed(allocator, "edit", args, &todo_list);
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Replace failed") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "matched") != null);

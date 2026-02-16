@@ -7,7 +7,7 @@ const display = @import("../display.zig");
 const tool_routing = @import("../tool_routing.zig");
 const todo = @import("../todo.zig");
 const cancel = @import("../cancel.zig");
-const subagent = @import("../subagent.zig");
+
 const turn = @import("turn.zig");
 
 // Tool output callback type for timeline integration
@@ -63,7 +63,6 @@ pub fn runModel(
     user_input: []const u8,
     stdout_is_tty: bool,
     todo_list: *todo.TodoList,
-    subagent_manager: ?*subagent.SubagentManager,
     custom_system_prompt: ?[]const u8,
 ) !active_module.RunTurnResult {
     _ = stdout_is_tty;
@@ -83,7 +82,7 @@ pub fn runModel(
     var w: std.ArrayList(u8) = .empty;
     defer w.deinit(arena_alloc);
 
-    const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text.";
+    const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text. For complex multi-step tasks, use todo_add to create a plan and todo_update to track progress.";
 
     // Build messages array (without system field - that goes in separate system param for most APIs)
     try w.appendSlice(arena_alloc, "[");
@@ -255,118 +254,6 @@ pub fn runModel(
                 try w.appendSlice(arena_alloc, "}");
                 continue;
             }
-                const A = struct {
-                    type: ?[]const u8 = null,
-                    description: ?[]const u8 = null,
-                    context: ?[]const u8 = null,
-                };
-                var p = std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true }) catch {
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(arena_alloc, ",\"content\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt("{\"error\":\"InvalidArguments\"}", .{})});
-                    try w.appendSlice(arena_alloc, "}");
-                    continue;
-                };
-                defer p.deinit();
-
-                const task_type_str = p.value.type orelse "coder";
-                const task_type = subagent.parseSubagentType(task_type_str) orelse subagent.SubagentType.coder;
-                const desc = p.value.description orelse "subagent task";
-
-                const id = subagent_manager.?.createTask(task_type, desc, p.value.context) catch |err| {
-                    const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to create subagent task: {s}\"}}", .{@errorName(err)});
-                    defer allocator.free(msg);
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(arena_alloc, ",\"content\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(arena_alloc, "}");
-                    continue;
-                };
-
-                const args_ptr = std.heap.page_allocator.create(@import("types.zig").SubagentThreadArgs) catch null;
-                if (args_ptr == null) {
-                    const msg = "{\"error\":\"Failed to allocate subagent runner\"}";
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(arena_alloc, ",\"content\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(arena_alloc, "}");
-                    continue;
-                }
-
-                const id_owned = std.heap.page_allocator.dupe(u8, id) catch null;
-                const desc_owned = std.heap.page_allocator.dupe(u8, desc) catch null;
-                const ctx_owned = if (p.value.context) |c| std.heap.page_allocator.dupe(u8, c) catch null else null;
-                const prov_owned = std.heap.page_allocator.dupe(u8, active.provider_id) catch null;
-                const model_owned = std.heap.page_allocator.dupe(u8, active.model_id) catch null;
-                const key_owned = if (active.api_key) |k| std.heap.page_allocator.dupe(u8, k) catch null else null;
-                const effort_owned = if (active.reasoning_effort) |e| std.heap.page_allocator.dupe(u8, e) catch null else null;
-
-                if (id_owned == null or desc_owned == null or prov_owned == null or model_owned == null) {
-                    if (id_owned) |v| std.heap.page_allocator.free(v);
-                    if (desc_owned) |v| std.heap.page_allocator.free(v);
-                    if (ctx_owned) |v| std.heap.page_allocator.free(v);
-                    if (prov_owned) |v| std.heap.page_allocator.free(v);
-                    if (model_owned) |v| std.heap.page_allocator.free(v);
-                    if (key_owned) |v| std.heap.page_allocator.free(v);
-                    if (effort_owned) |v| std.heap.page_allocator.free(v);
-                    std.heap.page_allocator.destroy(args_ptr.?);
-                    const msg = "{\"error\":\"Failed to allocate subagent strings\"}";
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(arena_alloc, ",\"content\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(arena_alloc, "}");
-                    continue;
-                }
-
-                args_ptr.?.* = .{
-                    .manager = subagent_manager.?,
-                    .id = id_owned.?,
-                    .task_type = task_type,
-                    .description = desc_owned.?,
-                    .parent_context = ctx_owned,
-                    .active = .{
-                        .provider_id = prov_owned.?,
-                        .model_id = model_owned.?,
-                        .api_key = key_owned,
-                        .reasoning_effort = effort_owned,
-                    },
-                };
-
-                const th = std.Thread.spawn(.{}, @import("subagent.zig").subagentThreadMain, .{args_ptr.?}) catch |err| {
-                    args_ptr.?.deinit(std.heap.page_allocator);
-                    std.heap.page_allocator.destroy(args_ptr.?);
-                    const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to start subagent thread: {s}\"}}", .{@errorName(err)});
-                    defer allocator.free(msg);
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(arena_alloc, ",\"content\":");
-                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(arena_alloc, "}");
-                    continue;
-                };
-                th.detach();
-
-                toolOutput("• subagent {s} {s}", .{ task_type_str, id });
-
-                const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
-                const out = try std.fmt.allocPrint(
-                    allocator,
-                    "{{\"id\":\"{s}\",\"status\":\"running\",\"type\":\"{s}\",\"system_prompt\":{f}}}",
-                    .{ id, task_type_str, std.json.fmt(sys_prompt, .{}) },
-                );
-                defer allocator.free(out);
-
-                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(arena_alloc, ",\"content\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(out, .{})});
-                try w.appendSlice(arena_alloc, "}");
-                continue;
-            }
 
             // Update spinner state based on tool type
             if (std.mem.eql(u8, tc.tool, "bash")) {
@@ -431,7 +318,7 @@ pub fn runModel(
                     try w.appendSlice(arena_alloc, "}");
                     continue;
                 }
-                const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
+                const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                     toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "respond_text arguments were invalid."),
@@ -451,7 +338,7 @@ pub fn runModel(
             }
             if (tools.isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
 
-            const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
+            const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                 toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
