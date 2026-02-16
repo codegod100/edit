@@ -219,6 +219,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try stdout.writeAll("\n");
 
         // 2. Pre-render the entire box
+        // Total outer width will be box_width + 2
         // Top
         try stdout.print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
         var bw: usize = 0;
@@ -228,7 +229,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Middle (Empty)
         try stdout.print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET });
         bw = 0;
-        while (bw < box_width - 4) : (bw += 1) try stdout.writeAll(" ");
+        // box_width total inner - 3 for " > "
+        while (bw < box_width - 3) : (bw += 1) try stdout.writeAll(" ");
         try stdout.print("{s}\xe2\x94\x82{s}\n", .{ display.C_CYAN, display.C_RESET }); // │
         
         // Bottom

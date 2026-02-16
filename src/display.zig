@@ -396,6 +396,9 @@ pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
     _ = stdout_file.write(seq) catch {};
     // Ensure cursor is in region at col 1
     _ = stdout_file.write("\x1b[H") catch {};
+
+    // Initial status bar draw so it's not empty
+    renderStatusBar(stdout_file, " ", "Ready");
 }
 
 pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
