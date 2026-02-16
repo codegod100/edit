@@ -146,7 +146,10 @@ pub fn readPromptLine(
 
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
         try stdout.writeAll(prompt);
-        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+        const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) orelse return null;
+        // Print the line so it appears in the pre-rendered box
+        try stdout.writeAll(line);
+        return line;
     };
 
     var raw = original;

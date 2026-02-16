@@ -250,6 +250,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
+            if (line_opt) |line| {
+                try stdout.writeAll(line);
+            }
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
         }
