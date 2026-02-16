@@ -98,7 +98,7 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
         const display_name = try allocator.dupe(u8, "OpenRouter");
         const env_vars = try allocator.alloc([]const u8, 1);
         env_vars[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
-        const models = try allocator.alloc(Model, 5);
+        const models = try allocator.alloc(Model, 6);
         models[0] = .{
             .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet"),
             .display_name = try allocator.dupe(u8, "Claude 3.5 Sonnet"),
@@ -118,6 +118,10 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
         models[4] = .{
             .id = try allocator.dupe(u8, "x-ai/grok-4.1-fast"),
             .display_name = try allocator.dupe(u8, "Grok 4.1 Fast"),
+        };
+        models[5] = .{
+            .id = try allocator.dupe(u8, "openai/gpt-oss-120b"),
+            .display_name = try allocator.dupe(u8, "GPT-OSS 120B"),
         };
         try specs.append(allocator, .{
             .id = id,
