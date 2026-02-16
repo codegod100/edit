@@ -51,19 +51,15 @@ pub fn setSpinnerStateWithText(state: SpinnerState, text: []const u8) void {
 pub fn getSpinnerStateText(buf: []u8) []const u8 {
     const custom_len = g_spinner_custom_len.load(.acquire);
     const state = g_spinner_state.load(.acquire);
-    const state_name = switch (state) {
-        1 => "tool",
-        2 => "read",
-        3 => "write",
-        4 => "$",
-        5 => "search",
-        else => "Thinking",
-    };
 
     if (custom_len > 0) {
-        return std.fmt.bufPrint(buf, "{s}: {s}", .{ state_name, g_spinner_custom_text[0..custom_len] }) catch state_name;
+        return std.fmt.bufPrint(buf, "{s}", .{ g_spinner_custom_text[0..custom_len] }) catch "Working...";
     }
-    return "Thinking...";
+
+    return switch (state) {
+        1, 2, 3, 4, 5 => "Running...",
+        else => "Thinking...",
+    };
 }
 
 /// Get the current braille spinner frame. Call periodically to animate.
@@ -348,6 +344,13 @@ pub fn deinitTimeline() void {
 pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     g_timeline_mutex.lock();
     defer g_timeline_mutex.unlock();
+    
+    // Also print to stdout immediately so we have a scrolling log
+    g_stdout_mutex.lock();
+    defer g_stdout_mutex.unlock();
+    
+    std.debug.print(format, args);
+
     if (g_timeline_allocator) |allocator| {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;
         g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
@@ -364,99 +367,10 @@ pub fn setSpinnerActive(active: bool) void {
 /// Redraw the entire screen with timeline and current prompt.
 /// Uses direct File access to avoid buffering issues.
 pub fn clearScreenAndRedrawTimeline(stdout_file: std.fs.File, current_prompt: []const u8) !void {
-    // Lock stdout for atomic redraw
-    g_stdout_mutex.lock();
-    defer g_stdout_mutex.unlock();
-
-    // Get terminal dimensions first
-    const term_height = getTerminalHeight();
-
-    // Count lines in prompt
-    var prompt_lines: usize = 0;
-    for (current_prompt) |c| {
-        if (c == '\n') prompt_lines += 1;
-    }
-    if (prompt_lines == 0) prompt_lines = 4;
-
-    // Reserve extra line as buffer between timeline and prompt
-    const spinner_buffer: usize = if (g_spinner_active.load(.acquire)) 2 else 1;
-    const reserved_lines = prompt_lines + spinner_buffer;
-    const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
-
-    // Move to top-left and clear everything below it (avoids scrollback pollution)
-    try stdout_file.writeAll("\x1b[H\x1b[J");
-
-    // Lock timeline for reading
-    g_timeline_mutex.lock();
-    defer g_timeline_mutex.unlock();
-
-    // Calculate total lines in timeline entries
-    var total_entry_lines: usize = 0;
-    for (g_timeline_entries.items) |entry| {
-        var lines_in_entry: usize = 0;
-        for (entry) |c| {
-            if (c == '\n') lines_in_entry += 1;
-        }
-        if (entry.len > 0 and entry[entry.len - 1] != '\n') lines_in_entry += 1;
-        total_entry_lines += lines_in_entry;
-    }
-
-    // Determine which entries to show (scrolling if needed)
-    // We want to fill exactly max_timeline_lines
-    const lines_to_show = @min(total_entry_lines, max_timeline_lines);
-    var start_idx: usize = 0;
-
-    if (total_entry_lines > max_timeline_lines) {
-        // Scroll: skip oldest entries
-        var lines_to_skip = total_entry_lines - max_timeline_lines;
-        var idx: usize = 0;
-        while (idx < g_timeline_entries.items.len and lines_to_skip > 0) {
-            var lines_in_entry: usize = 0;
-            for (g_timeline_entries.items[idx]) |c| {
-                if (c == '\n') lines_in_entry += 1;
-            }
-            if (g_timeline_entries.items[idx].len > 0 and g_timeline_entries.items[idx][g_timeline_entries.items[idx].len - 1] != '\n') lines_in_entry += 1;
-
-            if (lines_in_entry <= lines_to_skip) {
-                lines_to_skip -= lines_in_entry;
-                idx += 1;
-            } else {
-                break;
-            }
-        }
-        start_idx = idx;
-    }
-
-    // Print blank lines to push content down if timeline is shorter than max
-    // This ensures the prompt is always at the bottom
-    const leading_blanks = max_timeline_lines - lines_to_show;
-    for (0..leading_blanks) |_| {
-        try stdout_file.writeAll("\n");
-    }
-
-    // Draw timeline entries
-    var idx = start_idx;
-    while (idx < g_timeline_entries.items.len) : (idx += 1) {
-        const entry = g_timeline_entries.items[idx];
-        if (entry.len == 0) continue;
-        try stdout_file.writeAll(entry);
-        if (entry[entry.len - 1] != '\n') try stdout_file.writeAll("\n");
-    }
-
-    // Exactly one blank line before prompt (this is the spinner buffer line)
-    try stdout_file.writeAll("\n");
-
-    // Draw prompt at bottom
-    try stdout_file.writeAll(current_prompt);
-
-    // Position cursor in input line (│ > ) if it's a TTY and spinner is NOT active
-    // Standard prompt is 4 lines. Input is 3rd from bottom.
-    const is_tty = std.posix.isatty(stdout_file.handle);
-    if (is_tty and !g_spinner_active.load(.acquire)) {
-        try stdout_file.writeAll("\x1b[3A\x1b[5G");
-        // Ensure cursor is visible and block style
-        try stdout_file.writeAll("\x1b[?25h\x1b[1 q");
-    }
+    _ = stdout_file;
+    _ = current_prompt;
+    // We no longer clear the screen or redraw the whole timeline.
+    // The REPL now prints things as they happen.
 }
 
 pub fn getTerminalHeight() usize {

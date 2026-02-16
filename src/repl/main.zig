@@ -33,23 +33,18 @@ fn spinnerThread(stdout_file: std.fs.File) void {
         cancel.pollForEscape();
         const state_text = display.getSpinnerStateText(&state_buf);
         
-        // Print spinner above the prompt box using relative positioning
-        // We are currently at the input line (│ > ).
-        
-        // Lock stdout for atomic update
         display.g_stdout_mutex.lock();
         
-        _ = stdout_file.write("\x1b[s") catch {}; // Save
-        _ = stdout_file.write("\x1b[2A\r") catch {}; // Move up 2 lines and to start
-        const spinner_str = std.fmt.bufPrint(&buf, "{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
+        const spinner_str = std.fmt.bufPrint(&buf, "\r{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
-        _ = stdout_file.write("\x1b[u") catch {}; // Restore to input line
         
         display.g_stdout_mutex.unlock();
         
         frame_idx = (frame_idx + 1) % frames.len;
         std.Thread.sleep(80 * std.time.ns_per_ms);
     }
+    // Final clear
+    _ = stdout_file.write("\r\x1b[K") catch {};
 }
 
 // Reset cursor to terminal default
@@ -244,6 +239,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
+        // Print the prompt box
+        try stdout.writeAll(prompt);
+
         // Read Line
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
@@ -280,10 +278,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // Add user input to timeline and redraw immediately to clear input box
+        // Add user input to timeline
         display.addTimelineEntry("{s}>>{s} {s}\n", .{ display.C_CYAN, display.C_RESET, line });
-        // Redraw BEFORE startSpinner so it's not skipped by the active flag
-        try display.clearScreenAndRedrawTimeline(stdout_file, prompt);
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
@@ -295,25 +291,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
         defer legacy.deinitToolOutputArena();
         
         g_callback_stdout_file = stdout_file;
-        g_callback_prompt = prompt;
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
                 cancel.pollForEscape();
                 display.addTimelineEntry("{s}", .{text});
-                if (g_callback_stdout_file) |f| {
-                    if (g_callback_prompt) |p| {
-                        // Temporarily disable spinner flag to force full redraw
-                        const was_active = display.g_spinner_active.swap(false, .acquire);
-                        display.clearScreenAndRedrawTimeline(f, p) catch {};
-                        if (was_active) display.g_spinner_active.store(true, .release);
-                    }
-                }
             }
         }.callback);
         defer {
             model_loop.setToolOutputCallback(null);
             g_callback_stdout_file = null;
-            g_callback_prompt = null;
         }
 
         // Arena for per-turn allocations (context prompt, model result, etc.)
@@ -359,9 +345,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         try context.compactContextWindow(allocator, &state.context_window, active.?);
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
-
-        // Redraw timeline with prompt at bottom
-        try display.clearScreenAndRedrawTimeline(stdout_file, prompt);
 
         // Drain inputs during run
         line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
