@@ -208,10 +208,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
             display.setStatusBarInfo("none", "none", cwd);
         }
 
-        // Get terminal width/height for box and logging
+        // Get terminal dimensions
         const term_width = display.terminalColumns();
         const term_height = display.getTerminalHeight();
-        const box_width = if (term_width > 4) term_width - 2 else 78;
+        const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 

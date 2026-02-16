@@ -285,9 +285,9 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 
                 if (trimmed.len > MAX_WIDTH) {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
-                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
                 } else {
-                    addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, trimmed, C_RESET });
+                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
                 }
             }
         }
@@ -301,14 +301,14 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
         const line = output[r.start..r.end];
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
         } else {
-            addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, line, C_RESET });
+            addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
         }
     }
 
     const omitted = total - HEAD - TAIL;
-    addTimelineEntry("    {s}\xe2\x80\xa6 +{d} lines{s}", .{ C_GREY, omitted, C_RESET });
+    addTimelineEntry("    {s}\xe2\x80\xa6 +{d} lines{s}\n", .{ C_GREY, omitted, C_RESET });
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
@@ -317,9 +317,9 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
         const line = output[r.start..r.end];
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}", .{ C_GREY, line[0..safe_len], C_RESET, "" });
+            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}\n", .{ C_GREY, line[0..safe_len], C_RESET, "" });
         } else {
-            addTimelineEntry("    {s}{s}{s}", .{ C_GREY, line, C_RESET });
+            addTimelineEntry("    {s}{s}{s}\n", .{ C_GREY, line, C_RESET });
         }
     }
 }
