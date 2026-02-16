@@ -124,6 +124,18 @@ pub const TodoList = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    pub fn totalCount(self: *const TodoList) usize {
+        return self.items.items.len;
+    }
+
+    pub fn completedCount(self: *const TodoList) usize {
+        var count: usize = 0;
+        for (self.items.items) |item| {
+            if (item.status == .done) count += 1;
+        }
+        return count;
+    }
+
     pub fn summary(self: *const TodoList) []const u8 {
         var pending: usize = 0;
         var in_progress: usize = 0;

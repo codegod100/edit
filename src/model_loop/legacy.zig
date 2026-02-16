@@ -171,10 +171,20 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    const max_iterations: usize = 12;
+    var max_iterations: usize = 12;
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
+        // ADAPTIVE STEP LIMIT: If we are near the end but have a high completion rate, grant extra steps
+        if (iter == max_iterations - 2) {
+            const completed = todo_list.completedCount();
+            const total_todos = todo_list.totalCount();
+            if (total_todos > 0 and (@as(f32, @floatFromInt(completed)) / @as(f32, @floatFromInt(total_todos)) >= 0.75)) {
+                max_iterations += 5;
+                toolOutput("{s}Note:{s} task near completion ({d}/{d}); granting 5 extra steps for final push.", .{ display.C_DIM, display.C_RESET, completed, total_todos });
+            }
+        }
+
         if (turn.isCancelled()) {
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
@@ -271,6 +281,13 @@ pub fn runModel(
         }
         no_tool_retries = 0;
 
+        // BATCH TOOL EXECUTION: Process all tool calls in parallel (sequentially in code, but in one turn)
+        var turn_results: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (turn_results.items) |r| arena_alloc.free(r);
+            turn_results.deinit(arena_alloc);
+        }
+
         for (response.tool_calls) |tc| {
             const is_same_as_prev = blk: {
                 if (last_tool_name == null or last_tool_args == null) break :blk false;
@@ -299,14 +316,8 @@ pub fn runModel(
             const repeat_threshold: usize = if (is_bash) 1 else 3;
             if (repeated_tool_calls >= repeat_threshold) {
                 toolOutput("{s}Note:{s} repeated identical tool call detected; requesting a different next action.", .{ display.C_DIM, display.C_RESET });
-                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(arena_alloc, ",\"content\":");
-                try w.writer(arena_alloc).print(
-                    "{f}",
-                    .{std.json.fmt("Tool call rejected: repeated identical tool call. Reuse the previous result and choose a different next action (or finish with respond_text).", .{})},
-                );
-                try w.appendSlice(arena_alloc, "}");
+                const msg = "Tool call rejected: repeated identical tool call. Reuse the previous result and choose a different next action (or finish with respond_text).";
+                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
 
                 if (is_bash) {
                     rejected_repeated_bash += 1;
@@ -330,13 +341,8 @@ pub fn runModel(
             tool_calls += 1;
 
             if (std.mem.eql(u8, tc.tool, "subagent_spawn")) {
-                // Subagent support removed - return error
                 const msg = "{\"error\":\"Subagent support has been removed\"}";
-                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(arena_alloc, ",\"content\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
-                try w.appendSlice(arena_alloc, "}");
+                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                 continue;
             }
 
@@ -347,7 +353,6 @@ pub fn runModel(
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
                     if (is_rg) {
-                        // Only truncate if really long (80 chars)
                         const display_cmd = if (cmd.len > 80) cmd[cmd.len - 80 ..] else cmd;
                         display.setSpinnerStateWithText(.search, display_cmd);
                         toolOutput("• Search {s}", .{cmd});
@@ -381,9 +386,7 @@ pub fn runModel(
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 display.setSpinnerState(.thinking);
-                // Extract and show the text content
                 const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
-                // Unescape JSON escape sequences (\n -> newline, etc.)
                 var unescape_buf: [4096]u8 = undefined;
                 const unescaped = unescapeJsonString(&unescape_buf, text);
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, unescaped });
@@ -395,12 +398,8 @@ pub fn runModel(
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 if (mutation_request and mutating_tools_executed == 0) {
                     toolOutput("{s}Note:{s} request seems to require a file change, but no mutating tools were run.", .{ display.C_YELLOW, display.C_RESET });
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                    try w.writer(arena_alloc).print(
-                        "{f}",
-                        .{std.json.fmt("Your plan mentioned a file change, but you haven't executed any mutating tools (like write_file, edit, etc.) yet. Please execute the necessary tools to apply the changes before calling respond_text. If no change is actually needed, please explain why.", .{})},
-                    );
-                    try w.appendSlice(arena_alloc, "}");
+                    const msg = "Your plan mentioned a file change, but you haven't executed any mutating tools (like write_file, edit, etc.) yet. Please execute the necessary tools to apply the changes before calling respond_text. If no change is actually needed, please explain why.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
                 const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
@@ -425,51 +424,30 @@ pub fn runModel(
 
             const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                 toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
-                const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
-                defer allocator.free(err_msg);
-
-                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(arena_alloc, ",\"content\":");
-                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(err_msg, .{})});
-                try w.appendSlice(arena_alloc, "}");
+                const err_msg = try std.fmt.allocPrint(arena_alloc, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
+                try turn_results.append(arena_alloc, err_msg);
                 continue;
             };
-            defer arena_alloc.free(result);
 
             if (result.len > 0) {
                 try display.printTruncatedCommandOutput(stdout, result);
             }
 
             const clean_result = try display.stripAnsi(arena_alloc, result);
-            // clean_result is in arena, no need to free
-
-            try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
-            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
-            try w.appendSlice(arena_alloc, ",\"content\":");
-            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(clean_result, .{})});
-            try w.appendSlice(arena_alloc, "}");
+            try turn_results.append(arena_alloc, clean_result);
+            arena_alloc.free(result);
 
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 const A = struct { command: ?[]const u8 = null };
-                if (std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true })) |p| {
-                    defer p.deinit();
+                if (std.json.parseFromSlice(A, arena_alloc, tc.args, .{ .ignore_unknown_fields = true })) |p| {
                     if (p.value.command) |cmd_raw| {
                         const cmd = std.mem.trim(u8, cmd_raw, " \t\r\n");
                         const is_rg = std.mem.eql(u8, cmd, "rg") or std.mem.startsWith(u8, cmd, "rg ");
                         if (is_rg) {
-                            const out_trimmed = std.mem.trim(u8, result, " \t\r\n");
+                            const out_trimmed = std.mem.trim(u8, clean_result, " \t\r\n");
                             const effectively_empty = out_trimmed.len == 0 or std.mem.eql(u8, out_trimmed, "[exit 1]");
                             if (effectively_empty) {
                                 consecutive_empty_rg += 1;
-                                if (consecutive_empty_rg >= 2) {
-                                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                                    try w.writer(arena_alloc).print(
-                                        "{f}",
-                                        .{std.json.fmt("rg returned no matches multiple times. Do not keep varying the pattern. Instead, inspect likely files (e.g. list src/, open README/config), or ask the user for the exact symbol/file to change.", .{})},
-                                    );
-                                    try w.appendSlice(arena_alloc, "}");
-                                }
                             } else {
                                 consecutive_empty_rg = 0;
                             }
@@ -488,6 +466,26 @@ pub fn runModel(
                 } else {
                     arena_alloc.free(p);
                 }
+            }
+        }
+
+        // Add all tool results to conversation
+        for (response.tool_calls, 0..) |tc, i| {
+            const clean_result = turn_results.items[i];
+
+            try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+            try w.appendSlice(arena_alloc, ",\"content\":");
+            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(clean_result, .{})});
+            try w.appendSlice(arena_alloc, "}");
+
+            if (consecutive_empty_rg >= 2 and i == response.tool_calls.len - 1) {
+                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                try w.writer(arena_alloc).print(
+                    "{f}",
+                    .{std.json.fmt("rg returned no matches multiple times. Do not keep varying the pattern. Instead, inspect likely files (e.g. list src/, open README/config), or ask the user for the exact symbol/file to change.", .{})},
+                );
+                try w.appendSlice(arena_alloc, "}");
             }
         }
     }

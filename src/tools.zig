@@ -126,6 +126,11 @@ pub const definitions = [_]ToolDef{
     .{ .name = "todo_list", .description = "List all todo items with their current status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
     .{ .name = "todo_remove", .description = "Remove a todo item by ID.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID to remove\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
     .{ .name = "todo_clear_done", .description = "Clear all completed todo items.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
+    .{
+        .name = "get_file_outline",
+        .description = "Retrieves a structural outline of a source file (functions, structs, etc.) to understand its architecture without reading the full implementation.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"The path to the file to outline\"}},\"required\":[\"path\"],\"additionalProperties\":false}",
+    },
 };
 
 pub fn list() []const []const u8 {
@@ -374,6 +379,14 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     if (std.mem.eql(u8, name, "todo_clear_done")) {
         todo_list.clearDone();
         return std.fmt.allocPrint(allocator, "Cleared all completed todos", .{});
+    }
+
+    if (std.mem.eql(u8, name, "get_file_outline")) {
+        const A = struct { path: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const path = p.value.path orelse return NamedToolError.InvalidArguments;
+        return getFileOutline(allocator, path);
     }
 
     // Subagent tools removed
@@ -1035,3 +1048,46 @@ test "count edited lines tracks changed block size" {
     try std.testing.expectEqual(@as(usize, 1), countEditedLines("a\nb\nc\n", "a\nx\nc\n"));
     try std.testing.expectEqual(@as(usize, 3), countEditedLines("a\nb\nc\n", "a\nx\ny\nz\n"));
 }
+
+fn getFileOutline(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const content = try readFileAtPath(allocator, path, 4 * 1024 * 1024);
+    defer allocator.free(content);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.print("Outline of {s}:\n", .{path});
+
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var line_num: usize = 1;
+    while (it.next()) |line| : (line_num += 1) {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        // Simple heuristics for common languages (Zig, TS, Python, Go)
+        const is_decl = std.mem.startsWith(u8, trimmed, "fn ") or
+            std.mem.startsWith(u8, trimmed, "pub fn ") or
+            std.mem.startsWith(u8, trimmed, "const ") or
+            std.mem.startsWith(u8, trimmed, "pub const ") or
+            std.mem.startsWith(u8, trimmed, "struct ") or
+            std.mem.startsWith(u8, trimmed, "pub struct ") or
+            std.mem.startsWith(u8, trimmed, "interface ") or
+            std.mem.startsWith(u8, trimmed, "class ") or
+            std.mem.startsWith(u8, trimmed, "def ") or
+            std.mem.startsWith(u8, trimmed, "type ");
+
+        if (is_decl) {
+            // Only include the declaration line, but skip very long ones
+            const cap = @min(trimmed.len, 120);
+            try w.print("{d:4}: {s}\n", .{ line_num, trimmed[0..cap] });
+        }
+    }
+
+    if (out.items.len <= "Outline of :\n".len + path.len) {
+        try w.writeAll("(no major declarations found)\n");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+

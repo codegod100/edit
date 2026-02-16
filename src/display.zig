@@ -191,7 +191,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     const HEAD: usize = 5;
     const TAIL: usize = 5;
 
-    const Range = struct { start: usize, end: usize };
+    const Range = struct { start: usize, end: usize, important: bool = false };
     var head: [HEAD]Range = undefined;
     var head_len: usize = 0;
 
@@ -214,14 +214,34 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
             if (trimmed.len == 0) continue;
             total += 1;
 
-            const r: Range = .{ .start = start, .end = end };
+            const is_important = std.mem.indexOf(u8, trimmed, "error:") != null or std.mem.indexOf(u8, trimmed, "note:") != null or std.mem.indexOf(u8, trimmed, "panic:") != null;
+
+            const r: Range = .{ .start = start, .end = end, .important = is_important };
             if (head_len < HEAD) {
                 head[head_len] = r;
                 head_len += 1;
             }
 
-            tail[tail_seen % TAIL] = r;
-            tail_seen += 1;
+            // If important, try to keep it in the tail buffer even if it was a while ago
+            if (is_important) {
+                // Find a non-important slot to replace, or just use the rolling index
+                var replaced = false;
+                var j: usize = 0;
+                while (j < TAIL) : (j += 1) {
+                    if (!tail[j].important) {
+                        tail[j] = r;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) {
+                    tail[tail_seen % TAIL] = r;
+                    tail_seen += 1;
+                }
+            } else {
+                tail[tail_seen % TAIL] = r;
+                tail_seen += 1;
+            }
             if (tail_len < TAIL) tail_len += 1;
         }
     }
