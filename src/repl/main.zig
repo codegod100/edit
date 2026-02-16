@@ -218,19 +218,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
-        // Print the prompt prefix
-        try stdout.writeAll(display.C_CYAN ++ "> " ++ display.C_RESET);
+        // Print the prompt prefix to stderr (so it doesn't pollute redirected stdout)
+        if (queued_lines.items.len == 0) {
+            std.debug.print("{s}> {s}", .{ display.C_CYAN, display.C_RESET });
+        }
 
         // Read Line
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
-            if (line_opt) |line| {
-                try stdout.writeAll(line);
-                try stdout.writeAll("\n");
-                // Clear the temporary scripted line so the boxed version can take its place
-                try stdout.writeAll("\r\x1b[K\x1b[A\r\x1b[K"); 
-            }
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
         }
@@ -242,9 +238,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const line = line_opt.?;
         defer allocator.free(line);
 
+        // Ensure we are at the start of a clean line before drawing the box
+        std.debug.print("\r\x1b[K", .{});
+
         if (line.len == 0) {
-            // If empty line, we still need to clear the "> " prefix to stay clean
-            try stdout.writeAll("\r\x1b[K");
             continue;
         }
 
