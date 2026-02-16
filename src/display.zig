@@ -642,20 +642,35 @@ pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, stat
     const m_len = g_status_model_len.load(.acquire);
     const path_len = g_status_path_len.load(.acquire);
 
-    var id_buf: [128]u8 = undefined;
-    const full_id = std.fmt.bufPrint(&id_buf, "{s}/{s}", .{ g_status_provider[0..p_len], g_status_model[0..m_len] }) catch "model";
-
     var buf: [1024]u8 = undefined;
-    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s: <20} {s} {s: >30} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
+    
+    // Status text (Spinner + State) - Fixed width 30 chars
+    // Provider/Model - Fixed start at col 32
+    // Path - Fixed start at col 64 or right aligned? 
+    // Let's use specific widths.
+    
+    var id_buf: [128]u8 = undefined;
+    // Spinner + State: "⠋ Thinking..." (max ~20 chars)
+    const status_part = std.fmt.bufPrint(&id_buf, "{s} {s}", .{spinner_frame, state_text}) catch " ";
+    
+    // Model ID: "openai/gpt-4"
+    const full_id = std.fmt.bufPrint(&buf, "{s}/{s}", .{ g_status_provider[0..p_len], g_status_model[0..m_len] }) catch "model";
+
+    // Path
+    const path_str = g_status_path[0..path_len];
+
+    // Construct the full line with explicit padding
+    // We use a new buffer for the final escape sequence
+    var final_buf: [2048]u8 = undefined;
+    const status = std.fmt.bufPrint(&final_buf, "\x1b[s\x1b[{d};1H{s}{s} {s: <25} {s} {s: <30} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
         term_height,
         bg_color,
         fg_color,
-        spinner_frame,
-        state_text,
+        status_part, // Left (Status)
         accent_color,
-        full_id,
+        full_id,     // Middle (Model)
         fg_color,
-        g_status_path[0..path_len],
+        path_str,    // Right (Path)
     }) catch return;
 
     const safe_len = @min(status.len, term_width + 100); // 100 for escape codes
