@@ -161,7 +161,12 @@ pub fn readPromptLine(
         raw.cc[16] = 1;
         raw.cc[17] = 0;
     }
-    try std.posix.tcsetattr(stdin_file.handle, .NOW, raw);
+    std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
+        // If terminal setup fails (e.g., Ctrl+C pressed), fall back to simple mode
+        std.log.debug("Failed to set raw mode: {any}", .{err});
+        try stdout.writeAll(prompt);
+        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+    };
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
     // Initial draw of timeline + prompt
