@@ -483,30 +483,51 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
     const inner_width = width - 2;
 
     // Top
-    try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.top_left});
+    try w.writeAll(C_DIM);
+    try w.writeAll(s.top_left);
     var i: usize = 0;
     while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
-    try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.top_right});
+    try w.writeAll(s.top_right);
+    try w.writeAll(C_RESET);
+    try w.writeAll("\n");
 
     // Title line if present
     if (title.len > 0) {
-        try w.print(C_DIM ++ "{s}" ++ C_RESET ++ "  " ++ C_BOLD ++ C_CYAN ++ "{s}" ++ C_RESET, .{ s.vertical, title });
+        try w.writeAll(C_DIM);
+        try w.writeAll(s.vertical);
+        try w.writeAll(C_RESET);
+        try w.writeAll("  ");
+        try w.writeAll(C_BOLD);
+        try w.writeAll(C_CYAN);
+        try w.writeAll(title);
+        try w.writeAll(C_RESET);
+        
         const padding = if (inner_width > title.len + 2) inner_width - 2 - title.len else 0;
         i = 0;
         while (i < padding) : (i += 1) try w.writeByte(' ');
-        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+        
+        try w.writeAll(C_DIM);
+        try w.writeAll(s.vertical);
+        try w.writeAll(C_RESET);
+        try w.writeAll("\n");
 
-        try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.mid_left});
+        try w.writeAll(C_DIM);
+        try w.writeAll(s.mid_left);
         i = 0;
         while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
-        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.mid_right});
+        try w.writeAll(s.mid_right);
+        try w.writeAll(C_RESET);
+        try w.writeAll("\n");
     }
 
     // Content with ANSI-aware word wrapping
     for (lines) |line| {
         var start: usize = 0;
         while (start < line.len or line.len == 0) {
-            try w.print(C_DIM ++ "{s}" ++ C_RESET ++ " ", .{s.vertical});
+            try w.writeAll(C_DIM);
+            try w.writeAll(s.vertical);
+            try w.writeAll(C_RESET);
+            try w.writeAll(" ");
             
             var visible_count: usize = 0;
             var j: usize = start;
@@ -516,9 +537,11 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
 
             while (j < line.len and visible_count < target_width) {
                 if (line[j] == 0x1b and j + 1 < line.len and line[j + 1] == '[') {
+                    const esc_start = j;
                     j += 2;
                     while (j < line.len and !((line[j] >= 'A' and line[j] <= 'Z') or line[j] == 'm')) : (j += 1) {}
                     j += 1;
+                    try w.writeAll(line[esc_start..j]);
                     continue;
                 }
                 
@@ -562,7 +585,11 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
             var p: usize = 0;
             while (p < padding) : (p += 1) try w.writeByte(' ');
             
-            try w.print(" " ++ C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+            try w.writeAll(" ");
+            try w.writeAll(C_DIM);
+            try w.writeAll(s.vertical);
+            try w.writeAll(C_RESET);
+            try w.writeAll("\n");
             
             start = end;
             if (start >= line.len and line.len > 0) break;
@@ -571,10 +598,13 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
     }
 
     // Bottom
-    try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.bottom_left});
+    try w.writeAll(C_DIM);
+    try w.writeAll(s.bottom_left);
     i = 0;
     while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
-    try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.bottom_right});
+    try w.writeAll(s.bottom_right);
+    try w.writeAll(C_RESET);
+    try w.writeAll("\n");
 
     return out.toOwnedSlice(allocator);
 }
