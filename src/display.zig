@@ -206,23 +206,44 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
 
 /// Format command output for timeline and add it via callback
 fn formatTruncatedCommandOutput(output: []const u8) void {
-    var head_limit: usize = 5;
-    var tail_limit: usize = 5;
-
-    // If the output looks like a box, give it more vertical room.
-    // Detection is robust: check for raw box char OR ANSI-dimmed box char.
+    // 1. Detect if this is a box (Plan & Progress, etc.)
     const is_box = blk: {
         if (output.len < 3) break :blk false;
-        // Check first 16 bytes for any box-drawing characters
-        const check_len = @min(output.len, 16);
+        // Check first 32 bytes for any box-drawing characters (allowing for ANSI codes)
+        const check_len = @min(output.len, 32);
         break :blk std.mem.indexOf(u8, output[0..check_len], "╭") != null or 
                  std.mem.indexOf(u8, output[0..check_len], "\xe2\x95\xad") != null;
     };
 
+    const MAX_WIDTH: usize = 500;
+
+    // 2. If it's a box, bypass truncation logic entirely
     if (is_box) {
-        head_limit = 100;
-        tail_limit = 5; // Minimal tail for safety
+        var line_start: usize = 0;
+        var i: usize = 0;
+        while (i <= output.len) : (i += 1) {
+            if (i == output.len or output[i] == '\n') {
+                const raw = output[line_start..i];
+                const trimmed = std.mem.trimRight(u8, raw, "\r");
+                line_start = i + 1;
+                if (trimmed.len == 0) continue;
+
+                // For boxes, we use a simple indent but no L-bracket prefix
+                const prefix = "    ";
+                if (trimmed.len > MAX_WIDTH) {
+                    const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
+                } else {
+                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                }
+            }
+        }
+        return;
     }
+
+    // 3. Standard command output truncation logic
+    const head_limit: usize = 5;
+    const tail_limit: usize = 5;
 
     const Range = struct { start: usize, end: usize, important: bool = false };
     const MAX_BUFFER = 100;
@@ -283,7 +304,6 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     if (total == 0) return;
 
     const trunc = total > (head_limit + tail_limit);
-    const MAX_WIDTH: usize = 500;
 
     if (!trunc) {
         var printed_any = false;
@@ -296,24 +316,14 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 line_start = i + 1;
                 if (trimmed.len == 0) continue;
 
-                var prefix: []const u8 = "    ";
-                if (!printed_any) {
-                    printed_any = true;
-                    // If this is a box, don't use the L-bracket prefix
-                    if (std.mem.startsWith(u8, trimmed, "╭") or std.mem.startsWith(u8, trimmed, "\xe2\x95\xad")) {
-                        prefix = "";
-                    } else {
-                        prefix = "  \xe2\x94\x94 ";
-                    }
-                } else if (std.mem.startsWith(u8, trimmed, "╭") or std.mem.startsWith(u8, trimmed, "\xe2\x95\xad")) {
-                    prefix = "";
-                }
+                const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
+                printed_any = true;
                 
                 if (trimmed.len > MAX_WIDTH) {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
                     addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
                 } else {
-                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
                 }
             }
         }
@@ -323,17 +333,8 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     var printed_any = false;
     for (head[0..head_len]) |r| {
         const line = output[r.start..r.end];
-        var prefix: []const u8 = "    ";
-        if (!printed_any) {
-            printed_any = true;
-            if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad")) {
-                prefix = "";
-            } else {
-                prefix = "  \xe2\x94\x94 ";
-            }
-        } else if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad")) {
-            prefix = "";
-        }
+        const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
+        printed_any = true;
 
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
@@ -351,17 +352,17 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     while (t < tail_len) : (t += 1) {
         const r = tail[(first + t) % tail_limit];
         const line = output[r.start..r.end];
-        const prefix = if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad") or std.mem.startsWith(u8, line, "│") or std.mem.startsWith(u8, line, "\xe2\x94\x82") or std.mem.startsWith(u8, line, "╰") or std.mem.startsWith(u8, line, "\xe2\x95\xb0")) "" else "    ";
+        const prefix = "    ";
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
             addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
-                } else {
-                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
-                }
-            }
+        } else {
+            addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
         }
-        
-        fn findUtf8SafeLen(text: []const u8, max: usize) usize {
+    }
+}
+
+fn findUtf8SafeLen(text: []const u8, max: usize) usize {
     if (text.len <= max) return text.len;
     var i = max;
     // Walk back to start of UTF-8 character (not 10xxxxxx)
@@ -416,6 +417,22 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;
         g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
     }
+}
+
+pub fn getTerminalHeight() usize {
+    if (builtin.os.tag != .windows) {
+        var ws: std.posix.winsize = .{
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (std.posix.errno(rc) == .SUCCESS and ws.row > 0) {
+            return @as(usize, @intCast(ws.row));
+        }
+    }
+    return 24; // Default terminal height
 }
 
 pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
@@ -534,6 +551,13 @@ pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
     _ = stdout_file.write(seq) catch {};
 }
 
+// Track if spinner is active to reserve space for it
+pub var g_spinner_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+pub fn setSpinnerActive(active: bool) void {
+    g_spinner_active.store(active, .release);
+}
+
 pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, state_text: []const u8) void {
     const term_height = getTerminalHeight();
     const term_width = terminalColumns();
@@ -568,202 +592,4 @@ pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, stat
 
     const safe_len = @min(status.len, term_width + 100); // 100 for escape codes
     _ = stdout_file.write(status[0..safe_len]) catch {};
-}
-
-// Track if spinner is active to reserve space for it
-pub var g_spinner_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-pub fn setSpinnerActive(active: bool) void {
-    g_spinner_active.store(active, .release);
-}
-
-/// Redraw the entire screen with timeline and current prompt.
-/// Uses direct File access to avoid buffering issues.
-pub fn clearScreenAndRedrawTimeline(stdout_file: std.fs.File, current_prompt: []const u8) !void {
-    _ = stdout_file;
-    _ = current_prompt;
-    // We no longer clear the screen or redraw the whole timeline.
-    // The REPL now prints things as they happen.
-}
-
-pub fn getTerminalHeight() usize {
-    if (builtin.os.tag != .windows) {
-        var ws: std.posix.winsize = .{
-            .row = 0,
-            .col = 0,
-            .xpixel = 0,
-            .ypixel = 0,
-        };
-        const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-        if (std.posix.errno(rc) == .SUCCESS and ws.row > 0) {
-            return @as(usize, @intCast(ws.row));
-        }
-    }
-    return 24; // Default terminal height
-}
-
-fn isMarkdownTableSeparatorRow(line: []const u8) bool {
-    var text = std.mem.trim(u8, line, " \t");
-    if (text.len == 0) return false;
-    if (text[0] == '|') text = text[1..];
-    if (text.len > 0 and text[text.len - 1] == '|') text = text[0 .. text.len - 1];
-    if (text.len == 0) return false;
-
-    var seen_dash = false;
-    for (text) |ch| {
-        switch (ch) {
-            '-', ':' => seen_dash = true,
-            '|', ' ', '\t' => {},
-            else => return false,
-        }
-    }
-    return seen_dash;
-}
-
-fn renderMarkdownTableRow(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), line: []const u8, use_color: bool) !bool {
-    const trimmed = std.mem.trim(u8, line, " \t");
-    if (trimmed.len < 3) return false;
-    if (trimmed[0] != '|' and std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
-    if (isMarkdownTableSeparatorRow(trimmed)) return true;
-
-    var row = trimmed;
-    if (row.len > 0 and row[0] == '|') row = row[1..];
-    if (row.len > 0 and row[row.len - 1] == '|') row = row[0 .. row.len - 1];
-
-    var cells = std.mem.splitScalar(u8, row, '|');
-    var first = true;
-    while (cells.next()) |cell_raw| {
-        const cell = std.mem.trim(u8, cell_raw, " \t");
-        if (cell.len == 0) continue;
-        if (!first) try out.appendSlice(allocator, " | ");
-        first = false;
-        if (use_color) {
-            try out.writer(allocator).print("{s}{s}{s}", .{ C_CYAN, cell, C_RESET });
-        } else {
-            try out.appendSlice(allocator, cell);
-        }
-    }
-    try out.append(allocator, '\n');
-    return true;
-}
-
-pub fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, use_color: bool) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-
-    var in_code_block = false;
-    var lines = std.mem.splitScalar(u8, input, '\n');
-    while (lines.next()) |line| {
-        const trimmed_left = std.mem.trimLeft(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed_left, "```")) {
-            in_code_block = !in_code_block;
-            continue;
-        }
-
-        if (try renderMarkdownTableRow(allocator, &out, line, use_color)) {
-            continue;
-        }
-
-        if (in_code_block) {
-            if (use_color) try out.writer(allocator).print("{s}{s}{s}\n", .{ C_GREY, line, C_RESET }) else {
-                try out.appendSlice(allocator, line);
-                try out.append(allocator, '\n');
-            }
-            continue;
-        }
-
-        var hashes: usize = 0;
-        while (hashes < trimmed_left.len and trimmed_left[hashes] == '#') : (hashes += 1) {}
-        if (hashes > 0 and hashes <= 6 and hashes < trimmed_left.len and trimmed_left[hashes] == ' ') {
-            const header_text = std.mem.trim(u8, trimmed_left[hashes + 1 ..], " \t");
-            if (use_color) try out.writer(allocator).print("{s}{s}{s}{s}\n", .{ C_BOLD, C_CYAN, header_text, C_RESET }) else {
-                try out.appendSlice(allocator, header_text);
-                try out.append(allocator, '\n');
-            }
-            continue;
-        }
-
-        var content = line;
-        if (std.mem.startsWith(u8, trimmed_left, ">")) {
-            if (use_color) try out.appendSlice(allocator, C_DIM);
-            try out.appendSlice(allocator, "| ");
-            content = std.mem.trimLeft(u8, trimmed_left[1..], " \t");
-        } else if ((std.mem.startsWith(u8, trimmed_left, "- ") or std.mem.startsWith(u8, trimmed_left, "* ") or std.mem.startsWith(u8, trimmed_left, "+ "))) {
-            try out.appendSlice(allocator, "• ");
-            content = trimmed_left[2..];
-        } else {
-            var di: usize = 0;
-            while (di < trimmed_left.len and std.ascii.isDigit(trimmed_left[di])) : (di += 1) {}
-            if (di > 0 and di + 1 < trimmed_left.len and trimmed_left[di] == '.' and trimmed_left[di + 1] == ' ') {
-                try out.appendSlice(allocator, trimmed_left[0 .. di + 2]);
-                content = trimmed_left[di + 2 ..];
-            }
-        }
-
-        try appendInlineMarkdown(allocator, &out, content, use_color);
-        if (use_color and std.mem.startsWith(u8, trimmed_left, ">")) {
-            try out.appendSlice(allocator, C_RESET);
-        }
-        try out.append(allocator, '\n');
-    }
-
-    if (out.items.len > 0 and out.items[out.items.len - 1] == '\n') out.items.len -= 1;
-    return out.toOwnedSlice(allocator);
-}
-
-fn appendInlineMarkdown(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    text: []const u8,
-    use_color: bool,
-) !void {
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '`') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '`')) |end| {
-                const code = text[i + 1 .. end];
-                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_YELLOW, code, C_RESET }) else try out.appendSlice(allocator, code);
-                i = end + 1;
-                continue;
-            }
-        }
-
-        if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
-            if (std.mem.indexOfPos(u8, text, i + 2, "**")) |end| {
-                const bold_text = text[i + 2 .. end];
-                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_BOLD, bold_text, C_RESET }) else try out.appendSlice(allocator, bold_text);
-                i = end + 2;
-                continue;
-            }
-        }
-
-        if (text[i] == '*') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, '*')) |end| {
-                const em_text = text[i + 1 .. end];
-                if (use_color) try out.writer(allocator).print("{s}{s}{s}", .{ C_ITALIC, em_text, C_RESET }) else try out.appendSlice(allocator, em_text);
-                i = end + 1;
-                continue;
-            }
-        }
-
-        if (text[i] == '[') {
-            if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |close_bracket| {
-                if (close_bracket + 2 < text.len and text[close_bracket + 1] == '(') {
-                    if (std.mem.indexOfScalarPos(u8, text, close_bracket + 2, ')')) |close_paren| {
-                        const label = text[i + 1 .. close_bracket];
-                        const url = text[close_bracket + 2 .. close_paren];
-                        if (use_color) try out.writer(allocator).print("{s}{s}{s} ({s})", .{ C_UNDERLINE, label, C_RESET, url }) else {
-                            try out.appendSlice(allocator, label);
-                            try out.writer(allocator).print(" ({s})", .{url});
-                        }
-                        i = close_paren + 1;
-                        continue;
-                    }
-                }
-            }
-        }
-
-        try out.append(allocator, text[i]);
-        i += 1;
-    }
 }
