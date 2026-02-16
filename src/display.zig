@@ -206,14 +206,21 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
 
 /// Format command output for timeline and add it via callback
 fn formatTruncatedCommandOutput(output: []const u8) void {
-    const HEAD: usize = 5;
-    const TAIL: usize = 5;
+    var head_limit: usize = 5;
+    var tail_limit: usize = 5;
+
+    // If the output looks like a box, give it more vertical room
+    if (std.mem.startsWith(u8, output, "╭") or std.mem.startsWith(u8, output, "\xe2\x95\xad")) {
+        head_limit = 50;
+        tail_limit = 50;
+    }
 
     const Range = struct { start: usize, end: usize, important: bool = false };
-    var head: [HEAD]Range = undefined;
+    const MAX_BUFFER = 100;
+    var head: [MAX_BUFFER]Range = undefined;
     var head_len: usize = 0;
 
-    var tail: [TAIL]Range = undefined;
+    var tail: [MAX_BUFFER]Range = undefined;
     var tail_seen: usize = 0;
     var tail_len: usize = 0;
 
@@ -235,7 +242,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
             const is_important = std.mem.indexOf(u8, trimmed, "error:") != null or std.mem.indexOf(u8, trimmed, "note:") != null or std.mem.indexOf(u8, trimmed, "panic:") != null;
 
             const r: Range = .{ .start = start, .end = end, .important = is_important };
-            if (head_len < HEAD) {
+            if (head_len < head_limit) {
                 head[head_len] = r;
                 head_len += 1;
             }
@@ -245,7 +252,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 // Find a non-important slot to replace, or just use the rolling index
                 var replaced = false;
                 var j: usize = 0;
-                while (j < TAIL) : (j += 1) {
+                while (j < tail_limit) : (j += 1) {
                     if (!tail[j].important) {
                         tail[j] = r;
                         replaced = true;
@@ -253,20 +260,20 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                     }
                 }
                 if (!replaced) {
-                    tail[tail_seen % TAIL] = r;
+                    tail[tail_seen % tail_limit] = r;
                     tail_seen += 1;
                 }
             } else {
-                tail[tail_seen % TAIL] = r;
+                tail[tail_seen % tail_limit] = r;
                 tail_seen += 1;
             }
-            if (tail_len < TAIL) tail_len += 1;
+            if (tail_len < tail_limit) tail_len += 1;
         }
     }
 
     if (total == 0) return;
 
-    const trunc = total > (HEAD + TAIL);
+    const trunc = total > (head_limit + tail_limit);
     const MAX_WIDTH: usize = 500;
 
     if (!trunc) {
@@ -297,7 +304,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
                     addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
                 } else {
-                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
                 }
             }
         }
@@ -305,7 +312,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     }
 
     var printed_any = false;
-    for (head[0..HEAD]) |r| {
+    for (head[0..head_len]) |r| {
         const line = output[r.start..r.end];
         var prefix: []const u8 = "    ";
         if (!printed_any) {
@@ -327,25 +334,25 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
         }
     }
 
-    const omitted = total - HEAD - TAIL;
+    const omitted = total - head_limit - tail_limit;
     addTimelineEntry("    {s}\xe2\x80\xa6 +{d} lines{s}\n", .{ C_GREY, omitted, C_RESET });
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
-        while (t < tail_len) : (t += 1) {
-            const r = tail[(first + t) % TAIL];
-            const line = output[r.start..r.end];
-            const prefix = if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad") or std.mem.startsWith(u8, line, "│") or std.mem.startsWith(u8, line, "\xe2\x94\x82") or std.mem.startsWith(u8, line, "╰") or std.mem.startsWith(u8, line, "\xe2\x95\xb0")) "" else "    ";
-            if (line.len > MAX_WIDTH) {
-                const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-                addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
-            } else {
-                addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
+    while (t < tail_len) : (t += 1) {
+        const r = tail[(first + t) % tail_limit];
+        const line = output[r.start..r.end];
+        const prefix = if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad") or std.mem.startsWith(u8, line, "│") or std.mem.startsWith(u8, line, "\xe2\x94\x82") or std.mem.startsWith(u8, line, "╰") or std.mem.startsWith(u8, line, "\xe2\x95\xb0")) "" else "    ";
+        if (line.len > MAX_WIDTH) {
+            const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
+                } else {
+                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
+                }
             }
         }
-}
-
-fn findUtf8SafeLen(text: []const u8, max: usize) usize {
+        
+        fn findUtf8SafeLen(text: []const u8, max: usize) usize {
     if (text.len <= max) return text.len;
     var i = max;
     // Walk back to start of UTF-8 character (not 10xxxxxx)
