@@ -54,7 +54,8 @@ fn resetCursorStyle(stdout_file: std.fs.File) void {
 
 fn startSpinner(stdout_file: std.fs.File) !void {
     display.setSpinnerState(.thinking);
-    display.setSpinnerActive(true);
+    // TODO: Disable spinner to debug timeline corruption
+    // display.setSpinnerActive(true);
     g_spinner_running.store(true, .release);
     g_spinner_thread = try std.Thread.spawn(.{}, spinnerThread, .{stdout_file});
 }
@@ -301,9 +302,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
 
         // Show spinner while model is processing
-        if (stdout_file.isTty()) {
-            try startSpinner(stdout_file);
-        }
+        // TODO: Disable spinner temporarily to debug timeline corruption
+        // if (stdout_file.isTty()) {
+        //     try startSpinner(stdout_file);
+        // }
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
