@@ -212,22 +212,15 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8,
         try stdout.print("{s}\n", .{entry});
     }
     
-    // Draw prompt box at bottom (box already includes system info)
+    // Draw prompt box at bottom
+    // The prompt has 4 lines: top border, middle with "> ", bottom border, system info
     try stdout.print("{s}", .{current_prompt});
     
-    // Move cursor to middle line of box, after "> "
-    // Count lines in prompt to position correctly
-    var line_count: usize = 0;
-    for (current_prompt) |c| {
-        if (c == '\n') line_count += 1;
-    }
-    // Move up to middle line (3 lines in box: top, middle, bottom + info line)
-    // Cursor is currently at end of prompt, move up 2 lines and to column 3 (after "│ ")
-    if (line_count >= 3) {
-        try stdout.writeAll("\x1b[2A"); // Move up 2 lines
-        try stdout.writeAll("\x1b[3G"); // Move to column 3 (after "│ ")
-        try stdout.print("{s}", .{current_input});
-    }
+    // Position cursor inside the box on the middle line, after "> "
+    // Cursor is at end of system info line, move up 2 lines to middle line
+    try stdout.writeAll("\x1b[2A"); // Move up 2 lines (from info line to middle line)
+    try stdout.writeAll("\x1b[3G"); // Move to column 3 (after "│ ")
+    try stdout.print("{s}", .{current_input});
 }
 
 pub fn getTerminalHeight() usize {

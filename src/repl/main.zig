@@ -157,9 +157,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xae\n"); // ╮
         
         // Middle line with ">": │ > ... │
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ > (2 display chars)
+        // Inner width = box_width. Content: " >" (2 chars) + spaces (box_width - 3) + " " (1 char) = box_width
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ + space + > (3 display chars total: │ is 1 display char)
         bw = 0;
-        while (bw < box_width - 2) : (bw += 1) { // Fill remaining width minus "│ >" and "│"
+        while (bw < box_width - 3) : (bw += 1) { // Fill with box_width - 3 spaces
             try prompt_buf.appendSlice(allocator, " ");
         }
         try prompt_buf.appendSlice(allocator, " \xe2\x94\x82\n"); // space + │
