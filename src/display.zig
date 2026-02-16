@@ -217,23 +217,70 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     }
     if (prompt_lines == 0) prompt_lines = 4;
     
-    // Calculate available space for timeline
-    const reserved_lines = prompt_lines + 1;
-    const available_height = if (term_height > reserved_lines) term_height - reserved_lines else 5;
+    // Calculate how many timeline entries we can show
+    const reserved_lines = prompt_lines;
+    const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
     
-    // Draw timeline entries from top (show most recent at bottom of timeline area)
-    var lines_drawn: usize = 0;
-    const entries_to_show = @min(g_timeline_entries.items.len, available_height);
-    const start_idx = g_timeline_entries.items.len - entries_to_show;
-    
-    for (g_timeline_entries.items[start_idx..]) |entry| {
-        try stdout.print("{s}\n", .{entry});
-        lines_drawn += 1;
+    // Count total lines in all timeline entries (each entry may have newlines)
+    var total_entry_lines: usize = 0;
+    for (g_timeline_entries.items) |entry| {
+        var lines_in_entry: usize = 1; // At least 1 line
+        for (entry) |c| {
+            if (c == '\n') lines_in_entry += 1;
+        }
+        total_entry_lines += lines_in_entry;
     }
     
-    // Fill remaining space to push prompt to bottom
-    while (lines_drawn < available_height) : (lines_drawn += 1) {
+    // If we have more content than fits, only show what fits
+    // Start from the top and draw until we fill the available space
+    var lines_remaining = max_timeline_lines;
+    var start_idx: usize = 0;
+    
+    // Find starting index that allows us to show max content
+    if (total_entry_lines > max_timeline_lines) {
+        // Need to scroll - find which entries to skip
+        var lines_to_skip = total_entry_lines - max_timeline_lines;
+        var idx: usize = 0;
+        while (idx < g_timeline_entries.items.len and lines_to_skip > 0) {
+            var lines_in_entry: usize = 1;
+            for (g_timeline_entries.items[idx]) |c| {
+                if (c == '\n') lines_in_entry += 1;
+            }
+            if (lines_in_entry <= lines_to_skip) {
+                lines_to_skip -= lines_in_entry;
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+        start_idx = idx;
+    }
+    
+    // Draw timeline entries that fit
+    var idx = start_idx;
+    while (idx < g_timeline_entries.items.len and lines_remaining > 0) : (idx += 1) {
+        const entry = g_timeline_entries.items[idx];
+        var lines_in_entry: usize = 1;
+        for (entry) |c| {
+            if (c == '\n') lines_in_entry += 1;
+        }
+        
+        if (lines_in_entry <= lines_remaining) {
+            try stdout.print("{s}", .{entry});
+            if (idx < g_timeline_entries.items.len - 1) {
+                try stdout.writeAll("\n");
+            }
+            lines_remaining -= lines_in_entry;
+        } else {
+            // Entry is too long, truncate it
+            break;
+        }
+    }
+    
+    // If we have room left, add a blank line separator
+    if (lines_remaining > 0) {
         try stdout.writeAll("\n");
+        lines_remaining -= 1;
     }
     
     // Draw prompt box at bottom
