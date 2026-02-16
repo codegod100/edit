@@ -141,22 +141,33 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
-        // Prompt with horizontal box style
+        // Get terminal width for box
+        const term_width = display.terminalColumns();
+        const box_width = if (term_width > 4) term_width - 2 else 78;
+        
+        // Prompt with horizontal box style - fit to screen
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         
-        // Top border: ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+        // Top border: ╭────────────────────╮
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xad"); // ╭
-        for (0..100) |_| {
+        var bw: usize = 0;
+        while (bw < box_width) : (bw += 1) {
             try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
         }
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xae\n"); // ╮
         
-        // Middle line with ">": │ >                                                                                          │
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >                                                                                                    \xe2\x94\x82\n"); // │ ... │
+        // Middle line with ">": │ > ... │
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ >
+        bw = 0;
+        while (bw < box_width - 3) : (bw += 1) {
+            try prompt_buf.appendSlice(allocator, " ");
+        }
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82\n"); // │
         
-        // Bottom border: ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+        // Bottom border: ╰────────────────────╯
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xb0"); // ╰
-        for (0..100) |_| {
+        bw = 0;
+        while (bw < box_width) : (bw += 1) {
             try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
         }
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xaf\n"); // ╯
