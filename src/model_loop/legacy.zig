@@ -138,7 +138,7 @@ pub fn runModel(
     var w: std.ArrayListUnmanaged(u8) = .empty;
     defer w.deinit(arena_alloc);
 
-    const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text. For complex multi-step tasks, use todo_add to create a plan and todo_update to track progress.";
+    const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. When implementing new changes or performing multi-step tasks, you MUST use todo_add to create a clear step-by-step plan and todo_update to track your progress as you complete each part. Avoid repeating identical tool calls. Finish by calling respond_text.";
 
     // Build messages array (without system field - that goes in separate system param for most APIs)
     try w.appendSlice(arena_alloc, "[");
