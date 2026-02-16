@@ -38,6 +38,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         stdout_file.deprecatedWriter()
     else
         stdout_file.writer();
+    
+    // Initialize timeline display
+    display.initTimeline(allocator);
+    defer display.deinitTimeline();
 
     // Setup paths
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
@@ -182,7 +186,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // Add user turn
+        // Add user input to timeline and redraw
+        display.addTimelineEntry("{s}>>{s} {s}", .{ display.C_CYAN, display.C_RESET, line });
+        try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
+
+        // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
@@ -193,16 +201,33 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
 
+        // Move cursor to bottom for model output
+        try stdout.writeAll("\n");
+
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
         ) catch |err| {
-            try stdout.print("Model run failed: {s}\n", .{@errorName(err)});
+            display.addTimelineEntry("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, @errorName(err) });
+            try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
             continue;
         };
-        // Result is RunTurnResult (owned)
-        // We should add to context.
-        // Wait, context.append needs to handle ownership?
-        // runModel returns result with owned strings.
+
+        // Add assistant response to timeline (convert \n to actual newlines)
+        const response_with_newlines = try allocator.alloc(u8, result.response.len);
+        defer allocator.free(response_with_newlines);
+        var j: usize = 0;
+        var i: usize = 0;
+        while (i < result.response.len) : (i += 1) {
+            if (result.response[i] == '\\' and i + 1 < result.response.len and result.response[i + 1] == 'n') {
+                response_with_newlines[j] = '\n';
+                j += 1;
+                i += 1;
+            } else {
+                response_with_newlines[j] = result.response[i];
+                j += 1;
+            }
+        }
+        display.addTimelineEntry("⛬ {s}", .{response_with_newlines[0..j]});
 
         try state.context_window.append(allocator, .assistant, result.response, .{
             .tool_calls = result.tool_calls,
@@ -210,15 +235,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
             .files_touched = result.files_touched,
         });
 
-        // Cleanup result (it has dupe'd strings)
-        // RunTurnResult has deinit? Check context.zig
-        // Yes line 37.
-        // But `result` is not a pointer. `var res = result; res.deinit(allocator);`
+        // Cleanup result
         var mut_res = result;
         mut_res.deinit(allocator);
 
         try context.compactContextWindow(allocator, &state.context_window, active.?);
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
+
+        // Redraw timeline with prompt at bottom
+        try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
 
         // Drain inputs during run
         line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);

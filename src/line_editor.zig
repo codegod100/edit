@@ -164,7 +164,9 @@ pub fn readPromptLine(
     try std.posix.tcsetattr(stdin_file.handle, .NOW, raw);
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
-    try stdout.print("{s}", .{prompt});
+    // Initial draw of timeline + prompt
+    const display = @import("display.zig");
+    try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
 
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);

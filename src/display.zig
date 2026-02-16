@@ -177,6 +177,66 @@ pub fn describeModelQueryError(err: anyerror) []const u8 {
     };
 }
 
+// Timeline display for keeping prompt at bottom
+var g_timeline_entries: std.ArrayListUnmanaged([]const u8) = .{};
+var g_timeline_allocator: ?std.mem.Allocator = null;
+
+pub fn initTimeline(allocator: std.mem.Allocator) void {
+    g_timeline_allocator = allocator;
+}
+
+pub fn deinitTimeline() void {
+    if (g_timeline_allocator) |allocator| {
+        for (g_timeline_entries.items) |entry| {
+            allocator.free(entry);
+        }
+        g_timeline_entries.deinit(allocator);
+        g_timeline_entries = .{};
+        g_timeline_allocator = null;
+    }
+}
+
+pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
+    if (g_timeline_allocator) |allocator| {
+        const entry = std.fmt.allocPrint(allocator, format, args) catch return;
+        g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
+    }
+}
+
+pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8, current_input: []const u8) !void {
+    // Clear screen and move cursor to top
+    try stdout.writeAll("\x1b[2J\x1b[H");
+    
+    // Draw timeline entries
+    for (g_timeline_entries.items) |entry| {
+        try stdout.print("{s}\n", .{entry});
+    }
+    
+    // Add separator if we have entries
+    if (g_timeline_entries.items.len > 0) {
+        try stdout.writeAll("\n");
+    }
+    
+    // Draw prompt at bottom
+    try stdout.print("{s}{s}", .{ current_prompt, current_input });
+}
+
+pub fn getTerminalHeight() usize {
+    if (builtin.os.tag != .windows) {
+        var ws: std.posix.winsize = .{
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const rc = std.posix.system.ioctl(std.posix.STDOUT_FILENO, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+        if (std.posix.errno(rc) == .SUCCESS and ws.row > 0) {
+            return @as(usize, @intCast(ws.row));
+        }
+    }
+    return 24; // Default terminal height
+}
+
 fn isMarkdownTableSeparatorRow(line: []const u8) bool {
     var text = std.mem.trim(u8, line, " \t");
     if (text.len == 0) return false;
