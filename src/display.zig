@@ -203,7 +203,7 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     }
 }
 
-pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8, current_input: []const u8) !void {
+pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
     // Get terminal height
     const term_height = getTerminalHeight();
     
@@ -239,10 +239,9 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8,
     // Draw prompt box at bottom
     try stdout.print("{s}", .{current_prompt});
     
-    // Position cursor inside the box on the middle line, after "> "
+    // Position cursor: go up to middle line and to column 4 (after "│ >")
     try stdout.writeAll("\x1b[2A"); // Move up 2 lines
-    try stdout.writeAll("\x1b[3G"); // Move to column 3 (after "│ ")
-    try stdout.print("{s}", .{current_input});
+    try stdout.writeAll("\x1b[4G"); // Move to column 4 (after "│ >")
 }
 
 pub fn getTerminalHeight() usize {

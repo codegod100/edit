@@ -221,7 +221,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         // Add user input to timeline and redraw
         display.addTimelineEntry("{s}>>{s} {s}", .{ display.C_CYAN, display.C_RESET, line });
-        try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
+        try display.clearScreenAndRedrawTimeline(stdout, prompt);
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
@@ -241,7 +241,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
             ctx_prompt, stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
         ) catch |err| {
             display.addTimelineEntry("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, @errorName(err) });
-            try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
+            try display.clearScreenAndRedrawTimeline(stdout, prompt);
             continue;
         };
 
@@ -276,7 +276,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
         // Redraw timeline with prompt at bottom
-        try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
+        try display.clearScreenAndRedrawTimeline(stdout, prompt);
 
         // Drain inputs during run
         line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
