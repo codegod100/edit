@@ -11,10 +11,11 @@ const tools = @import("../tools.zig");
 const llm = @import("../llm.zig");
 const model_select = @import("../model_select.zig");
 const utils = @import("../utils.zig");
+const context = @import("../context.zig");
 
 // Helper to format providers output
 fn formatProvidersOutput(allocator: std.mem.Allocator, providers: []const pm.ProviderSpec, states: []const pm.ProviderState) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -297,6 +298,23 @@ pub fn handleCommand(
         },
         .clear => {
             try stdout.print("\x1b[2J\x1b[H", .{}); // ANSI clear screen
+        },
+        .restore => {
+            // Clear current context first
+            state.context_window.deinit(allocator);
+            state.context_window = context.ContextWindow.init(32000, 20);
+
+            context.loadContextWindow(allocator, state.config_dir, &state.context_window, state.project_hash) catch |e| {
+                try stdout.print("Failed to restore context: {any}\n", .{e});
+                return true;
+            };
+
+            const turn_count = state.context_window.turns.items.len;
+            if (turn_count > 0) {
+                try stdout.print("Restored {d} turns from previous session.\n", .{turn_count});
+            } else {
+                try stdout.print("No previous context found.\n", .{});
+            }
         },
         .none, .default_model => {}, // ...
     }

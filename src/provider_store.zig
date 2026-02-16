@@ -33,7 +33,7 @@ pub fn load(allocator: std.mem.Allocator, base_path: []const u8) ![]StoredPair {
 
 pub fn upsertFile(allocator: std.mem.Allocator, base_path: []const u8, name: []const u8, value: []const u8) !void {
     const raw_pairs = try load(allocator, base_path);
-    var list = try std.ArrayList(StoredPair).initCapacity(allocator, raw_pairs.len);
+    var list = try std.ArrayListUnmanaged(StoredPair).initCapacity(allocator, raw_pairs.len);
     try list.appendSlice(allocator, raw_pairs);
     allocator.free(raw_pairs);
 
@@ -88,7 +88,7 @@ const SanitizedValue = struct {
 };
 
 fn sanitizeEnvValue(allocator: std.mem.Allocator, value: []const u8) !SanitizedValue {
-    var out = std.ArrayList(u8).init(allocator);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     var stripped = false;
     for (value) |ch| {
@@ -102,7 +102,7 @@ fn sanitizeEnvValue(allocator: std.mem.Allocator, value: []const u8) !SanitizedV
 }
 
 fn parseContent(allocator: std.mem.Allocator, content: []const u8) ![]StoredPair {
-    var out = try std.ArrayList(StoredPair).initCapacity(allocator, 0);
+    var out = try std.ArrayListUnmanaged(StoredPair).initCapacity(allocator, 0);
     errdefer {
         for (out.items) |*pair| pair.deinit(allocator);
         out.deinit(allocator);

@@ -15,12 +15,12 @@ pub const TodoItem = struct {
 };
 
 pub const TodoList = struct {
-    items: std.ArrayList(TodoItem),
+    items: std.ArrayListUnmanaged(TodoItem),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TodoList {
         return .{
-            .items = std.ArrayList(TodoItem).empty,
+            .items = std.ArrayListUnmanaged(TodoItem).empty,
             .allocator = allocator,
         };
     }
@@ -105,7 +105,7 @@ pub const TodoList = struct {
     }
 
     pub fn list(self: *const TodoList, allocator: std.mem.Allocator) ![]u8 {
-        var result: std.ArrayList(u8) = .empty;
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         errdefer result.deinit(allocator);
         const w = result.writer(allocator);
 
@@ -183,7 +183,7 @@ pub const TodoList = struct {
 
     // Persistence - save todos to JSON file
     pub fn saveToFile(self: *const TodoList, allocator: std.mem.Allocator, file_path: []const u8) !void {
-        var json: std.ArrayList(u8) = .empty;
+        var json: std.ArrayListUnmanaged(u8) = .empty;
         defer json.deinit(allocator);
         const w = json.writer(allocator);
 

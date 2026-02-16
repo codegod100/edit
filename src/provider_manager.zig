@@ -42,7 +42,7 @@ pub const ProviderManager = struct {
         env: []const EnvPair,
         options: Options,
     ) ![]ProviderState {
-        var out = try std.ArrayList(ProviderState).initCapacity(allocator, 0);
+        var out = try std.ArrayListUnmanaged(ProviderState).initCapacity(allocator, 0);
         errdefer out.deinit(allocator);
 
         for (specs) |spec| {

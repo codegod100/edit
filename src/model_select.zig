@@ -82,7 +82,7 @@ pub fn envPairsForProviders(
     providers: []const pm.ProviderSpec,
     stored: []const store.StoredPair,
 ) ![]pm.EnvPair {
-    var out = try std.ArrayList(pm.EnvPair).initCapacity(allocator, 0);
+    var out = try std.ArrayListUnmanaged(pm.EnvPair).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
     for (providers) |provider| {
@@ -209,7 +209,7 @@ pub fn collectModelOptions(
     connected: []const pm.ProviderState,
     only_provider_id: ?[]const u8,
 ) ![]ModelOption {
-    var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
+    var out = try std.ArrayListUnmanaged(ModelOption).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
     for (providers) |spec| {
@@ -283,7 +283,7 @@ pub fn filterModelOptions(allocator: std.mem.Allocator, options: []const ModelOp
     const q = std.mem.trim(u8, query, " \t\r\n");
     if (q.len == 0) return allocator.dupe(ModelOption, options);
 
-    var out = try std.ArrayList(ModelOption).initCapacity(allocator, 0);
+    var out = try std.ArrayListUnmanaged(ModelOption).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
     for (options) |o| {

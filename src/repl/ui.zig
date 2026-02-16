@@ -15,7 +15,7 @@ pub fn sanitizeLineInput(allocator: std.mem.Allocator, raw: ?[]u8) !?[]u8 {
     const trimmed = std.mem.trim(u8, slice, " \t\r\n");
     if (trimmed.len == 0) return null;
 
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     for (trimmed) |ch| {
         if (ch >= 32 and ch <= 126) {
@@ -182,7 +182,7 @@ fn buildFilterPreviewBlock(allocator: std.mem.Allocator, options: []const model_
     const filtered = try model_select.filterModelOptions(allocator, options, query);
     defer allocator.free(filtered);
 
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 

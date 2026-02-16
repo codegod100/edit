@@ -102,8 +102,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
     };
     defer state.deinit();
 
-    // Load Context/History
-    context.loadContextWindow(allocator, config_dir, &state.context_window, state.project_hash) catch {};
+    // Load Context/History (only restore context if ZAGENT_RESTORE_CONTEXT is set)
+    const restore_context = std.posix.getenv("ZAGENT_RESTORE_CONTEXT") != null;
+    if (restore_context) {
+        context.loadContextWindow(allocator, config_dir, &state.context_window, state.project_hash) catch {};
+    }
     var history = context.CommandHistory.init();
     defer history.deinit(allocator);
     context.loadHistory(allocator, config_dir, &history) catch {};
@@ -119,12 +122,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 
     // Input queue
-    var queued_lines: std.ArrayList([]u8) = .empty;
+    var queued_lines: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (queued_lines.items) |l| allocator.free(l);
         queued_lines.deinit(allocator);
     }
-    var queued_partial: std.ArrayList(u8) = .empty;
+    var queued_partial: std.ArrayListUnmanaged(u8) = .empty;
     defer queued_partial.deinit(allocator);
 
     // Main Loop
@@ -132,7 +135,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         cancel.resetCancelled();
 
         // Prompt
-        var prompt_buf: std.ArrayList(u8) = .empty;
+        var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         try prompt_buf.appendSlice(allocator, "zagent");
         if (state.selected_model) |m| {
             try prompt_buf.writer(allocator).print(":{s}", .{m.model_id});
@@ -189,10 +192,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const turn_alloc = turn_arena.allocator();
 
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
-        
+
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            ctx_prompt,
-            stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
+            ctx_prompt, stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
         ) catch |err| {
             try stdout.print("Model run failed: {s}\n", .{@errorName(err)});
             continue;

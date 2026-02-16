@@ -49,7 +49,7 @@ pub const SubagentTask = struct {
 pub const SubagentManager = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
-    tasks: std.ArrayList(SubagentTask),
+    tasks: std.ArrayListUnmanaged(SubagentTask),
     next_id: usize,
     max_concurrent: usize,
     total_tool_calls: usize,
@@ -60,7 +60,7 @@ pub const SubagentManager = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .tasks = std.ArrayList(SubagentTask).empty,
+            .tasks = std.ArrayListUnmanaged(SubagentTask).empty,
             .next_id = 1,
             .max_concurrent = 3,
             .total_tool_calls = 0,
@@ -185,7 +185,7 @@ pub const SubagentManager = struct {
     pub fn listTasks(self: *Self, allocator: std.mem.Allocator) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var result: std.ArrayList(u8) = .empty;
+        var result: std.ArrayListUnmanaged(u8) = .empty;
         defer result.deinit(allocator);
         const w = result.writer(allocator);
 

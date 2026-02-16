@@ -47,7 +47,7 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator, base_path: []const u8) ![
 }
 
 fn mergeProviderSpecs(allocator: std.mem.Allocator, base: []const pm.ProviderSpec, extra: []const pm.ProviderSpec) ![]pm.ProviderSpec {
-    var out = try std.ArrayList(pm.ProviderSpec).initCapacity(allocator, base.len);
+    var out = try std.ArrayListUnmanaged(pm.ProviderSpec).initCapacity(allocator, base.len);
     errdefer {
         for (out.items) |s| {
             allocator.free(s.id);
@@ -80,7 +80,7 @@ fn mergeProviderSpecs(allocator: std.mem.Allocator, base: []const pm.ProviderSpe
 
         if (found) |s| {
             // Add models that don't exist
-            var new_models = try std.ArrayList(pm.Model).initCapacity(allocator, s.models.len);
+            var new_models = try std.ArrayListUnmanaged(pm.Model).initCapacity(allocator, s.models.len);
             for (s.models) |m| {
                 try new_models.append(allocator, try dupeModel(allocator, m));
             }
@@ -167,7 +167,7 @@ fn parseProviderSpecsFromJson(allocator: std.mem.Allocator, json_text: []const u
 
     if (parsed.value != .object) return allocator.alloc(pm.ProviderSpec, 0);
 
-    var specs = try std.ArrayList(pm.ProviderSpec).initCapacity(allocator, 0);
+    var specs = try std.ArrayListUnmanaged(pm.ProviderSpec).initCapacity(allocator, 0);
     errdefer {
         for (specs.items) |spec| {
             allocator.free(spec.id);
@@ -197,7 +197,7 @@ fn parseProviderSpecsFromJson(allocator: std.mem.Allocator, json_text: []const u
             try allocator.dupe(u8, entry.key_ptr.*);
         errdefer allocator.free(display_name);
 
-        var env_vars = try std.ArrayList([]const u8).initCapacity(allocator, 0);
+        var env_vars = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 0);
         errdefer {
             for (env_vars.items) |env| allocator.free(env);
             env_vars.deinit(allocator);
@@ -210,7 +210,7 @@ fn parseProviderSpecsFromJson(allocator: std.mem.Allocator, json_text: []const u
             }
         }
 
-        var models = try std.ArrayList(pm.Model).initCapacity(allocator, 0);
+        var models = try std.ArrayListUnmanaged(pm.Model).initCapacity(allocator, 0);
         errdefer {
             for (models.items) |m| {
                 allocator.free(m.id);

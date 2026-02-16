@@ -17,7 +17,8 @@ pub const CommandTag = enum {
     stats,
     ping,
     todo,
-    clear, // Added clear command
+    clear,
+    restore, // Restore previous session context
 };
 
 pub fn parseCommand(input: []const u8) CommandTag {
@@ -43,6 +44,7 @@ pub fn parseCommand(input: []const u8) CommandTag {
     if (std.mem.eql(u8, cmd, "/ping")) return .ping;
     if (std.mem.eql(u8, cmd, "/todo")) return .todo;
     if (std.mem.eql(u8, cmd, "/clear")) return .clear;
+    if (std.mem.eql(u8, cmd, "/restore")) return .restore;
 
     return .none;
 }

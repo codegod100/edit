@@ -50,6 +50,46 @@ pub fn parseReadParamsFromArgs(allocator: std.mem.Allocator, arguments_json: []c
     };
 }
 
+/// Parse respond_text text from tool arguments JSON (returns pointer to parsed data, not allocated)
+/// Note: returned pointer is valid only as long as arguments_json is valid
+pub fn parseRespondTextFromArgs(arguments_json: []const u8) ?[]const u8 {
+    // Simple JSON parsing without allocation - look for text/message/summary/content fields
+    const fields = [_][]const u8{ "\"text\"", "\"message\"", "\"summary\"", "\"content\"" };
+    for (fields) |field| {
+        if (std.mem.indexOf(u8, arguments_json, field)) |start| {
+            // Find the value after the field name
+            var val_start = start + field.len;
+            // Skip whitespace and colon
+            while (val_start < arguments_json.len) {
+                const c = arguments_json[val_start];
+                if (c == ' ' or c == ':' or c == '\t' or c == '\n' or c == '\r') {
+                    val_start += 1;
+                } else {
+                    break;
+                }
+            }
+            // Check for string value
+            if (val_start < arguments_json.len and (arguments_json[val_start] == '"' or arguments_json[val_start] == '\'')) {
+                const quote = arguments_json[val_start];
+                const str_start = val_start + 1;
+                // Find closing quote (handle escaped quotes)
+                var end = str_start;
+                while (end < arguments_json.len and arguments_json[end] != quote) {
+                    if (arguments_json[end] == '\\' and end + 1 < arguments_json.len) {
+                        end += 2; // Skip escaped character
+                    } else {
+                        end += 1;
+                    }
+                }
+                if (end > str_start) {
+                    return arguments_json[str_start..end];
+                }
+            }
+        }
+    }
+    return null;
+}
+
 pub const ToolError = error{InvalidToolCommand};
 pub const NamedToolError = error{ InvalidToolName, InvalidArguments, IoError, Cancelled };
 
@@ -149,15 +189,7 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     }
 
     if (std.mem.eql(u8, name, "respond_text")) {
-        const A = struct {
-            text: ?[]const u8 = null,
-            message: ?[]const u8 = null,
-            summary: ?[]const u8 = null,
-            content: ?[]const u8 = null,
-        };
-        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
-        defer p.deinit();
-        const msg = p.value.text orelse p.value.message orelse p.value.summary orelse p.value.content orelse "";
+        const msg = parseRespondTextFromArgs(arguments_json) orelse "";
         return allocator.dupe(u8, msg);
     }
 

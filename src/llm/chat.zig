@@ -346,7 +346,27 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
     if (parsed.value.choices) |choices| {
         if (choices.len > 0) {
             const c = choices[0];
+
+            // Build result step by step with proper cleanup
+            var text: []u8 = &.{};
+            var reasoning: []u8 = &.{};
+            var finish_reason: []u8 = &.{};
+            var tool_calls: []types.ToolCall = &.{};
+
+            // Parse tool calls first
             var tools: std.ArrayList(types.ToolCall) = .empty;
+            defer {
+                // If we error before moving to result, cleanup tools
+                if (tool_calls.len == 0) {
+                    for (tools.items) |tc| {
+                        allocator.free(tc.id);
+                        allocator.free(tc.tool);
+                        allocator.free(tc.args);
+                    }
+                    tools.deinit(allocator);
+                }
+            }
+
             if (c.message.tool_calls) |tc| {
                 for (tc) |t| {
                     try tools.append(allocator, .{
@@ -356,11 +376,25 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
                     });
                 }
             }
+
+            // Now allocate remaining fields with cleanup
+            errdefer allocator.free(text);
+            text = try allocator.dupe(u8, c.message.content orelse "");
+
+            errdefer allocator.free(reasoning);
+            reasoning = try allocator.dupe(u8, c.message.reasoning_content orelse "");
+
+            errdefer allocator.free(finish_reason);
+            finish_reason = try allocator.dupe(u8, c.finish_reason orelse "");
+
+            // Move tool calls ownership (disables the defer cleanup)
+            tool_calls = try tools.toOwnedSlice(allocator);
+
             return .{
-                .text = try allocator.dupe(u8, c.message.content orelse ""),
-                .reasoning = try allocator.dupe(u8, c.message.reasoning_content orelse ""),
-                .tool_calls = try tools.toOwnedSlice(allocator),
-                .finish_reason = try allocator.dupe(u8, c.finish_reason orelse ""),
+                .text = text,
+                .reasoning = reasoning,
+                .tool_calls = tool_calls,
+                .finish_reason = finish_reason,
             };
         }
     }

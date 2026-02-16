@@ -24,29 +24,32 @@ pub fn runModel(
 ) !active_module.RunTurnResult {
     _ = stdout_is_tty;
 
+    // Use an arena for the entire turn to simplify memory management
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
 
     var paths: std.ArrayList([]u8) = .empty;
-    defer {
-        for (paths.items) |p| allocator.free(p);
-        paths.deinit(allocator);
-    }
+    defer paths.deinit(arena_alloc);
+    // Note: paths items are allocated from arena, so no need to free individually
 
     var w: std.ArrayList(u8) = .empty;
-    defer w.deinit(allocator);
+    defer w.deinit(arena_alloc);
 
     const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text.";
 
     // Build messages array (without system field - that goes in separate system param for most APIs)
-    try w.appendSlice(allocator, "[");
+    try w.appendSlice(arena_alloc, "[");
 
-    try w.writer(allocator).print(
+    try w.writer(arena_alloc).print(
         "{{\"role\":\"system\",\"content\":{f}}},",
         .{std.json.fmt(system_prompt, .{})},
     );
 
-    try w.writer(allocator).print(
+    try w.writer(arena_alloc).print(
         "{{\"role\":\"user\",\"content\":{f}}}",
         .{std.json.fmt(user_input, .{})},
     );
@@ -55,6 +58,10 @@ pub fn runModel(
     var no_tool_retries: usize = 0;
     var last_tool_name: ?[]u8 = null;
     var last_tool_args: ?[]u8 = null;
+    defer {
+        if (last_tool_name) |v| allocator.free(v);
+        if (last_tool_args) |v| allocator.free(v);
+    }
     var repeated_tool_calls: usize = 0;
     var rejected_repeated_bash: usize = 0;
     var rejected_repeated_other: usize = 0;
@@ -74,11 +81,11 @@ pub fn runModel(
             };
         }
 
-        try w.appendSlice(allocator, "]");
+        try w.appendSlice(arena_alloc, "]");
 
         const messages_json = w.items;
         const response = try llm.chat(
-            allocator,
+            arena_alloc,
             active.api_key orelse "",
             active.model_id,
             active.provider_id,
@@ -86,26 +93,40 @@ pub fn runModel(
             turn.toolDefsToLlm(tools.definitions[0..]),
             active.reasoning_effort,
         );
+        // Response is arena-allocated, no need to deinit individual fields
 
-        try w.replaceRange(allocator, w.items.len - 1, 1, "");
+        try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
+
+        // Add assistant's message with tool_calls to conversation
+        try w.writer(arena_alloc).writeAll(",{\"role\":\"assistant\",\"tool_calls\":[");
+        for (response.tool_calls, 0..) |tc, i| {
+            if (i > 0) try w.writer(arena_alloc).writeAll(",");
+            // Format: {"id":"...","type":"function","function":{"name":"...","arguments":"..."}}
+            try w.writer(arena_alloc).print("{{\"id\":{f},\"type\":\"function\",\"function\":{{\"name\":{f},\"arguments\":{f}}}}}", .{
+                std.json.fmt(tc.id, .{}),
+                std.json.fmt(tc.tool, .{}),
+                std.json.fmt(tc.args, .{}),
+            });
+        }
+        try w.writer(arena_alloc).writeAll("]}");
 
         if (response.tool_calls.len == 0) {
             no_tool_retries += 1;
             if (no_tool_retries <= 2) {
-                try w.appendSlice(allocator, ",{\"role\":\"user\",\"content\":",
+                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":",
                 );
                 if (no_tool_retries == 1) {
-                    try w.writer(allocator).print(
+                    try w.writer(arena_alloc).print(
                         "{f}",
                         .{std.json.fmt("You did not call any tools. You must use the function-call tool interface.", .{})},
                     );
                 } else {
-                    try w.writer(allocator).print(
+                    try w.writer(arena_alloc).print(
                         "{f}",
                         .{std.json.fmt("Return at least one tool call via the function-call interface. If you are ready to answer finally, call respond_text with {\"text\":\"...\"}. Do not reply with plain text outside tool calls.", .{})},
                     );
                 }
-                try w.appendSlice(allocator, "}");
+                try w.appendSlice(arena_alloc, "}");
                 continue;
             }
             const finish_reason = if (response.finish_reason.len > 0) response.finish_reason else "none";
@@ -131,22 +152,31 @@ pub fn runModel(
                 repeated_tool_calls = 0;
                 if (last_tool_name) |v| allocator.free(v);
                 if (last_tool_args) |v| allocator.free(v);
-                last_tool_name = try allocator.dupe(u8, tc.tool);
-                last_tool_args = try allocator.dupe(u8, tc.args);
+                last_tool_name = allocator.dupe(u8, tc.tool) catch |err| {
+                    last_tool_name = null;
+                    last_tool_args = null;
+                    return err;
+                };
+                last_tool_args = allocator.dupe(u8, tc.args) catch |err| {
+                    allocator.free(last_tool_name.?);
+                    last_tool_name = null;
+                    last_tool_args = null;
+                    return err;
+                };
             }
 
             const is_bash = std.mem.eql(u8, tc.tool, "bash");
             const repeat_threshold: usize = if (is_bash) 1 else 3;
             if (repeated_tool_calls >= repeat_threshold) {
                 try stdout.print("{s}Note:{s} repeated identical tool call detected; requesting a different next action.\n", .{ display.C_DIM, display.C_RESET });
-                try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(allocator, ",\"content\":");
-                try w.writer(allocator).print(
+                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.appendSlice(arena_alloc, ",\"content\":");
+                try w.writer(arena_alloc).print(
                     "{f}",
                     .{std.json.fmt("Tool call rejected: repeated identical tool call. Reuse the previous result and choose a different next action (or finish with respond_text).", .{})},
                 );
-                try w.appendSlice(allocator, "}");
+                try w.appendSlice(arena_alloc, "}");
 
                 if (is_bash) {
                     rejected_repeated_bash += 1;
@@ -178,11 +208,11 @@ pub fn runModel(
                     context: ?[]const u8 = null,
                 };
                 var p = std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true }) catch {
-                    try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(allocator, ",\"content\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt("{\"error\":\"InvalidArguments\"}", .{})});
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.appendSlice(arena_alloc, ",\"content\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt("{\"error\":\"InvalidArguments\"}", .{})});
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 };
                 defer p.deinit();
@@ -194,22 +224,22 @@ pub fn runModel(
                 const id = subagent_manager.?.createTask(task_type, desc, p.value.context) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to create subagent task: {s}\"}}", .{@errorName(err)});
                     defer allocator.free(msg);
-                    try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(allocator, ",\"content\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.appendSlice(arena_alloc, ",\"content\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 };
 
                 const args_ptr = std.heap.page_allocator.create(@import("types.zig").SubagentThreadArgs) catch null;
                 if (args_ptr == null) {
                     const msg = "{\"error\":\"Failed to allocate subagent runner\"}";
-                    try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(allocator, ",\"content\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.appendSlice(arena_alloc, ",\"content\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 }
 
@@ -231,11 +261,11 @@ pub fn runModel(
                     if (effort_owned) |v| std.heap.page_allocator.free(v);
                     std.heap.page_allocator.destroy(args_ptr.?);
                     const msg = "{\"error\":\"Failed to allocate subagent strings\"}";
-                    try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(allocator, ",\"content\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.appendSlice(arena_alloc, ",\"content\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 }
 
@@ -258,11 +288,11 @@ pub fn runModel(
                     std.heap.page_allocator.destroy(args_ptr.?);
                     const msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"Failed to start subagent thread: {s}\"}}", .{@errorName(err)});
                     defer allocator.free(msg);
-                    try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                    try w.appendSlice(allocator, ",\"content\":");
-                    try w.writer(allocator).print("{f}", .{std.json.fmt(msg, .{})});
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                    try w.appendSlice(arena_alloc, ",\"content\":");
+                    try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 };
                 th.detach();
@@ -277,11 +307,11 @@ pub fn runModel(
                 );
                 defer allocator.free(out);
 
-                try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(allocator, ",\"content\":");
-                try w.writer(allocator).print("{f}", .{std.json.fmt(out, .{})});
-                try w.appendSlice(allocator, "}");
+                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.appendSlice(arena_alloc, ",\"content\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(out, .{})});
+                try w.appendSlice(arena_alloc, "}");
                 continue;
             }
 
@@ -299,10 +329,10 @@ pub fn runModel(
                 } else {
                     try stdout.print("• Ran {s}\n", .{tc.tool});
                 }
-            } else if (tools.parsePrimaryPathFromArgs(allocator, tc.args)) |path| {
-                defer allocator.free(path);
+            } else if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |path| {
+                defer arena_alloc.free(path);
                 if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
-                    if (try tools.parseReadParamsFromArgs(allocator, tc.args)) |params| {
+                    if (try tools.parseReadParamsFromArgs(arena_alloc, tc.args)) |params| {
                         if (params.offset) |off| {
                             try stdout.print("• {s} {s} [{d}:{d}]\n", .{ tc.tool, path, off, params.limit orelse 0 });
                         } else {
@@ -314,6 +344,10 @@ pub fn runModel(
                 } else {
                     try stdout.print("• {s} {s}\n", .{ tc.tool, path });
                 }
+            } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
+                // Extract and show the text content
+                const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
+                try stdout.print("• respond_text: \"{s}\"\n", .{text});
             } else {
                 try stdout.print("• {s}\n", .{tc.tool});
             }
@@ -321,15 +355,15 @@ pub fn runModel(
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 if (mutation_request and mutating_tools_executed == 0) {
                     try stdout.print("{s}Stop:{s} respond_text rejected: edit request requires at least one mutating tool execution first.\n", .{ display.C_DIM, display.C_RESET });
-                    try w.appendSlice(allocator, ",{\"role\":\"user\",\"content\":");
-                    try w.writer(allocator).print(
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                    try w.writer(arena_alloc).print(
                         "{f}",
                         .{std.json.fmt("You must run at least one mutating tool (write_file/replace_in_file/edit/write/apply_patch) before respond_text for this request.", .{})},
                     );
-                    try w.appendSlice(allocator, "}");
+                    try w.appendSlice(arena_alloc, "}");
                     continue;
                 }
-                const final_text = tools.executeNamed(allocator, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
+                const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
                     try stdout.print("{s}  error: {s}{s}\n", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "respond_text arguments were invalid."),
@@ -340,7 +374,7 @@ pub fn runModel(
                     };
                 };
                 return .{
-                    .response = final_text,
+                    .response = try allocator.dupe(u8, final_text),
                     .reasoning = try allocator.dupe(u8, response.reasoning),
                     .tool_calls = tool_calls,
                     .error_count = 0,
@@ -349,19 +383,19 @@ pub fn runModel(
             }
             if (tools.isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
 
-            const result = tools.executeNamed(allocator, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
+            const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
                 try stdout.print("{s}  error: {s}{s}\n", .{ display.C_RED, @errorName(err), display.C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
 
-                try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-                try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-                try w.appendSlice(allocator, ",\"content\":");
-                try w.writer(allocator).print("{f}", .{std.json.fmt(err_msg, .{})});
-                try w.appendSlice(allocator, "}");
+                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.appendSlice(arena_alloc, ",\"content\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(err_msg, .{})});
+                try w.appendSlice(arena_alloc, "}");
                 continue;
             };
-            defer allocator.free(result);
+            defer arena_alloc.free(result);
 
             if (!tools.isReadToolName(tc.tool) and result.len > 0) {
                 if (std.mem.eql(u8, tc.tool, "bash")) {
@@ -375,11 +409,11 @@ pub fn runModel(
                 }
             }
 
-            try w.appendSlice(allocator, ",{\"role\":\"tool\",\"tool_call_id\":");
-            try w.writer(allocator).print("{f}", .{std.json.fmt(tc.id, .{})});
-            try w.appendSlice(allocator, ",\"content\":");
-            try w.writer(allocator).print("{f}", .{std.json.fmt(result, .{})});
-            try w.appendSlice(allocator, "}");
+            try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+            try w.appendSlice(arena_alloc, ",\"content\":");
+            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(result, .{})});
+            try w.appendSlice(arena_alloc, "}");
 
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 const A = struct { command: ?[]const u8 = null };
@@ -394,12 +428,12 @@ pub fn runModel(
                             if (effectively_empty) {
                                 consecutive_empty_rg += 1;
                                 if (consecutive_empty_rg >= 2) {
-                                    try w.appendSlice(allocator, ",{\"role\":\"user\",\"content\":");
-                                    try w.writer(allocator).print(
+                                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                                    try w.writer(arena_alloc).print(
                                         "{f}",
                                         .{std.json.fmt("rg returned no matches multiple times. Do not keep varying the pattern. Instead, inspect likely files (e.g. list src/, open README/config), or ask the user for the exact symbol/file to change.", .{})},
                                     );
-                                    try w.appendSlice(allocator, "}");
+                                    try w.appendSlice(arena_alloc, "}");
                                 }
                             } else {
                                 consecutive_empty_rg = 0;
@@ -413,17 +447,18 @@ pub fn runModel(
                 consecutive_empty_rg = 0;
             }
 
-            if (tools.parsePrimaryPathFromArgs(allocator, tc.args)) |p| {
+            if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |p| {
                 if (!utils.containsPath(paths.items, p)) {
-                    try paths.append(allocator, p);
+                    try paths.append(arena_alloc, p);
                 } else {
-                    allocator.free(p);
+                    arena_alloc.free(p);
                 }
             }
         }
     }
 
     try stdout.print("{s}Stop:{s} reached maximum step limit ({d}).\n", .{ display.C_DIM, display.C_RESET, max_iterations });
+
     return .{
         .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
         .reasoning = try allocator.dupe(u8, ""),
