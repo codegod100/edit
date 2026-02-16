@@ -143,7 +143,6 @@ pub fn readPromptLine(
     prompt: []const u8,
     history: *context.CommandHistory,
 ) !?[]u8 {
-    _ = history;
 
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
         try stdout.writeAll(prompt);
@@ -181,6 +180,10 @@ pub fn readPromptLine(
     var line: []u8 = &.{};
     var cursor_pos: usize = 0;
     var buf: [1]u8 = undefined;
+    
+    // History navigation state
+    var history_index: ?usize = null; // null means not navigating history (editing current)
+    var saved_line: []u8 = &.{}; // Line being edited before history navigation
 
     while (true) {
         const n = try stdin_file.read(&buf);
@@ -210,11 +213,71 @@ pub fn readPromptLine(
                             try stdout.writeAll("\x1b[C");
                         }
                     },
-                    'A' => { // Up arrow - history (simplified: just ignore for now)
-                        // TODO: implement history navigation
+                    'A' => { // Up arrow - previous history entry
+                        if (history.items.items.len == 0) continue;
+                        
+                        // Save current line if starting history navigation
+                        if (history_index == null) {
+                            saved_line = try arena_alloc.dupe(u8, line);
+                            history_index = history.items.items.len;
+                        }
+                        
+                        if (history_index.? > 0) {
+                            history_index.? -= 1;
+                            const history_entry = history.items.items[history_index.?];
+                            
+                            // Clear current line and load history entry
+                            // Move cursor to end of current line first
+                            while (cursor_pos < line.len) {
+                                cursor_pos += 1;
+                                try stdout.writeAll("\x1b[C");
+                            }
+                            // Clear from cursor to beginning of line
+                            for (0..line.len) |_| {
+                                try stdout.writeAll("\x08 \x08");
+                            }
+                            
+                            line = try arena_alloc.dupe(u8, history_entry);
+                            cursor_pos = line.len;
+                            try stdout.writeAll(line);
+                        }
                     },
-                    'B' => { // Down arrow - history (simplified: just ignore for now)
-                        // TODO: implement history navigation
+                    'B' => { // Down arrow - next history entry
+                        if (history_index == null) continue;
+                        
+                        if (history_index.? < history.items.items.len - 1) {
+                            history_index.? += 1;
+                            const history_entry = history.items.items[history_index.?];
+                            
+                            // Clear current line and load history entry
+                            while (cursor_pos < line.len) {
+                                cursor_pos += 1;
+                                try stdout.writeAll("\x1b[C");
+                            }
+                            for (0..line.len) |_| {
+                                try stdout.writeAll("\x08 \x08");
+                            }
+                            
+                            line = try arena_alloc.dupe(u8, history_entry);
+                            cursor_pos = line.len;
+                            try stdout.writeAll(line);
+                        } else {
+                            // At end of history, restore saved line
+                            history_index = null;
+                            
+                            // Clear current line
+                            while (cursor_pos < line.len) {
+                                cursor_pos += 1;
+                                try stdout.writeAll("\x1b[C");
+                            }
+                            for (0..line.len) |_| {
+                                try stdout.writeAll("\x08 \x08");
+                            }
+                            
+                            line = try arena_alloc.dupe(u8, saved_line);
+                            cursor_pos = line.len;
+                            try stdout.writeAll(line);
+                        }
                     },
                     'H' => { // Home
                         while (cursor_pos > 0) {

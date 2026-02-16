@@ -3,6 +3,7 @@ const tools = @import("../tools.zig");
 const display = @import("../display.zig");
 const subagent = @import("../subagent.zig");
 const todo = @import("../todo.zig");
+const legacy = @import("legacy.zig");
 
 pub fn executeInlineToolCalls(
     allocator: std.mem.Allocator,
@@ -13,6 +14,7 @@ pub fn executeInlineToolCalls(
     todo_list: *todo.TodoList,
     subagent_manager: ?*subagent.SubagentManager,
 ) !?[]u8 {
+    _ = stdout; // Still needed for printTruncatedCommandOutput
     var result_buf: std.ArrayList(u8) = .empty;
     defer result_buf.deinit(allocator);
 
@@ -60,27 +62,35 @@ pub fn executeInlineToolCalls(
         else
             null;
 
-        // Execute tool
-        try stdout.print("• {s}", .{tool_name});
+        // Build tool call description for timeline
+        var tool_desc_buf: [512]u8 = undefined;
+        var tool_desc_pos: usize = 0;
+        const tool_desc_w = std.io.fixedBufferStream(&tool_desc_buf);
+        const tool_desc_writer = tool_desc_w.writer();
+        tool_desc_writer.print("• {s}", .{tool_name}) catch {};
+        tool_desc_pos = @min(tool_name.len + 2, tool_desc_buf.len);
         if (file_path) |fp| {
-            try stdout.print(" {s}file={s}{s}", .{ display.C_CYAN, fp, display.C_RESET });
+            const written = (std.fmt.bufPrint(tool_desc_buf[tool_desc_pos..], " {s}file={s}{s}", .{ display.C_CYAN, fp, display.C_RESET }) catch "").len;
+            tool_desc_pos += written;
         }
         if (bash_cmd) |bc| {
-            // Truncate long commands
             const max_cmd_len = 60;
             const display_cmd = if (bc.len > max_cmd_len) bc[0..max_cmd_len] else bc;
             const suffix = if (bc.len > max_cmd_len) "..." else "";
-            try stdout.print(" {s}cmd=\"{s}{s}\"{s}", .{ display.C_CYAN, display_cmd, suffix, display.C_RESET });
+            const written = (std.fmt.bufPrint(tool_desc_buf[tool_desc_pos..], " {s}cmd=\"{s}{s}\"{s}", .{ display.C_CYAN, display_cmd, suffix, display.C_RESET }) catch "").len;
+            tool_desc_pos += written;
         }
         if (read_params) |rp| {
             if (rp.offset) |off| {
-                try stdout.print(" {s}offset={d}{s}", .{ display.C_DIM, off, display.C_RESET });
+                const written = (std.fmt.bufPrint(tool_desc_buf[tool_desc_pos..], " {s}offset={d}{s}", .{ display.C_DIM, off, display.C_RESET }) catch "").len;
+                tool_desc_pos += written;
             }
             if (rp.limit) |lim| {
-                try stdout.print(" {s}limit={d}{s}", .{ display.C_DIM, lim, display.C_RESET });
+                const written = (std.fmt.bufPrint(tool_desc_buf[tool_desc_pos..], " {s}limit={d}{s}", .{ display.C_DIM, lim, display.C_RESET }) catch "").len;
+                tool_desc_pos += written;
             }
         }
-        try stdout.print("\n", .{});
+        legacy.toolOutput("{s}", .{tool_desc_buf[0..tool_desc_pos]});
 
         const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list, subagent_manager) catch |err| {
             try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
@@ -88,9 +98,9 @@ pub fn executeInlineToolCalls(
         };
         defer allocator.free(tool_out);
 
-        // For mutating tools, print diff to stdout for user visibility
+        // For mutating tools, add output to timeline
         if (tools.isMutatingToolName(tool_name)) {
-            try stdout.print("{s}\n", .{tool_out});
+            legacy.toolOutput("{s}", .{tool_out});
         }
 
         try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, tool_out });

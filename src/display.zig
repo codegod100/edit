@@ -17,6 +17,56 @@ pub const C_CYAN = "\x1b[36m";
 pub const C_BRIGHT_WHITE = "\x1b[97m";
 pub const C_GREY = "\x1b[90m";
 
+// Braille spinner frames for working/thinking indicator
+const SPINNER_FRAMES = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+var spinner_frame_index: u8 = 0;
+var spinner_last_update: i64 = 0;
+
+/// Spinner states for monitoring what the model is doing
+pub const SpinnerState = enum(u8) {
+    thinking = 0,
+    tool = 1,
+    reading = 2,
+    writing = 3,
+    bash = 4,
+    search = 5,
+};
+
+var g_spinner_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+pub fn setSpinnerState(state: SpinnerState) void {
+    g_spinner_state.store(@intFromEnum(state), .release);
+}
+
+pub fn getSpinnerStateText() []const u8 {
+    return switch (g_spinner_state.load(.acquire)) {
+        1 => "tool",
+        2 => "reading",
+        3 => "writing",
+        4 => "bash",
+        5 => "search",
+        else => "thinking",
+    };
+}
+
+/// Get the current braille spinner frame. Call periodically to animate.
+/// Returns the spinner character and advances to next frame if enough time passed.
+pub fn getSpinnerFrame() []const u8 {
+    const now = std.time.milliTimestamp();
+    if (now - spinner_last_update > 80) { // Update every 80ms
+        spinner_frame_index = (spinner_frame_index + 1) % SPINNER_FRAMES.len;
+        spinner_last_update = now;
+    }
+    return SPINNER_FRAMES[spinner_frame_index];
+}
+
+/// Reset spinner to first frame
+pub fn resetSpinner() void {
+    spinner_frame_index = 0;
+    spinner_last_update = 0;
+    g_spinner_state.store(0, .release);
+}
+
 pub fn terminalColumns() usize {
     if (builtin.os.tag != .windows) {
         var ws: std.posix.winsize = .{
@@ -90,6 +140,13 @@ pub fn printColoredToolEvent(stdout: anytype, event_type: []const u8, step: ?usi
 }
 
 pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
+    _ = stdout;
+    // Use timeline callback instead of direct stdout
+    formatTruncatedCommandOutput(output);
+}
+
+/// Format command output for timeline and add it via callback
+fn formatTruncatedCommandOutput(output: []const u8) void {
     const HEAD: usize = 2;
     const TAIL: usize = 2;
 
@@ -144,7 +201,7 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
 
                 const prefix = if (!printed_any) "  └ " else "    ";
                 printed_any = true;
-                try stdout.print("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, trimmed, C_RESET });
             }
         }
         return;
@@ -154,17 +211,17 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
     for (head[0..HEAD]) |r| {
         const prefix = if (!printed_any) "  └ " else "    ";
         printed_any = true;
-        try stdout.print("{s}{s}{s}{s}\n", .{ prefix, C_GREY, output[r.start..r.end], C_RESET });
+        addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, output[r.start..r.end], C_RESET });
     }
 
     const omitted = total - HEAD - TAIL;
-    try stdout.print("    {s}… +{d} lines{s}\n", .{ C_GREY, omitted, C_RESET });
+    addTimelineEntry("    {s}… +{d} lines{s}", .{ C_GREY, omitted, C_RESET });
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
     while (t < tail_len) : (t += 1) {
         const r = tail[(first + t) % TAIL];
-        try stdout.print("    {s}{s}{s}\n", .{ C_GREY, output[r.start..r.end], C_RESET });
+        addTimelineEntry("    {s}{s}{s}", .{ C_GREY, output[r.start..r.end], C_RESET });
     }
 }
 
@@ -204,41 +261,38 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
-    // Get terminal height
-    const term_height = getTerminalHeight();
-    
     // Clear screen and move cursor to top
     try stdout.writeAll("\x1b[2J\x1b[H");
-    
-    // Count lines in prompt (box + system info = 4 lines typically)
+
+    // Count lines in prompt
     var prompt_lines: usize = 0;
     for (current_prompt) |c| {
         if (c == '\n') prompt_lines += 1;
     }
     if (prompt_lines == 0) prompt_lines = 4;
-    
-    // Calculate how many timeline entries we can show
-    const reserved_lines = prompt_lines;
+
+    // Get terminal height
+    const term_height = getTerminalHeight();
+    // Reserve extra line as buffer between timeline and prompt
+    const reserved_lines = prompt_lines + 1;
     const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
-    
-    // Count total lines in all timeline entries (each entry may have newlines)
+
+    // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;
     for (g_timeline_entries.items) |entry| {
-        var lines_in_entry: usize = 1; // At least 1 line
+        var lines_in_entry: usize = 1;
         for (entry) |c| {
             if (c == '\n') lines_in_entry += 1;
         }
         total_entry_lines += lines_in_entry;
     }
-    
-    // If we have more content than fits, only show what fits
-    // Start from the top and draw until we fill the available space
-    var lines_remaining = max_timeline_lines;
+
+    // Determine which entries to show (scrolling if needed)
+    const lines_to_show = @min(total_entry_lines, max_timeline_lines);
     var start_idx: usize = 0;
-    
-    // Find starting index that allows us to show max content
+
     if (total_entry_lines > max_timeline_lines) {
-        // Need to scroll - find which entries to skip
+        // Scroll: skip oldest entries
         var lines_to_skip = total_entry_lines - max_timeline_lines;
         var idx: usize = 0;
         while (idx < g_timeline_entries.items.len and lines_to_skip > 0) {
@@ -255,41 +309,38 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
         }
         start_idx = idx;
     }
-    
-    // Draw timeline entries that fit
-    var idx = start_idx;
-    while (idx < g_timeline_entries.items.len and lines_remaining > 0) : (idx += 1) {
-        const entry = g_timeline_entries.items[idx];
-        var lines_in_entry: usize = 1;
-        for (entry) |c| {
-            if (c == '\n') lines_in_entry += 1;
-        }
-        
-        if (lines_in_entry <= lines_remaining) {
-            try stdout.print("{s}", .{entry});
-            if (idx < g_timeline_entries.items.len - 1) {
-                try stdout.writeAll("\n");
-            }
-            lines_remaining -= lines_in_entry;
-        } else {
-            // Entry is too long, truncate it
-            break;
-        }
-    }
-    
-    // Fill remaining space to push prompt to bottom
-    while (lines_remaining > 0) : (lines_remaining -= 1) {
+
+    // Calculate how many blank lines to print before timeline to position it correctly
+    // We want: [blank lines] + [timeline] + [buffer] + [prompt] = term_height
+    const blank_lines = max_timeline_lines - lines_to_show;
+
+    // Print blank lines to push content down
+    for (0..blank_lines) |_| {
         try stdout.writeAll("\n");
     }
-    
-    // Draw prompt box at bottom
+
+    // Draw timeline entries
+    var idx = start_idx;
+    while (idx < g_timeline_entries.items.len) : (idx += 1) {
+        const entry = g_timeline_entries.items[idx];
+        try stdout.print("{s}", .{entry});
+        if (idx < g_timeline_entries.items.len - 1) {
+            try stdout.writeAll("\n");
+        }
+    }
+
+    // Add a blank line buffer between timeline and prompt
+    try stdout.writeAll("\n");
+
+    // Draw prompt at bottom
     try stdout.print("{s}", .{current_prompt});
-    
-    // Position cursor: go up to middle line and to column 4 (after "│ >")
-    // After printing prompt (ends with \n), cursor is at start of new line
-    // Need to go up 3 lines: from below system info -> system info -> bottom border -> middle line
+
+    // Position cursor in the middle line of prompt box (input line)
+    // Prompt structure: ┌─...─┐\n│ > ...│\n└─...─┘\n[system info]\n
+    // After printing prompt, cursor is on the line AFTER system info
+    // To get to input line (│ > ...│), we need to go up 3 lines
     try stdout.writeAll("\x1b[3A"); // Move up 3 lines
-    try stdout.writeAll("\x1b[4G"); // Move to column 4 (after "│ >")
+    try stdout.writeAll("\x1b[4G"); // Move to column 4 (after "│ > ")
 }
 
 pub fn getTerminalHeight() usize {

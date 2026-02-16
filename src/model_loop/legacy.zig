@@ -20,12 +20,38 @@ pub fn setToolOutputCallback(callback: ?ToolOutputCallback) void {
     g_tool_output_callback = callback;
 }
 
-fn toolOutput(comptime fmt: []const u8, args: anytype) void {
+pub fn toolOutput(comptime fmt: []const u8, args: anytype) void {
     if (g_tool_output_callback) |callback| {
         var buf: [1024]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
         callback(text);
     }
+}
+
+/// Unescape JSON escape sequences in place
+fn unescapeJsonString(buf: []u8, input: []const u8) []const u8 {
+    var out_idx: usize = 0;
+    var in_idx: usize = 0;
+    while (in_idx < input.len and out_idx < buf.len) : (in_idx += 1) {
+        if (input[in_idx] == '\\' and in_idx + 1 < input.len) {
+            const next = input[in_idx + 1];
+            switch (next) {
+                'n' => { buf[out_idx] = '\n'; out_idx += 1; in_idx += 1; },
+                'r' => { buf[out_idx] = '\r'; out_idx += 1; in_idx += 1; },
+                't' => { buf[out_idx] = '\t'; out_idx += 1; in_idx += 1; },
+                '\\' => { buf[out_idx] = '\\'; out_idx += 1; in_idx += 1; },
+                '"' => { buf[out_idx] = '"'; out_idx += 1; in_idx += 1; },
+                'b' => { buf[out_idx] = 0x08; out_idx += 1; in_idx += 1; },
+                'f' => { buf[out_idx] = 0x0c; out_idx += 1; in_idx += 1; },
+                '/' => { buf[out_idx] = '/'; out_idx += 1; in_idx += 1; },
+                else => { buf[out_idx] = input[in_idx]; out_idx += 1; },
+            }
+        } else {
+            buf[out_idx] = input[in_idx];
+            out_idx += 1;
+        }
+    }
+    return buf[0..out_idx];
 }
 
 // Simplified bridge-based tool loop - uses Bun AI SDK
@@ -148,7 +174,7 @@ pub fn runModel(
                 continue;
             }
             const finish_reason = if (response.finish_reason.len > 0) response.finish_reason else "none";
-            try stdout.print("{s}Stop:{s} model failed protocol: no tool call after retries (finish_reason={s}).\n", .{ display.C_DIM, display.C_RESET, finish_reason });
+            toolOutput("{s}Stop:{s} model failed protocol: no tool call after retries (finish_reason={s}).", .{ display.C_DIM, display.C_RESET, finish_reason });
             return .{
                 .response = try allocator.dupe(u8, "Model did not return required tool-call format. Try again or switch model/provider."),
                 .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -186,7 +212,7 @@ pub fn runModel(
             const is_bash = std.mem.eql(u8, tc.tool, "bash");
             const repeat_threshold: usize = if (is_bash) 1 else 3;
             if (repeated_tool_calls >= repeat_threshold) {
-                try stdout.print("{s}Note:{s} repeated identical tool call detected; requesting a different next action.\n", .{ display.C_DIM, display.C_RESET });
+                toolOutput("{s}Note:{s} repeated identical tool call detected; requesting a different next action.", .{ display.C_DIM, display.C_RESET });
                 try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
                 try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
                 try w.appendSlice(arena_alloc, ",\"content\":");
@@ -203,7 +229,7 @@ pub fn runModel(
                 }
 
                 if (rejected_repeated_bash >= 2 or rejected_repeated_other >= 6) {
-                    try stdout.print("{s}Stop:{s} model is stuck repeating the same tool call.\n", .{ display.C_DIM, display.C_RESET });
+                    toolOutput("{s}Stop:{s} model is stuck repeating the same tool call.", .{ display.C_DIM, display.C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "Model kept repeating the same tool call even after rejection. Try rephrasing the request, or switch model/provider."),
                         .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -333,23 +359,27 @@ pub fn runModel(
                 continue;
             }
 
+            // Update spinner state based on tool type
             if (std.mem.eql(u8, tc.tool, "bash")) {
                 if (tools.parseBashCommandFromArgs(allocator, tc.args)) |cmd| {
                     defer allocator.free(cmd);
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
                     if (is_rg) {
+                        display.setSpinnerState(.search);
                         toolOutput("• Search {s}", .{cmd});
                     } else {
+                        display.setSpinnerState(.bash);
                         toolOutput("• Ran {s}", .{cmd});
                     }
-
                 } else {
+                    display.setSpinnerState(.bash);
                     toolOutput("• Ran {s}", .{tc.tool});
                 }
             } else if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |path| {
                 defer arena_alloc.free(path);
                 if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
+                    display.setSpinnerState(.reading);
                     if (try tools.parseReadParamsFromArgs(arena_alloc, tc.args)) |params| {
                         if (params.offset) |off| {
                             toolOutput("• {s} {s} [{d}:{d}]", .{ tc.tool, path, off, params.limit orelse 0 });
@@ -360,19 +390,25 @@ pub fn runModel(
                         toolOutput("• {s} {s}", .{ tc.tool, path });
                     }
                 } else {
+                    display.setSpinnerState(.writing);
                     toolOutput("• {s} {s}", .{ tc.tool, path });
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
+                display.setSpinnerState(.thinking);
                 // Extract and show the text content
                 const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
-                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, text });
+                // Unescape JSON escape sequences (\n -> newline, etc.)
+                var unescape_buf: [4096]u8 = undefined;
+                const unescaped = unescapeJsonString(&unescape_buf, text);
+                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, unescaped });
             } else {
+                display.setSpinnerState(.tool);
                 toolOutput("• {s}", .{tc.tool});
             }
 
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 if (mutation_request and mutating_tools_executed == 0) {
-                    try stdout.print("{s}Stop:{s} respond_text rejected: edit request requires at least one mutating tool execution first.\n", .{ display.C_DIM, display.C_RESET });
+                    toolOutput("{s}Stop:{s} respond_text rejected: edit request requires at least one mutating tool execution first.", .{ display.C_DIM, display.C_RESET });
                     try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
                     try w.writer(arena_alloc).print(
                         "{f}",
@@ -382,7 +418,7 @@ pub fn runModel(
                     continue;
                 }
                 const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
-                    try stdout.print("{s}  error: {s}{s}\n", .{ display.C_RED, @errorName(err), display.C_RESET });
+                    toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
                         .response = try allocator.dupe(u8, "respond_text arguments were invalid."),
                         .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -402,7 +438,7 @@ pub fn runModel(
             if (tools.isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
 
             const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list, subagent_manager) catch |err| {
-                try stdout.print("{s}  error: {s}{s}\n", .{ display.C_RED, @errorName(err), display.C_RESET });
+                toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                 const err_msg = try std.fmt.allocPrint(allocator, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 defer allocator.free(err_msg);
 
@@ -422,7 +458,7 @@ pub fn runModel(
                     var it = std.mem.splitScalar(u8, result, '\n');
                     while (it.next()) |line| {
                         if (line.len == 0) continue;
-                        try stdout.print("  {s}{s}{s}\n", .{ display.C_GREY, line, display.C_RESET });
+                        toolOutput("  {s}{s}{s}", .{ display.C_GREY, line, display.C_RESET });
                     }
                 }
             }
@@ -475,7 +511,7 @@ pub fn runModel(
         }
     }
 
-    try stdout.print("{s}Stop:{s} reached maximum step limit ({d}).\n", .{ display.C_DIM, display.C_RESET, max_iterations });
+    toolOutput("{s}Stop:{s} reached maximum step limit ({d}).", .{ display.C_DIM, display.C_RESET, max_iterations });
 
     return .{
         .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),

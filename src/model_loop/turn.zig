@@ -7,6 +7,7 @@ const display = @import("../display.zig");
 const tool_routing = @import("../tool_routing.zig");
 const todo = @import("../todo.zig");
 const cancel = @import("../cancel.zig");
+const legacy = @import("legacy.zig");
 
 pub fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
     return @ptrCast(defs);
@@ -91,7 +92,7 @@ pub fn runModelTurnWithTools(
         var routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
-            try stdout.print("{s}»{s} ", .{ display.C_DIM, display.C_RESET });
+            legacy.toolOutput("{s}»{s} ", .{ display.C_DIM, display.C_RESET });
             const strict_prompt = try tool_routing.buildStrictToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_prompt);
             routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, strict_prompt, true);
@@ -99,14 +100,14 @@ pub fn runModelTurnWithTools(
 
         if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
             forced_mutation_probe_done = true;
-            try stdout.print("{s}✎{s} ", .{ display.C_DIM, display.C_RESET });
+            legacy.toolOutput("{s}✎{s} ", .{ display.C_DIM, display.C_RESET });
             const strict_mutation_prompt = try tool_routing.buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_mutation_prompt);
             routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, strict_mutation_prompt, true);
         }
 
         if (routed == null and step == 0 and mutation_request) {
-            try stdout.print("{s}ƒ{s} ", .{ display.C_DIM, display.C_RESET });
+            legacy.toolOutput("{s}ƒ{s} ", .{ display.C_DIM, display.C_RESET });
             routed = try tool_routing.inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
@@ -135,7 +136,7 @@ pub fn runModelTurnWithTools(
         }
 
         if (routed == null) {
-            try stdout.print("{s}—{s}\n", .{ display.C_YELLOW, display.C_RESET });
+            legacy.toolOutput("{s}—{s}", .{ display.C_YELLOW, display.C_RESET });
 
             if (mutation_request and tool_calls == 0) {
                 allocator.free(context_prompt);
@@ -187,7 +188,7 @@ pub fn runModelTurnWithTools(
                     continue;
                 }
             } else if (step < soft_limit) {
-                try stdout.print("{s}...continuing{s}\n", .{ display.C_DIM, display.C_RESET });
+                legacy.toolOutput("{s}...continuing{s}", .{ display.C_DIM, display.C_RESET });
                 const next_prompt = try std.fmt.allocPrint(
                     allocator,
                     "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
@@ -230,7 +231,7 @@ pub fn runModelTurnWithTools(
                     };
                 }
             } else if (step < soft_limit) {
-                try stdout.print("{s}...continuing{s}\n", .{ display.C_DIM, display.C_RESET });
+                legacy.toolOutput("{s}...continuing{s}", .{ display.C_DIM, display.C_RESET });
                 const next_prompt = try std.fmt.allocPrint(
                     allocator,
                     "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
@@ -274,8 +275,17 @@ pub fn runModelTurnWithTools(
         const call_id = try std.fmt.allocPrint(allocator, "toolcall-{d}", .{step + 1});
         defer allocator.free(call_id);
 
-        try display.printColoredToolEvent(stdout, "tool-input-start", step + 1, call_id, routed.?.tool);
-        try display.printColoredToolEvent(stdout, "tool-call", step + 1, call_id, routed.?.tool);
+        // Update spinner state based on tool type
+        if (tools.isReadToolName(routed.?.tool)) {
+            display.setSpinnerState(.reading);
+        } else if (tools.isMutatingToolName(routed.?.tool)) {
+            display.setSpinnerState(.writing);
+        } else if (std.mem.eql(u8, routed.?.tool, "bash")) {
+            display.setSpinnerState(.bash);
+        } else {
+            display.setSpinnerState(.tool);
+        }
+        legacy.toolOutput("• {s}", .{routed.?.tool});
 
         const started_ms = std.time.milliTimestamp();
         const file_path = tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
@@ -286,7 +296,7 @@ pub fn runModelTurnWithTools(
             const err_line = try display.buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);
             defer allocator.free(err_line);
             if (file_path) |fp| allocator.free(fp);
-            try stdout.print("{s}\n", .{err_line});
+            legacy.toolOutput("{s}", .{err_line});
             allocator.free(context_prompt);
             return .{
                 .response = try std.fmt.allocPrint(
@@ -307,13 +317,13 @@ pub fn runModelTurnWithTools(
         const ok_line = try display.buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms, file_path);
         defer allocator.free(ok_line);
         if (file_path) |fp| allocator.free(fp);
-        try stdout.print("{s}\n", .{ok_line});
+        legacy.toolOutput("{s}", .{ok_line});
 
         if (tools.isMutatingToolName(routed.?.tool)) {
-            try display.printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
-            try stdout.print("{s}\n", .{tool_out});
+            legacy.toolOutput("• {s} (mutating)", .{routed.?.tool});
+            legacy.toolOutput("{s}", .{tool_out});
         } else if (tools.isReadToolName(routed.?.tool)) {
-            try display.printColoredToolEvent(stdout, "tool-meta", step + 1, call_id, routed.?.tool);
+            legacy.toolOutput("• {s} (read)", .{routed.?.tool});
             const max_lines: usize = 15;
             var lines_shown: usize = 0;
             var pos: usize = 0;
@@ -335,11 +345,14 @@ pub fn runModelTurnWithTools(
                 for (tool_out) |ch| {
                     if (ch == '\n') total_lines += 1;
                 }
-                try stdout.print("{s}\n[...truncated, showing {d} of {d} lines]\n", .{ tool_out[0..pos], max_lines, total_lines });
+                legacy.toolOutput("{s}\n[...truncated, showing {d} of {d} lines]", .{ tool_out[0..pos], max_lines, total_lines });
             } else {
-                try stdout.print("{s}\n", .{tool_out});
+                legacy.toolOutput("{s}", .{tool_out});
             }
         }
+
+        // Reset spinner to thinking state for next iteration
+        display.setSpinnerState(.thinking);
 
         const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
         const next_prompt = try std.fmt.allocPrint(

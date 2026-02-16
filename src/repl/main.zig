@@ -20,6 +20,46 @@ const display = @import("../display.zig");
 const cancel = @import("../cancel.zig");
 const line_editor = @import("../line_editor.zig");
 
+// Spinner state for showing processing indicator
+var g_spinner_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var g_spinner_thread: ?std.Thread = null;
+
+fn spinnerThread(stdout_file: std.fs.File) void {
+    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+    var frame_idx: usize = 0;
+    var buf: [128]u8 = undefined;
+    while (g_spinner_running.load(.acquire)) {
+        const state_text = display.getSpinnerStateText();
+        // Save cursor position, print spinner between timeline and prompt, restore cursor
+        _ = stdout_file.write("\x1b[s") catch {};
+        // Move up 5 lines (prompt=4 lines + 1 buffer line) to position between timeline and prompt
+        const spinner_str = std.fmt.bufPrint(&buf, "\x1b[5A\r{s} {s}...\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
+        _ = stdout_file.write(spinner_str) catch {};
+        _ = stdout_file.write("\x1b[u") catch {};
+        frame_idx = (frame_idx + 1) % frames.len;
+        std.Thread.sleep(80 * std.time.ns_per_ms);
+    }
+    // Clear spinner when done - move up and clear line
+    _ = stdout_file.write("\x1b[s") catch {};
+    _ = stdout_file.write("\x1b[5A\r\x1b[K") catch {};
+    _ = stdout_file.write("\x1b[u") catch {};
+}
+
+fn startSpinner(stdout_file: std.fs.File) !void {
+    display.setSpinnerState(.thinking);
+    g_spinner_running.store(true, .release);
+    g_spinner_thread = try std.Thread.spawn(.{}, spinnerThread, .{stdout_file});
+}
+
+fn stopSpinner() void {
+    g_spinner_running.store(false, .release);
+    if (g_spinner_thread) |t| {
+        t.join();
+        g_spinner_thread = null;
+    }
+    display.setSpinnerState(.thinking);
+}
+
 pub fn run(allocator: std.mem.Allocator) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
@@ -242,16 +282,21 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
 
-        // Move cursor to bottom for model output
-        try stdout.writeAll("\n");
+        // Show spinner while model is processing
+        if (stdout_file.isTty()) {
+            try startSpinner(stdout_file);
+        }
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
         ) catch |err| {
+            stopSpinner();
             display.addTimelineEntry("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, @errorName(err) });
             try display.clearScreenAndRedrawTimeline(stdout, prompt);
             continue;
         };
+
+        stopSpinner();
 
         // Response is already added by toolOutput callback from model_loop
         // Just need to redraw the timeline with the new entries
