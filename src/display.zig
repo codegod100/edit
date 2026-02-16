@@ -345,7 +345,7 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     g_timeline_mutex.lock();
     defer g_timeline_mutex.unlock();
     
-    // Also print to stdout immediately so we have a scrolling log
+    // Also print to stderr immediately so we have a scrolling log
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
     

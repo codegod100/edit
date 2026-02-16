@@ -151,6 +151,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     };
     defer state.deinit();
 
+    // Print Session Info
+    try stdout.print("Session ID: {s}{s}{s} (Log: {s}/transcript_{s}.txt)\n", .{ 
+        display.C_BOLD, logger.getSessionID(), display.C_RESET,
+        config_dir, logger.getSessionID() 
+    });
+
     // Load Context/History (only restore context if ZAGENT_RESTORE_CONTEXT is set)
     const restore_context = std.posix.getenv("ZAGENT_RESTORE_CONTEXT") != null;
     if (restore_context) {
