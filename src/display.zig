@@ -421,21 +421,23 @@ pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, stat
     const m_len = g_status_model_len.load(.acquire);
     const path_len = g_status_path_len.load(.acquire);
 
+    var id_buf: [128]u8 = undefined;
+    const full_id = std.fmt.bufPrint(&id_buf, "{s}/{s}", .{ g_status_provider[0..p_len], g_status_model[0..m_len] }) catch "model";
+
     var buf: [1024]u8 = undefined;
-    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s} {s} {s}/{s} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
+    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s: <20} {s} {s: >30} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
         term_height,
         bg_color,
         fg_color,
         spinner_frame,
         state_text,
         accent_color,
-        g_status_provider[0..p_len],
-        g_status_model[0..m_len],
+        full_id,
         fg_color,
         g_status_path[0..path_len],
     }) catch return;
 
-    const safe_len = @min(status.len, term_width + 50); // 50 for escape codes
+    const safe_len = @min(status.len, term_width + 100); // 100 for escape codes
     _ = stdout_file.write(status[0..safe_len]) catch {};
 }
 

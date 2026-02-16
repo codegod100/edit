@@ -29,8 +29,7 @@ fn spinnerThread(stdout_file: std.fs.File) void {
     while (g_spinner_running.load(.acquire)) {
         cancel.pollForEscape();
         const state_text = display.getSpinnerStateText(&state_buf);
-        const state = display.g_spinner_state.load(.acquire);
-        const frame = if (state == 0) " " else display.getSpinnerFrame();
+        const frame = display.getSpinnerFrame();
         
         display.renderStatusBar(stdout_file, frame, state_text);
         
