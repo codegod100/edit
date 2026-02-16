@@ -84,10 +84,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
     else
         stdout_file.writer();
     
-    // Initialize scrolling region (reserves bottom line for status bar)
-    display.setupScrollingRegion(stdout_file);
-    defer display.resetScrollingRegion(stdout_file);
-
     // Initialize timeline display
     display.initTimeline(allocator);
     defer display.deinitTimeline();
@@ -155,6 +151,21 @@ pub fn run(allocator: std.mem.Allocator) !void {
     };
     defer state.deinit();
 
+    // Load selected model config into state
+    state.selected_model = config_store.loadSelectedModel(allocator, config_dir) catch null;
+
+    // Initialize Status Bar Info before setupScrollingRegion
+    const active_init = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
+    if (active_init) |a| {
+        display.setStatusBarInfo(a.provider_id, a.model_id, cwd);
+    } else {
+        display.setStatusBarInfo("none", "none", cwd);
+    }
+
+    // Initialize scrolling region (reserves bottom line for status bar)
+    display.setupScrollingRegion(stdout_file);
+    defer display.resetScrollingRegion(stdout_file);
+
     // Print Session Info
     try stdout.print("Session ID: {s}{s}{s} (Log: {s}/transcript_{s}.txt)\n", .{ 
         display.C_BOLD, logger.getSessionID(), display.C_RESET,
@@ -169,16 +180,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
     var history = context.CommandHistory.init();
     defer history.deinit(allocator);
     context.loadHistory(allocator, config_dir, &history) catch {};
-
-    // Load selected model config
-    state.selected_model = config_store.loadSelectedModel(allocator, config_dir) catch null;
-    if (state.selected_model) |_| {
-        // Restore reasoning_effort if saved? config_store might load it?
-        // ConfigStore struct needs checking. Assuming for now.
-        // Actually loadSelectedModel returns OwnedModelSelection which has specific fields.
-        // We might need to load reasoning effort separately if not in OwnedModelSelection.
-        // Ignoring effort restoration for brevity unless critical.
-    }
 
     // Input queue
     var queued_lines: std.ArrayListUnmanaged([]u8) = .empty;
