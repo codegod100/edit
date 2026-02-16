@@ -1,4 +1,5 @@
 const std = @import("std");
+
 const active_module = @import("../context.zig");
 const llm = @import("../llm.zig");
 const tools = @import("../tools.zig");
@@ -20,11 +21,30 @@ pub fn setToolOutputCallback(callback: ?ToolOutputCallback) void {
     g_tool_output_callback = callback;
 }
 
+// Global arena for tool output strings (cleared each turn)
+var g_tool_output_arena: ?std.heap.ArenaAllocator = null;
+
+pub fn initToolOutputArena(allocator: std.mem.Allocator) void {
+    g_tool_output_arena = std.heap.ArenaAllocator.init(allocator);
+}
+
+pub fn deinitToolOutputArena() void {
+    if (g_tool_output_arena) |*arena| {
+        arena.deinit();
+        g_tool_output_arena = null;
+    }
+}
+
 pub fn toolOutput(comptime fmt: []const u8, args: anytype) void {
     if (g_tool_output_callback) |callback| {
         var buf: [1024]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        callback(text);
+        // Use arena to allocate persistent copy
+        if (g_tool_output_arena) |*arena| {
+            const copy = arena.allocator().alloc(u8, text.len) catch return;
+            @memcpy(copy, text);
+            callback(copy);
+        }
     }
 }
 
@@ -303,7 +323,7 @@ pub fn runModel(
                 const unescaped = unescapeJsonString(&unescape_buf, text);
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, unescaped });
             } else {
-                display.setSpinnerState(.tool);
+                display.setSpinnerStateWithText(.tool, tc.tool);
                 toolOutput("• {s}", .{tc.tool});
             }
 

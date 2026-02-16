@@ -256,6 +256,10 @@ pub fn describeModelQueryError(err: anyerror) []const u8 {
 // Timeline display for keeping prompt at bottom
 var g_timeline_entries: std.ArrayListUnmanaged([]const u8) = .{};
 var g_timeline_allocator: ?std.mem.Allocator = null;
+var g_timeline_mutex: std.Thread.Mutex = .{};
+
+// Global stdout mutex to prevent concurrent writes
+pub var g_stdout_mutex: std.Thread.Mutex = .{};
 
 pub fn initTimeline(allocator: std.mem.Allocator) void {
     g_timeline_allocator = allocator;
@@ -273,6 +277,8 @@ pub fn deinitTimeline() void {
 }
 
 pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
+    g_timeline_mutex.lock();
+    defer g_timeline_mutex.unlock();
     if (g_timeline_allocator) |allocator| {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;
         g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
@@ -287,6 +293,13 @@ pub fn setSpinnerActive(active: bool) void {
 }
 
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
+    // Skip redraw if spinner is active to avoid stdout conflicts
+    if (g_spinner_active.load(.acquire)) return;
+    
+    // Lock stdout for atomic redraw
+    g_stdout_mutex.lock();
+    defer g_stdout_mutex.unlock();
+    
     // Get terminal dimensions first
     const term_height = getTerminalHeight();
 
@@ -308,6 +321,10 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     try stdout.writeAll("\x1b[J"); // Clear from cursor to end (preserves scrollback above)
     try stdout.writeAll("\x1b[H"); // Move to top to start drawing
 
+    // Lock timeline for reading
+    g_timeline_mutex.lock();
+    defer g_timeline_mutex.unlock();
+    
     // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;
     for (g_timeline_entries.items) |entry| {

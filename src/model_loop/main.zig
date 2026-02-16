@@ -21,6 +21,8 @@ pub const toolDefsToLlm = @import("turn.zig").toolDefsToLlm;
 pub const isCancelled = @import("turn.zig").isCancelled;
 pub const setToolOutputCallback = @import("legacy.zig").setToolOutputCallback;
 pub const ToolOutputCallback = @import("legacy.zig").ToolOutputCallback;
+pub const initToolOutputArena = @import("legacy.zig").initToolOutputArena;
+pub const deinitToolOutputArena = @import("legacy.zig").deinitToolOutputArena;
 
 // Subagent handling
 pub const subagentThreadMain = @import("subagent.zig").subagentThreadMain;

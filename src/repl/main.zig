@@ -31,6 +31,11 @@ fn spinnerThread(stdout_file: std.fs.File) void {
     var state_buf: [192]u8 = undefined;
     while (g_spinner_running.load(.acquire)) {
         const state_text = display.getSpinnerStateText(&state_buf);
+        
+        // Lock stdout for atomic update
+        display.g_stdout_mutex.lock();
+        defer display.g_stdout_mutex.unlock();
+        
         // Save cursor position, print spinner between timeline and prompt, restore cursor
         _ = stdout_file.write("\x1b[s") catch {};
         // Move up 2 lines to position between timeline and prompt
@@ -276,6 +281,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try state.context_window.append(allocator, .user, line, .{});
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
+        // Initialize tool output arena for persistent strings
+        const legacy = @import("../model_loop/legacy.zig");
+        legacy.initToolOutputArena(allocator);
+        defer legacy.deinitToolOutputArena();
+        
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
                 display.addTimelineEntry("{s}", .{text});
