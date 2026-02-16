@@ -11,12 +11,12 @@ pub fn parseCodexResponsesStream(allocator: std.mem.Allocator, raw: []const u8) 
         return try parseNonStreamResponse(allocator, raw);
     }
 
-    var out_text: std.ArrayList(u8) = .empty;
+    var out_text: std.ArrayListUnmanaged(u8) = .empty;
     defer out_text.deinit(allocator);
 
     var current_name: ?[]u8 = null;
     defer if (current_name) |n| allocator.free(n);
-    var args: std.ArrayList(u8) = .empty;
+    var args: std.ArrayListUnmanaged(u8) = .empty;
     defer args.deinit(allocator);
     var saw_args_delta: bool = false;
 
@@ -120,7 +120,7 @@ fn parseNonStreamResponse(allocator: std.mem.Allocator, raw: []const u8) !types.
 }
 
 fn parseOutputArray(allocator: std.mem.Allocator, out_val: std.json.Value, root_parsed: std.json.Parsed(std.json.Value)) !types.ChatResponse {
-    var out_text = std.ArrayList(u8).empty;
+    var out_text: std.ArrayListUnmanaged(u8) = .empty;
     defer out_text.deinit(allocator);
 
     var tool_name: ?[]const u8 = null;
@@ -245,7 +245,7 @@ pub fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.C
     const finish_reason = choices[0].finish_reason orelse "";
     const reasoning = message.reasoning_content orelse message.thinking orelse "";
 
-    var tool_calls = std.ArrayListUnmanaged(types.ToolCall).empty;
+    var tool_calls: std.ArrayListUnmanaged(types.ToolCall) = .empty;
     errdefer {
         for (tool_calls.items) |tc| {
             allocator.free(tc.id);

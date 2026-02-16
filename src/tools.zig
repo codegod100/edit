@@ -819,7 +819,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
 }
 
 fn joinLines(allocator: std.mem.Allocator, lines: []const []const u8, trailing_newline: bool) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     for (lines, 0..) |line, idx| {
         try out.appendSlice(allocator, line);
@@ -836,9 +836,9 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
         return allocator.dupe(u8, "(no textual change)\n");
     }
 
-    var before_lines: std.ArrayList([]const u8) = .empty;
+    var before_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer before_lines.deinit(allocator);
-    var after_lines: std.ArrayList([]const u8) = .empty;
+    var after_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer after_lines.deinit(allocator);
 
     var bit = std.mem.splitScalar(u8, before, '\n');
@@ -863,7 +863,7 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
         as -= 1;
     }
 
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
     const c_reset = "\x1b[0m";
@@ -888,9 +888,9 @@ fn renderMiniDiff(allocator: std.mem.Allocator, path: []const u8, before: []cons
 fn countEditedLines(before: []const u8, after: []const u8) usize {
     if (std.mem.eql(u8, before, after)) return 0;
 
-    var before_lines: std.ArrayList([]const u8) = .empty;
+    var before_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer before_lines.deinit(std.heap.page_allocator);
-    var after_lines: std.ArrayList([]const u8) = .empty;
+    var after_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer after_lines.deinit(std.heap.page_allocator);
 
     var bit = std.mem.splitScalar(u8, before, '\n');
@@ -929,7 +929,7 @@ fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     const w = out.writer(allocator);
 

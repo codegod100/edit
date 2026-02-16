@@ -12,7 +12,6 @@ pub fn executeInlineToolCalls(
     tool_calls: *usize,
     todo_list: *todo.TodoList,
 ) !?[]u8 {
-    _ = stdout; // Still needed for printTruncatedCommandOutput
     var result_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer result_buf.deinit(allocator);
 
@@ -96,12 +95,14 @@ pub fn executeInlineToolCalls(
         };
         defer allocator.free(tool_out);
 
-        // For mutating tools, add output to timeline
-        if (tools.isMutatingToolName(tool_name)) {
-            legacy.toolOutput("{s}", .{tool_out});
+        if (tool_out.len > 0) {
+            try display.printTruncatedCommandOutput(stdout, tool_out);
         }
 
-        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, tool_out });
+        const clean_out = try display.stripAnsi(allocator, tool_out);
+        defer allocator.free(clean_out);
+
+        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, clean_out });
     }
 
     if (result_buf.items.len == 0) return null;

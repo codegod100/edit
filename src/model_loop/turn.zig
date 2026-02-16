@@ -337,42 +337,17 @@ pub fn runModelTurnWithTools(
         if (file_path) |fp| allocator.free(fp);
         legacy.toolOutput("{s}", .{ok_line});
 
-        if (tools.isMutatingToolName(routed.?.tool)) {
-            legacy.toolOutput("• {s} (mutating)", .{routed.?.tool});
-            legacy.toolOutput("{s}", .{tool_out});
-        } else if (tools.isReadToolName(routed.?.tool)) {
-            legacy.toolOutput("• {s} (read)", .{routed.?.tool});
-            const max_lines: usize = 15;
-            var lines_shown: usize = 0;
-            var pos: usize = 0;
-            var truncated = false;
-
-            while (pos < tool_out.len and lines_shown < max_lines) {
-                if (tool_out[pos] == '\n') {
-                    lines_shown += 1;
-                }
-                pos += 1;
-            }
-
-            if (pos < tool_out.len) {
-                truncated = true;
-            }
-
-            if (truncated) {
-                var total_lines: usize = 1;
-                for (tool_out) |ch| {
-                    if (ch == '\n') total_lines += 1;
-                }
-                legacy.toolOutput("{s}\n[...truncated, showing {d} of {d} lines]", .{ tool_out[0..pos], max_lines, total_lines });
-            } else {
-                legacy.toolOutput("{s}", .{tool_out});
-            }
+        if (tool_out.len > 0) {
+            try display.printTruncatedCommandOutput(stdout, tool_out);
         }
+
+        const clean_out = try display.stripAnsi(allocator, tool_out);
+        defer allocator.free(clean_out);
 
         // Reset spinner to thinking state for next iteration
         display.setSpinnerState(.thinking);
 
-        const capped = if (tool_out.len > 4000) tool_out[0..4000] else tool_out;
+        const capped = if (clean_out.len > 4000) clean_out[0..4000] else clean_out;
         const next_prompt = try std.fmt.allocPrint(
             allocator,
             "{s}\n\nTool events:\n- event=tool-input-start step={d} call_id={s} tool={s}\n- event=tool-call step={d} call_id={s} tool={s}\n- {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",

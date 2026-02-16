@@ -355,7 +355,7 @@ pub fn readPromptLine(
                 try stdout.writeAll("\x1b[D");
             }
             try stdout.writeAll("\x1b[K");
-            line = &.{};
+            line = try arena_alloc.dupe(u8, &.{});
             cursor_pos = 0;
             continue;
         }

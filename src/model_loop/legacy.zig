@@ -138,7 +138,12 @@ pub fn runModel(
     var w: std.ArrayListUnmanaged(u8) = .empty;
     defer w.deinit(arena_alloc);
 
-    const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. When implementing new changes or performing multi-step tasks, you MUST use todo_add to create a clear step-by-step plan and todo_update to track your progress as you complete each part. Avoid repeating identical tool calls. Finish by calling respond_text.";
+    const system_prompt = custom_system_prompt orelse "You are a highly capable software engineering assistant. Your goal is to help the user with their task efficiently and accurately.\n\n" ++
+        "1. **Analyze First**: Before making changes, use `grep` and `read_file` to understand the existing codebase, architectural patterns, and naming conventions. Mimic the style and structure of the project.\n" ++
+        "2. **Plan Your Work**: For multi-step tasks, you MUST use `todo_add` to create a detailed plan. Update your progress with `todo_update` as you complete each step. Break down complex tasks into smaller, manageable chunks.\n" ++
+        "3. **Be Precise**: When editing files, provide exact matches for `find` or `oldString`. Avoid introducing redundant or messy code. If you notice a pattern (like provider IDs), follow it strictly.\n" ++
+        "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
+        "5. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
 
     // Build messages array (without system field - that goes in separate system param for most APIs)
     try w.appendSlice(arena_alloc, "[");
@@ -221,7 +226,8 @@ pub fn runModel(
         try w.writer(arena_alloc).writeAll("]}");
 
         if (response.tool_calls.len == 0) {
-            if (response.text.len > 0) {
+            const trimmed_text = std.mem.trim(u8, response.text, " \t\r\n");
+            if (trimmed_text.len > 0) {
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response.text });
                 return .{
                     .response = try allocator.dupe(u8, response.text),
@@ -388,11 +394,11 @@ pub fn runModel(
 
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 if (mutation_request and mutating_tools_executed == 0) {
-                    toolOutput("{s}Stop:{s} respond_text rejected: edit request requires at least one mutating tool execution first.", .{ display.C_DIM, display.C_RESET });
+                    toolOutput("{s}Note:{s} request seems to require a file change, but no mutating tools were run.", .{ display.C_YELLOW, display.C_RESET });
                     try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
                     try w.writer(arena_alloc).print(
                         "{f}",
-                        .{std.json.fmt("You must run at least one mutating tool (write_file/replace_in_file/edit/write/apply_patch) before respond_text for this request.", .{})},
+                        .{std.json.fmt("Your plan mentioned a file change, but you haven't executed any mutating tools (like write_file, edit, etc.) yet. Please execute the necessary tools to apply the changes before calling respond_text. If no change is actually needed, please explain why.", .{})},
                     );
                     try w.appendSlice(arena_alloc, "}");
                     continue;
@@ -431,22 +437,17 @@ pub fn runModel(
             };
             defer arena_alloc.free(result);
 
-            if (!tools.isReadToolName(tc.tool) and result.len > 0) {
-                if (std.mem.eql(u8, tc.tool, "bash")) {
-                    try display.printTruncatedCommandOutput(stdout, result);
-                } else {
-                    var it = std.mem.splitScalar(u8, result, '\n');
-                    while (it.next()) |line| {
-                        if (line.len == 0) continue;
-                        toolOutput("  {s}{s}{s}", .{ display.C_GREY, line, display.C_RESET });
-                    }
-                }
+            if (result.len > 0) {
+                try display.printTruncatedCommandOutput(stdout, result);
             }
+
+            const clean_result = try display.stripAnsi(arena_alloc, result);
+            // clean_result is in arena, no need to free
 
             try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
             try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
             try w.appendSlice(arena_alloc, ",\"content\":");
-            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(result, .{})});
+            try w.writer(arena_alloc).print("{f}", .{std.json.fmt(clean_result, .{})});
             try w.appendSlice(arena_alloc, "}");
 
             if (std.mem.eql(u8, tc.tool, "bash")) {

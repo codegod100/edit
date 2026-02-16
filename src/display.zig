@@ -117,6 +117,28 @@ pub fn visibleLenAnsi(text: []const u8) usize {
     return n;
 }
 
+pub fn stripAnsi(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            i += 2;
+            while (i < text.len and ((text[i] >= '0' and text[i] <= '9') or text[i] == ';' or text[i] == 'm' or text[i] == 'K' or text[i] == 'A' or text[i] == 'B' or text[i] == 'C' or text[i] == 'D' or text[i] == 'H' or text[i] == 'J')) : (i += 1) {
+                const c = text[i];
+                if (c >= 'A' and c <= 'Z' or c == 'm') {
+                    i += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn buildToolResultEventLine(
     allocator: std.mem.Allocator,
     step: usize,
@@ -207,6 +229,8 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     if (total == 0) return;
 
     const trunc = total > (HEAD + TAIL);
+    const MAX_WIDTH: usize = 120;
+
     if (!trunc) {
         var printed_any = false;
         line_start = 0;
@@ -218,9 +242,14 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 line_start = i + 1;
                 if (trimmed.len == 0) continue;
 
-                const prefix = if (!printed_any) "  └ " else "    ";
+                const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
                 printed_any = true;
-                addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, trimmed, C_RESET });
+                
+                if (trimmed.len > MAX_WIDTH) {
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, trimmed[0..MAX_WIDTH], C_RESET });
+                } else {
+                    addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, trimmed, C_RESET });
+                }
             }
         }
         return;
@@ -228,19 +257,29 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
 
     var printed_any = false;
     for (head[0..HEAD]) |r| {
-        const prefix = if (!printed_any) "  └ " else "    ";
+        const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
         printed_any = true;
-        addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, output[r.start..r.end], C_RESET });
+        const line = output[r.start..r.end];
+        if (line.len > MAX_WIDTH) {
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, line[0..MAX_WIDTH], C_RESET });
+        } else {
+            addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, line, C_RESET });
+        }
     }
 
     const omitted = total - HEAD - TAIL;
-    addTimelineEntry("    {s}… +{d} lines{s}", .{ C_GREY, omitted, C_RESET });
+    addTimelineEntry("    {s}\xe2\x80\xa6 +{d} lines{s}", .{ C_GREY, omitted, C_RESET });
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
     while (t < tail_len) : (t += 1) {
         const r = tail[(first + t) % TAIL];
-        addTimelineEntry("    {s}{s}{s}", .{ C_GREY, output[r.start..r.end], C_RESET });
+        const line = output[r.start..r.end];
+        if (line.len > MAX_WIDTH) {
+            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}", .{ C_GREY, line[0..MAX_WIDTH], C_RESET, "" });
+        } else {
+            addTimelineEntry("    {s}{s}{s}", .{ C_GREY, line, C_RESET });
+        }
     }
 }
 
