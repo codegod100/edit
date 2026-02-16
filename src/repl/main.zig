@@ -39,7 +39,7 @@ fn spinnerThread(stdout_file: std.fs.File) void {
         display.g_stdout_mutex.lock();
         
         _ = stdout_file.write("\x1b[s") catch {}; // Save
-        _ = stdout_file.write("\x1b[4A\r") catch {}; // Move up 4 lines and to start
+        _ = stdout_file.write("\x1b[2A\r") catch {}; // Move up 2 lines and to start
         const spinner_str = std.fmt.bufPrint(&buf, "{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
         _ = stdout_file.write("\x1b[u") catch {}; // Restore to input line
