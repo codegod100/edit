@@ -37,6 +37,7 @@ fn formatProvidersOutput(allocator: std.mem.Allocator, providers: []const pm.Pro
             }
         }
     }
+    try w.print("\n\n", .{}); // Extra newlines to prevent prompt overlap
     return out.toOwnedSlice(allocator);
 }
 

@@ -19,12 +19,12 @@ pub fn isLikelyOAuthToken(token: []const u8) bool {
 }
 
 pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
-    if (std.mem.eql(u8, provider_id, "opencode")) {
-        return .{ .endpoint = "https://opencode.ai/zen/v1/chat/completions", .referer = "https://opencode.ai/", .title = "opencode", .user_agent = "opencode/0.1.0" };
-    } else if (std.mem.eql(u8, provider_id, "openrouter")) {
+    if (std.mem.eql(u8, provider_id, "openrouter")) {
         return .{ .endpoint = "https://openrouter.ai/api/v1/chat/completions", .referer = "https://zagent.local/", .title = "zagent", .user_agent = null };
     } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
         return .{ .endpoint = "https://api.githubcopilot.com/chat/completions", .referer = null, .title = null, .user_agent = "zagent/0.1" };
+    } else if (std.mem.eql(u8, provider_id, "zai")) {
+        return .{ .endpoint = "https://api.z.ai/api/coding/paas/v4", .referer = "https://z.ai/", .title = "zagent", .user_agent = null };
     }
     return .{ .endpoint = "https://api.openai.com/v1/chat/completions", .referer = null, .title = null, .user_agent = null };
 }
@@ -32,8 +32,8 @@ pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
 pub fn getModelsEndpoint(provider_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider_id, "openai")) return "https://api.openai.com/v1/models";
     if (std.mem.eql(u8, provider_id, "github-copilot")) return "https://api.githubcopilot.com/models";
-    if (std.mem.eql(u8, provider_id, "opencode")) return "https://opencode.ai/zen/v1/models";
     if (std.mem.eql(u8, provider_id, "openrouter")) return "https://openrouter.ai/api/v1/models";
+    if (std.mem.eql(u8, provider_id, "zai")) return "https://api.z.ai/api/coding/paas/v4";
     return null;
 }
 
