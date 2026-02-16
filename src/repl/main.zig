@@ -14,7 +14,7 @@ const context = @import("../context.zig");
 const model_loop = @import("../model_loop.zig");
 const model_select = @import("../model_select.zig");
 const catalog = @import("../models_catalog.zig");
-const subagent = @import("../subagent.zig");
+
 const todo = @import("../todo.zig");
 const display = @import("../display.zig");
 const cancel = @import("../cancel.zig");
@@ -27,26 +27,29 @@ var g_spinner_thread: ?std.Thread = null;
 fn spinnerThread(stdout_file: std.fs.File) void {
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     var frame_idx: usize = 0;
-    var buf: [128]u8 = undefined;
+    var buf: [256]u8 = undefined;
+    var state_buf: [192]u8 = undefined;
     while (g_spinner_running.load(.acquire)) {
-        const state_text = display.getSpinnerStateText();
+        const state_text = display.getSpinnerStateText(&state_buf);
         // Save cursor position, print spinner between timeline and prompt, restore cursor
         _ = stdout_file.write("\x1b[s") catch {};
-        // Move up 5 lines (prompt=4 lines + 1 buffer line) to position between timeline and prompt
-        const spinner_str = std.fmt.bufPrint(&buf, "\x1b[5A\r{s} {s}...\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
+        // Move up 2 lines to position between timeline and prompt
+        const spinner_str = std.fmt.bufPrint(&buf, "\x1b[2A\r  {s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
         _ = stdout_file.write("\x1b[u") catch {};
         frame_idx = (frame_idx + 1) % frames.len;
         std.Thread.sleep(80 * std.time.ns_per_ms);
     }
-    // Clear spinner when done - move up and clear line
-    _ = stdout_file.write("\x1b[s") catch {};
-    _ = stdout_file.write("\x1b[5A\r\x1b[K") catch {};
-    _ = stdout_file.write("\x1b[u") catch {};
+}
+
+// Reset cursor to terminal default
+fn resetCursorStyle(stdout_file: std.fs.File) void {
+    _ = stdout_file.write("\x1b[0 q") catch {}; // Reset to terminal default
 }
 
 fn startSpinner(stdout_file: std.fs.File) !void {
     display.setSpinnerState(.thinking);
+    display.setSpinnerActive(true);
     g_spinner_running.store(true, .release);
     g_spinner_thread = try std.Thread.spawn(.{}, spinnerThread, .{stdout_file});
 }
@@ -57,6 +60,7 @@ fn stopSpinner() void {
         t.join();
         g_spinner_thread = null;
     }
+    display.setSpinnerActive(false);
     display.setSpinnerState(.thinking);
 }
 
@@ -139,7 +143,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         .selected_model = null,
         .context_window = context.ContextWindow.init(32000, 20),
         .todo_list = todo.TodoList.init(allocator),
-        .subagent_manager = subagent.SubagentManager.init(allocator),
+
         .reasoning_effort = null,
         .project_hash = context.hashProjectPath(cwd),
         .config_dir = config_dir,
@@ -188,38 +192,41 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Prompt with horizontal box style - fit to screen
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         
-        // Top border: ╭────────────────────╮
-        try prompt_buf.appendSlice(allocator, "\xe2\x95\xad"); // ╭
+        // Top border: ╭────────────────────╮ (colored cyan)
+        try prompt_buf.writer(allocator).print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
         var bw: usize = 0;
         while (bw < box_width) : (bw += 1) {
             try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
         }
-        try prompt_buf.appendSlice(allocator, "\xe2\x95\xae\n"); // ╮
+        try prompt_buf.writer(allocator).print("\xe2\x95\xae{s}\n", .{display.C_RESET}); // ╮
         
-        // Middle line with ">": │ > ... │
-        // Inner width = box_width. Content: " >" (2 chars) + spaces (box_width - 3) + " " (1 char) = box_width
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ + space + > (3 display chars total: │ is 1 display char)
+        // Middle line with ">": │ >  ... │ (colored borders, extra space after >)
+        // Inner width = box_width. Content: " > " (3 chars) + spaces (box_width - 4) + " " (1 char) = box_width
+        try prompt_buf.writer(allocator).print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET }); // │ + space + > + space
         bw = 0;
-        while (bw < box_width - 3) : (bw += 1) { // Fill with box_width - 3 spaces
+        while (bw < box_width - 4) : (bw += 1) { // Fill with box_width - 4 spaces
             try prompt_buf.appendSlice(allocator, " ");
         }
-        try prompt_buf.appendSlice(allocator, " \xe2\x94\x82\n"); // space + │
+        try prompt_buf.writer(allocator).print(" {s}\xe2\x94\x82{s}\n", .{ display.C_CYAN, display.C_RESET }); // space + │
         
-        // Bottom border: ╰────────────────────╯
-        try prompt_buf.appendSlice(allocator, "\xe2\x95\xb0"); // ╰
+        // Bottom border: ╰────────────────────╯ (colored cyan)
+        try prompt_buf.writer(allocator).print("{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
         bw = 0;
         while (bw < box_width) : (bw += 1) {
             try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
         }
-        try prompt_buf.appendSlice(allocator, "\xe2\x95\xaf\n"); // ╯
+        try prompt_buf.writer(allocator).print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
         
-        // System info line below box - show full path
+        // System info line below box - show model and path with colors
         if (active) |a| {
             if (state.selected_model) |m| {
-                try prompt_buf.writer(allocator).print(" {s}/{s} @ ", .{ a.provider_id, m.model_id });
+                try prompt_buf.writer(allocator).print(" {s}{s}{s} {s}{s}{s} @ ", .{ 
+                    display.C_ORANGE, a.provider_id, display.C_RESET,
+                    display.C_YELLOW, m.model_id, display.C_RESET 
+                });
             }
         }
-        try prompt_buf.writer(allocator).print("{s}\n", .{cwd});
+        try prompt_buf.writer(allocator).print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
@@ -262,12 +269,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Add user input to timeline and redraw
         display.addTimelineEntry("{s}>>{s} {s}", .{ display.C_CYAN, display.C_RESET, line });
         try display.clearScreenAndRedrawTimeline(stdout, prompt);
+        // Small delay to ensure screen is rendered before spinner starts
+        std.Thread.sleep(10 * std.time.ns_per_ms);
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
-        // Set up tool output callback to add to timeline
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
                 display.addTimelineEntry("{s}", .{text});
@@ -288,7 +296,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            ctx_prompt, stdout_file.isTty(), &state.todo_list, &state.subagent_manager, null // system prompt override
+            ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {
             stopSpinner();
             display.addTimelineEntry("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, @errorName(err) });
@@ -297,6 +305,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         };
 
         stopSpinner();
+        resetCursorStyle(stdout_file);
 
         // Response is already added by toolOutput callback from model_loop
         // Just need to redraw the timeline with the new entries

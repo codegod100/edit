@@ -1,6 +1,6 @@
 const std = @import("std");
 const todo = @import("todo.zig");
-const subagent = @import("subagent.zig");
+
 const cancel = @import("cancel.zig");
 
 /// Parse the bash command from tool arguments JSON
@@ -126,12 +126,6 @@ pub const definitions = [_]ToolDef{
     .{ .name = "todo_list", .description = "List all todo items with their current status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
     .{ .name = "todo_remove", .description = "Remove a todo item by ID.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID to remove\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
     .{ .name = "todo_clear_done", .description = "Clear all completed todo items.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
-    // Subagent tools for task delegation
-    .{ .name = "subagent_spawn", .description = "Spawn a specialized subagent to handle a specific task. Types: coder, researcher, editor, tester, git.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"type\":{\"type\":\"string\",\"description\":\"Subagent type: coder, researcher, editor, tester, or git\"},\"description\":{\"type\":\"string\",\"description\":\"Task description for the subagent\"},\"context\":{\"type\":\"string\",\"description\":\"Optional context from parent agent\"}},\"required\":[\"type\",\"description\"],\"additionalProperties\":false}" },
-    .{ .name = "subagent_status", .description = "Check the status of a subagent task.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Subagent task ID\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
-    .{ .name = "subagent_list", .description = "List all subagent tasks and their status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
-    .{ .name = "subagent_cancel", .description = "Cancel a running subagent task.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Subagent task ID to cancel\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
-    .{ .name = "subagent_clear", .description = "Clear completed or failed subagent tasks.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
 };
 
 pub fn list() []const []const u8 {

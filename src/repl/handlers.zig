@@ -283,19 +283,6 @@ pub fn handleCommand(
         .ping => {
             try stdout.print("pong\n", .{});
         },
-        .todo => {
-            // Interactive todo
-            if (arg.len == 0) {
-                try stdout.print("{s}\n", .{state.todo_list.summary()});
-                const list = try state.todo_list.list(allocator);
-                defer allocator.free(list);
-                try stdout.print("{s}\n", .{list});
-            } else {
-                // Add todo?
-                _ = try state.todo_list.add(arg);
-                try stdout.print("Todo added.\n", .{});
-            }
-        },
         .clear => {
             try stdout.print("\x1b[2J\x1b[H", .{}); // ANSI clear screen
         },

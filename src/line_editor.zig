@@ -324,6 +324,54 @@ pub fn readPromptLine(
             return null;
         }
 
+        if (ch == 1) { // Ctrl+A - beginning of line
+            while (cursor_pos > 0) {
+                cursor_pos -= 1;
+                try stdout.writeAll("\x1b[D");
+            }
+            continue;
+        }
+
+        if (ch == 5) { // Ctrl+E - end of line
+            while (cursor_pos < line.len) {
+                cursor_pos += 1;
+                try stdout.writeAll("\x1b[C");
+            }
+            continue;
+        }
+
+        if (ch == 11) { // Ctrl+K - kill to end of line
+            if (cursor_pos < line.len) {
+                // Clear from cursor to end
+                for (cursor_pos..line.len) |_| {
+                    try stdout.writeAll(" \x1b[C");
+                }
+                for (cursor_pos..line.len) |_| {
+                    try stdout.writeAll("\x1b[D");
+                }
+                for (cursor_pos..line.len) |_| {
+                    try stdout.writeAll(" \x1b[D");
+                }
+                // Truncate line at cursor position
+                line = try arena_alloc.dupe(u8, line[0..cursor_pos]);
+            }
+            continue;
+        }
+
+        if (ch == 21) { // Ctrl+U - kill whole line
+            // Clear entire line
+            while (cursor_pos < line.len) {
+                cursor_pos += 1;
+                try stdout.writeAll("\x1b[C");
+            }
+            for (0..line.len) |_| {
+                try stdout.writeAll("\x08 \x08");
+            }
+            line = &.{};
+            cursor_pos = 0;
+            continue;
+        }
+
         if (ch == '\n' or ch == '\r') {
             try stdout.print("\n", .{});
             return try allocator.dupe(u8, line);

@@ -245,7 +245,16 @@ pub fn runModel(
 
 
 
-            if (std.mem.eql(u8, tc.tool, "subagent_spawn") and subagent_manager != null) {
+            if (std.mem.eql(u8, tc.tool, "subagent_spawn")) {
+                // Subagent support removed - return error
+                const msg = "{\"error\":\"Subagent support has been removed\"}";
+                try w.appendSlice(arena_alloc, ",{\"role\":\"tool\",\"tool_call_id\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(tc.id, .{})});
+                try w.appendSlice(arena_alloc, ",\"content\":");
+                try w.writer(arena_alloc).print("{f}", .{std.json.fmt(msg, .{})});
+                try w.appendSlice(arena_alloc, "}");
+                continue;
+            }
                 const A = struct {
                     type: ?[]const u8 = null,
                     description: ?[]const u8 = null,
@@ -366,10 +375,13 @@ pub fn runModel(
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
                     if (is_rg) {
-                        display.setSpinnerState(.search);
+                        // Only truncate if really long (80 chars)
+                        const display_cmd = if (cmd.len > 80) cmd[cmd.len - 80 ..] else cmd;
+                        display.setSpinnerStateWithText(.search, display_cmd);
                         toolOutput("• Search {s}", .{cmd});
                     } else {
-                        display.setSpinnerState(.bash);
+                        const display_cmd = if (cmd.len > 80) cmd[cmd.len - 80 ..] else cmd;
+                        display.setSpinnerStateWithText(.bash, display_cmd);
                         toolOutput("• Ran {s}", .{cmd});
                     }
                 } else {
@@ -379,7 +391,8 @@ pub fn runModel(
             } else if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |path| {
                 defer arena_alloc.free(path);
                 if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
-                    display.setSpinnerState(.reading);
+                    const display_path = if (path.len > 80) path[path.len - 80 ..] else path;
+                    display.setSpinnerStateWithText(.reading, display_path);
                     if (try tools.parseReadParamsFromArgs(arena_alloc, tc.args)) |params| {
                         if (params.offset) |off| {
                             toolOutput("• {s} {s} [{d}:{d}]", .{ tc.tool, path, off, params.limit orelse 0 });
@@ -390,7 +403,8 @@ pub fn runModel(
                         toolOutput("• {s} {s}", .{ tc.tool, path });
                     }
                 } else {
-                    display.setSpinnerState(.writing);
+                    const display_path = if (path.len > 80) path[path.len - 80 ..] else path;
+                    display.setSpinnerStateWithText(.writing, display_path);
                     toolOutput("• {s} {s}", .{ tc.tool, path });
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {

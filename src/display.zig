@@ -33,20 +33,39 @@ pub const SpinnerState = enum(u8) {
 };
 
 var g_spinner_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+var g_spinner_custom_text: [128]u8 = undefined;
+var g_spinner_custom_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
 pub fn setSpinnerState(state: SpinnerState) void {
     g_spinner_state.store(@intFromEnum(state), .release);
+    g_spinner_custom_len.store(0, .release);
 }
 
-pub fn getSpinnerStateText() []const u8 {
-    return switch (g_spinner_state.load(.acquire)) {
+pub fn setSpinnerStateWithText(state: SpinnerState, text: []const u8) void {
+    g_spinner_state.store(@intFromEnum(state), .release);
+    const len = @min(text.len, g_spinner_custom_text.len);
+    @memcpy(g_spinner_custom_text[0..len], text[0..len]);
+    g_spinner_custom_len.store(len, .release);
+}
+
+pub fn getSpinnerStateText(buf: []u8) []const u8 {
+    const custom_len = g_spinner_custom_len.load(.acquire);
+    const state = g_spinner_state.load(.acquire);
+    const state_name = switch (state) {
         1 => "tool",
-        2 => "reading",
-        3 => "writing",
-        4 => "bash",
+        2 => "read",
+        3 => "write",
+        4 => "$",
         5 => "search",
-        else => "thinking",
+        else => "think",
     };
+    
+    if (custom_len > 0) {
+        // Format: "state: custom_text"
+        const fmt = std.fmt.bufPrint(buf, "{s}: {s}", .{ state_name, g_spinner_custom_text[0..custom_len] }) catch state_name;
+        return fmt;
+    }
+    return state_name;
 }
 
 /// Get the current braille spinner frame. Call periodically to animate.
@@ -260,9 +279,16 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     }
 }
 
+// Track if spinner is active to reserve space for it
+var g_spinner_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+pub fn setSpinnerActive(active: bool) void {
+    g_spinner_active.store(active, .release);
+}
+
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
-    // Clear screen and move cursor to top
-    try stdout.writeAll("\x1b[2J\x1b[H");
+    // Get terminal dimensions first
+    const term_height = getTerminalHeight();
 
     // Count lines in prompt
     var prompt_lines: usize = 0;
@@ -271,11 +297,14 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     }
     if (prompt_lines == 0) prompt_lines = 4;
 
-    // Get terminal height
-    const term_height = getTerminalHeight();
     // Reserve extra line as buffer between timeline and prompt
-    const reserved_lines = prompt_lines + 1;
+    // Add extra line for spinner when active
+    const spinner_buffer: usize = if (g_spinner_active.load(.acquire)) 2 else 1;
+    const reserved_lines = prompt_lines + spinner_buffer;
     const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
+
+    // Clear screen and move to top for clean redraw
+    try stdout.writeAll("\x1b[2J\x1b[H");
 
     // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;
@@ -319,28 +348,33 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
         try stdout.writeAll("\n");
     }
 
-    // Draw timeline entries
+    // Draw timeline entries (ensure each ends with newline)
     var idx = start_idx;
     while (idx < g_timeline_entries.items.len) : (idx += 1) {
         const entry = g_timeline_entries.items[idx];
         try stdout.print("{s}", .{entry});
-        if (idx < g_timeline_entries.items.len - 1) {
-            try stdout.writeAll("\n");
-        }
+        // Always add newline after entry to prevent collision
+        try stdout.writeAll("\n");
     }
 
-    // Add a blank line buffer between timeline and prompt
+    // Add blank line buffer (spinner line + prompt gap)
     try stdout.writeAll("\n");
 
     // Draw prompt at bottom
     try stdout.print("{s}", .{current_prompt});
 
     // Position cursor in the middle line of prompt box (input line)
-    // Prompt structure: ┌─...─┐\n│ > ...│\n└─...─┘\n[system info]\n
+    // Prompt structure: ┌─...─┐\n│ >  ...│\n└─...─┘\n[system info]\n
     // After printing prompt, cursor is on the line AFTER system info
-    // To get to input line (│ > ...│), we need to go up 3 lines
+    // To get to input line (│ >  ...│), we need to go up 3 lines
     try stdout.writeAll("\x1b[3A"); // Move up 3 lines
-    try stdout.writeAll("\x1b[4G"); // Move to column 4 (after "│ > ")
+    try stdout.writeAll("\x1b[5G"); // Move to column 5 (after "│ > ")
+
+    // Enable blinking block cursor (throbbing effect)
+    try stdout.writeAll("\x1b[1 q"); // Blinking block cursor
+    
+    // Ensure cursor is visible and positioned before returning
+    try stdout.writeAll("\x1b[?25h"); // Show cursor
 }
 
 pub fn getTerminalHeight() usize {

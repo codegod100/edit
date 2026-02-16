@@ -275,13 +275,18 @@ pub fn runModelTurnWithTools(
         const call_id = try std.fmt.allocPrint(allocator, "toolcall-{d}", .{step + 1});
         defer allocator.free(call_id);
 
-        // Update spinner state based on tool type
+        // Set initial spinner state (will be updated with details after parsing)
         if (tools.isReadToolName(routed.?.tool)) {
             display.setSpinnerState(.reading);
         } else if (tools.isMutatingToolName(routed.?.tool)) {
             display.setSpinnerState(.writing);
         } else if (std.mem.eql(u8, routed.?.tool, "bash")) {
-            display.setSpinnerState(.bash);
+            if (tools.parseBashCommandFromArgs(allocator, routed.?.arguments_json)) |cmd| {
+                defer allocator.free(cmd);
+                display.setSpinnerStateWithText(.bash, cmd);
+            } else {
+                display.setSpinnerState(.bash);
+            }
         } else {
             display.setSpinnerState(.tool);
         }
@@ -289,6 +294,19 @@ pub fn runModelTurnWithTools(
 
         const started_ms = std.time.milliTimestamp();
         const file_path = tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
+
+        // Update spinner with file path details now that we have them
+        if (tools.isReadToolName(routed.?.tool)) {
+            if (file_path) |fp| {
+                const display_fp = if (fp.len > 80) fp[fp.len - 80 ..] else fp;
+                display.setSpinnerStateWithText(.reading, display_fp);
+            }
+        } else if (tools.isMutatingToolName(routed.?.tool)) {
+            if (file_path) |fp| {
+                const display_fp = if (fp.len > 80) fp[fp.len - 80 ..] else fp;
+                display.setSpinnerStateWithText(.writing, display_fp);
+            }
+        }
 
         const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list, null) catch |err| {
             const failed_ms = std.time.milliTimestamp();
