@@ -141,18 +141,22 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
-        // Prompt
+        // Prompt with box around ">" and system info below
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         
-        try prompt_buf.appendSlice(allocator, "zagent");
+        // Box around ">"
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x8c\xe2\x94\x80>\n"); // ┌─>
+        
+        // System info below
         if (active) |a| {
-            try prompt_buf.writer(allocator).print(":{s}", .{a.provider_id});
+            if (state.selected_model) |m| {
+                try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}/{s}\n", .{ a.provider_id, m.model_id });
+            } else {
+                try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}\n", .{a.provider_id});
+            }
         }
-        if (state.selected_model) |m| {
-            try prompt_buf.writer(allocator).print("/{s}", .{m.model_id});
-            if (state.reasoning_effort) |e| try prompt_buf.writer(allocator).print("({s})", .{e});
-        }
-        try prompt_buf.writer(allocator).print(" [{s}]> ", .{cwd});
+        try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}\n", .{cwd});
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x94\xe2\x94\x80 "); // └─ 
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
