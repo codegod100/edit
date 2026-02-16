@@ -253,22 +253,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         };
 
-        // Add assistant response to timeline (convert \n to actual newlines)
-        const response_with_newlines = try allocator.alloc(u8, result.response.len);
-        defer allocator.free(response_with_newlines);
-        var j: usize = 0;
-        var i: usize = 0;
-        while (i < result.response.len) : (i += 1) {
-            if (result.response[i] == '\\' and i + 1 < result.response.len and result.response[i + 1] == 'n') {
-                response_with_newlines[j] = '\n';
-                j += 1;
-                i += 1;
-            } else {
-                response_with_newlines[j] = result.response[i];
-                j += 1;
-            }
-        }
-        display.addTimelineEntry("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response_with_newlines[0..j] });
+        // Response is already added by toolOutput callback from model_loop
+        // Just need to redraw the timeline with the new entries
+        try display.clearScreenAndRedrawTimeline(stdout, prompt);
 
         try state.context_window.append(allocator, .assistant, result.response, .{
             .tool_calls = result.tool_calls,
