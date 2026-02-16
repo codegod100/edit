@@ -41,47 +41,107 @@ Use the ANSI `DECSTBM` escape sequence (`\x1b[1;<height-1>r`) to define a scroll
 
 
 
-### The Issues
-
-1.  **Input Outside the Box**: We print the whole box, then the line editor starts. This puts the user's typing *below* the box rather than *inside* it.
-
-2.  **Missing Newlines**: Assistant output doesn't force a newline before the next box, causing "Just let me know what you need!╭───" mashed-together lines.
-
-3.  **Layout Redundancy**: The `cwd` and model info are below the box, making it feel disjointed.
-
-4.  **Cursor Jump**: Without relative positioning, the line editor can't "find" the input line inside the previously printed box.
+### The Issues (Phase 2 fallout)
 
 
 
-### The Fix (Phase 2)
+1.  **Broken Box**: The middle line `│ > ` never gets its trailing `│`, and the input doesn't look contained.
 
 
 
-- [x] **Vertical Spacing**: Ensure every assistant response or tool result ends with an explicit double newline before the next prompt starts.
+2.  **Region Conflict**: If the terminal is small, the status bar (at Line H) might be hiding the bottom border of the box if the scrolling region isn't perfectly respected or if we are off-by-one.
 
 
 
-- [x] **Containerized Input**: 
+3.  **Cursor Desync**: When the user types a long line that wraps, the `\r` before the bottom border might not return to the intended "start" of the prompt.
 
 
 
-    - [x] Print the TOP and MIDDLE (with `│ > `) parts of the box.
 
 
 
-    - [x] Start the line editor *right there*.
+
+### The Fix (Phase 3)
 
 
 
-    - [x] Print the BOTTOM of the box *after* the user hits Enter.
 
 
 
-- [x] **Refined Status Bar**: Ensure the status bar doesn't flicker or overwrite the bottom line of the scrolling region.
+
+- [x] **Pre-rendered Box**:
 
 
 
-- [x] **Transcript Logic**: Ensure the transcript records the full conversation flow.
+
+
+
+
+    - [x] Print the entire box (Top, Middle with trailing `│`, Bottom).
+
+
+
+
+
+
+
+    - [x] Use ANSI `\x1b[2A\x1b[5G` to position the cursor back into the middle line.
+
+
+
+
+
+
+
+    - [x] This ensures the box is always fully visible and correctly sized.
+
+
+
+
+
+
+
+- [x] **Explicit Scroll Region**: Verified `getTerminalHeight()` usage.
+
+
+
+
+
+
+
+- [x] **UTF-8/ANSI Width**: Handled via UTF-8 safe truncation logic.
+
+
+
+
+
+
+
+- [x] **Transcript Trace**: Added terminal dimension logging.
+
+
+
+
+
+
+
+## Corrected Verification Steps
+
+
+
+- [ ] Box is fully closed (all 4 sides) before typing starts.
+
+
+
+- [ ] Long inputs wrap *inside* the box (or we handle the wrap gracefully).
+
+
+
+- [ ] No "ghost" borders left behind after Enter.
+
+
+
+
 
 
 

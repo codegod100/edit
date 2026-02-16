@@ -199,10 +199,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
-        // Get terminal width for box
+        // Get terminal width/height for box and logging
         const term_width = display.terminalColumns();
+        const term_height = display.getTerminalHeight();
         const box_width = if (term_width > 4) term_width - 2 else 78;
         
+        try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
+
         // 1. Print Model/Path Info ABOVE the box
         try stdout.writeAll("\n");
         if (active) |a| {
@@ -215,18 +218,29 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
         try stdout.print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
 
-        // 2. Print Top Border: ╭────────────────────╮ (colored cyan)
+        // 2. Pre-render the entire box
+        // Top
         try stdout.print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
         var bw: usize = 0;
-        while (bw < box_width) : (bw += 1) {
-            try stdout.writeAll("\xe2\x94\x80"); // ─
-        }
+        while (bw < box_width) : (bw += 1) try stdout.writeAll("\xe2\x94\x80"); // ─
         try stdout.print("\xe2\x95\xae{s}\n", .{display.C_RESET}); // ╮
         
-        // 3. Print Middle Line Prefix: │ > 
+        // Middle (Empty)
         try stdout.print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET });
+        bw = 0;
+        while (bw < box_width - 4) : (bw += 1) try stdout.writeAll(" ");
+        try stdout.print("{s}\xe2\x94\x82{s}\n", .{ display.C_CYAN, display.C_RESET }); // │
+        
+        // Bottom
+        try stdout.print("{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
+        bw = 0;
+        while (bw < box_width) : (bw += 1) try stdout.writeAll("\xe2\x94\x80"); // ─
+        try stdout.print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
 
-        // Read Line (passing empty prompt because we already printed the prefix)
+        // 3. Move cursor UP 2 lines and forward 5 chars to get into the "│ > " position
+        try stdout.writeAll("\x1b[2A\x1b[5G");
+
+        // Read Line (passing empty prompt because we already printed it)
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
@@ -241,14 +255,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const line = line_opt.?;
         defer allocator.free(line);
 
-        // 4. Print Bottom Border: ╰────────────────────╯ (colored cyan)
-        // We need to move to column 1 first if the line editor ended elsewhere
-        try stdout.print("\r{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
-        bw = 0;
-        while (bw < box_width) : (bw += 1) {
-            try stdout.writeAll("\xe2\x94\x80"); // ─
-        }
-        try stdout.print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
+        // 4. Move cursor down past the box bottom to resume normal scrolling
+        try stdout.writeAll("\x1b[2B\r");
 
         if (line.len == 0) continue;
 

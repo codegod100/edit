@@ -359,19 +359,26 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 
 pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
     const height = getTerminalHeight();
-    if (height < 2) return;
+    if (height < 3) return; // Need at least 3 lines for status + space
+    
     // DECSTBM: Set Top and Bottom Margins
-    // \x1b[1;<height-1>r
+    // We reserve the LAST line for status.
+    // Margins are 1-based.
     var buf: [32]u8 = undefined;
     const seq = std.fmt.bufPrint(&buf, "\x1b[1;{d}r", .{height - 1}) catch return;
     _ = stdout_file.write(seq) catch {};
-    // Ensure cursor stays within the region
+    // Ensure cursor is in region at col 1
     _ = stdout_file.write("\x1b[H") catch {};
 }
 
 pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
     // Reset margins to full screen
     _ = stdout_file.write("\x1b[r") catch {};
+    // Ensure cursor is at bottom of region
+    const height = getTerminalHeight();
+    var buf: [32]u8 = undefined;
+    const seq = std.fmt.bufPrint(&buf, "\x1b[{d};1H", .{height}) catch return;
+    _ = stdout_file.write(seq) catch {};
 }
 
 pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, state_text: []const u8) void {
