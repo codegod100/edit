@@ -67,7 +67,7 @@ pub fn getSpinnerStateText(buf: []u8) []const u8 {
 pub fn getSpinnerFrame() []const u8 {
     const now = std.time.milliTimestamp();
     if (now - spinner_last_update > 80) { // Update every 80ms
-        spinner_frame_index = (spinner_frame_index + 1) % SPINNER_FRAMES.len;
+        spinner_frame_index = @intCast((spinner_frame_index + 1) % SPINNER_FRAMES.len);
         spinner_last_update = now;
     }
     return SPINNER_FRAMES[spinner_frame_index];
@@ -355,6 +355,38 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;
         g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
     }
+}
+
+pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, state_text: []const u8) void {
+    const term_height = getTerminalHeight();
+    const term_width = terminalColumns();
+
+    g_stdout_mutex.lock();
+    defer g_stdout_mutex.unlock();
+
+    // 1. Save cursor position
+    // 2. Move to bottom-most line
+    // 3. Print status bar with background color
+    // 4. Restore cursor
+    
+    const bg_color = "\x1b[48;5;235m"; // Dark grey background
+    const fg_color = "\x1b[38;5;250m"; // Light grey foreground
+    
+    // \x1b[s: save cursor
+    // \x1b[<H>;1H: move to line H, column 1
+    // \x1b[K: clear line
+    var buf: [512]u8 = undefined;
+    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s}" ++ " " ** 200 ++ "\x1b[0m\x1b[u", .{
+        term_height,
+        bg_color,
+        fg_color,
+        spinner_frame,
+        state_text,
+    }) catch return;
+
+    // Truncate to terminal width safely
+    const safe_len = @min(status.len, term_width + 30); // 30 for escape codes
+    _ = stdout_file.write(status[0..safe_len]) catch {};
 }
 
 // Track if spinner is active to reserve space for it

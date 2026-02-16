@@ -163,15 +163,10 @@ pub fn readPromptLine(
     std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
         // If terminal setup fails (e.g., Ctrl+C pressed), fall back to simple mode
         std.log.debug("Failed to set raw mode: {any}", .{err});
-        try stdout.writeAll(prompt);
         return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
     };
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
-    // Initial draw of timeline + prompt
-    const display = @import("display.zig");
-    try display.clearScreenAndRedrawTimeline(stdin_file, prompt);
-    
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

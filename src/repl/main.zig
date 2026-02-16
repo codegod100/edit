@@ -25,26 +25,18 @@ var g_spinner_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(fals
 var g_spinner_thread: ?std.Thread = null;
 
 fn spinnerThread(stdout_file: std.fs.File) void {
-    const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-    var frame_idx: usize = 0;
-    var buf: [256]u8 = undefined;
     var state_buf: [192]u8 = undefined;
     while (g_spinner_running.load(.acquire)) {
         cancel.pollForEscape();
         const state_text = display.getSpinnerStateText(&state_buf);
+        const frame = display.getSpinnerFrame();
         
-        display.g_stdout_mutex.lock();
+        display.renderStatusBar(stdout_file, frame, state_text);
         
-        const spinner_str = std.fmt.bufPrint(&buf, "\r{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
-        _ = stdout_file.write(spinner_str) catch {};
-        
-        display.g_stdout_mutex.unlock();
-        
-        frame_idx = (frame_idx + 1) % frames.len;
         std.Thread.sleep(80 * std.time.ns_per_ms);
     }
-    // Final clear
-    _ = stdout_file.write("\r\x1b[K") catch {};
+    // Final clear of status bar
+    display.renderStatusBar(stdout_file, "", "");
 }
 
 // Reset cursor to terminal default
@@ -236,10 +228,11 @@ pub fn run(allocator: std.mem.Allocator) !void {
             }
         }
         try prompt_buf.writer(allocator).print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
+        try prompt_buf.writer(allocator).print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
-        // Print the prompt box
+        // Print the prompt box (will scroll naturally)
         try stdout.writeAll(prompt);
 
         // Read Line
@@ -277,9 +270,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
             try stdout.print("No active model/provider. Use /connect or /model.\n", .{});
             continue;
         }
-
-        // Add user input to timeline
-        display.addTimelineEntry("{s}>>{s} {s}\n", .{ display.C_CYAN, display.C_RESET, line });
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
