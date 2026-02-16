@@ -502,7 +502,7 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
         try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.mid_right});
     }
 
-    // Content with ANSI-aware wrapping
+    // Content with ANSI-aware word wrapping
     for (lines) |line| {
         var start: usize = 0;
         while (start < line.len or line.len == 0) {
@@ -510,25 +510,55 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
             
             var visible_count: usize = 0;
             var j: usize = start;
-            while (j < line.len and visible_count < width - 4) {
+            var last_space_idx: ?usize = null;
+            var last_space_visible: usize = 0;
+            const target_width = width - 4;
+
+            while (j < line.len and visible_count < target_width) {
                 if (line[j] == 0x1b and j + 1 < line.len and line[j + 1] == '[') {
-                    const esc_start = j;
                     j += 2;
                     while (j < line.len and !((line[j] >= 'A' and line[j] <= 'Z') or line[j] == 'm')) : (j += 1) {}
                     j += 1;
-                    try w.writeAll(line[esc_start..j]);
                     continue;
                 }
                 
-                // UTF-8 start byte
-                const len = std.unicode.utf8ByteSequenceLength(line[j]) catch 1;
-                try w.writeAll(line[j .. j + len]);
-                j += len;
+                if (line[j] == ' ') {
+                    last_space_idx = j;
+                    last_space_visible = visible_count;
+                }
+
+                const char_len = std.unicode.utf8ByteSequenceLength(line[j]) catch 1;
+                j += char_len;
                 visible_count += 1;
             }
-            
-            const end = j;
-            const padding = (width - 4) - visible_count;
+
+            var end = j;
+            var end_visible = visible_count;
+
+            if (end < line.len and last_space_idx != null) {
+                end = last_space_idx.? + 1;
+                end_visible = last_space_visible + 1;
+            }
+
+            // Write the chunk
+            var k: usize = start;
+            var written_visible: usize = 0;
+            while (k < end) {
+                if (line[k] == 0x1b and k + 1 < line.len and line[k + 1] == '[') {
+                    const esc_start = k;
+                    k += 2;
+                    while (k < line.len and !((line[k] >= 'A' and line[k] <= 'Z') or line[k] == 'm')) : (k += 1) {}
+                    k += 1;
+                    try w.writeAll(line[esc_start..k]);
+                    continue;
+                }
+                const char_len = std.unicode.utf8ByteSequenceLength(line[k]) catch 1;
+                try w.writeAll(line[k .. k + char_len]);
+                k += char_len;
+                written_visible += 1;
+            }
+
+            const padding = target_width - written_visible;
             var p: usize = 0;
             while (p < padding) : (p += 1) try w.writeByte(' ');
             
