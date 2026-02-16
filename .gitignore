@@ -10,6 +10,8 @@ build
 
 # Build artifacts and binaries
 *.o
+broken
+test_stdout
 
 # Output files
 output.txt
