@@ -347,7 +347,7 @@ pub fn runModel(
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 // Extract and show the text content
                 const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
-                try stdout.print("⛬ {s}\n", .{text});
+                try stdout.print("{s}⛬{s} {s}\n", .{ display.C_CYAN, display.C_RESET, text });
             } else {
                 try stdout.print("• {s}\n", .{tc.tool});
             }

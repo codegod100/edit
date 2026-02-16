@@ -227,7 +227,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
                 j += 1;
             }
         }
-        display.addTimelineEntry("⛬ {s}", .{response_with_newlines[0..j]});
+        display.addTimelineEntry("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response_with_newlines[0..j] });
 
         try state.context_window.append(allocator, .assistant, result.response, .{
             .tool_calls = result.tool_calls,
