@@ -357,26 +357,41 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     }
 }
 
+pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
+    const height = getTerminalHeight();
+    if (height < 2) return;
+    // DECSTBM: Set Top and Bottom Margins
+    // \x1b[1;<height-1>r
+    var buf: [32]u8 = undefined;
+    const seq = std.fmt.bufPrint(&buf, "\x1b[1;{d}r", .{height - 1}) catch return;
+    _ = stdout_file.write(seq) catch {};
+    // Ensure cursor stays within the region
+    _ = stdout_file.write("\x1b[H") catch {};
+}
+
+pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
+    // Reset margins to full screen
+    _ = stdout_file.write("\x1b[r") catch {};
+}
+
 pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, state_text: []const u8) void {
     const term_height = getTerminalHeight();
-    const term_width = terminalColumns();
 
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
 
-    // 1. Save cursor position
-    // 2. Move to bottom-most line
-    // 3. Print status bar with background color
-    // 4. Restore cursor
+    // Target the absolute last line (outside the scrolling region)
+    // \x1b[s: save cursor
+    // \x1b[<H>;1H: move to line H, col 1
+    // \x1b[K: clear line
+    // \x1b[u: restore cursor
     
     const bg_color = "\x1b[48;5;235m"; // Dark grey background
     const fg_color = "\x1b[38;5;250m"; // Light grey foreground
     
-    // \x1b[s: save cursor
-    // \x1b[<H>;1H: move to line H, column 1
-    // \x1b[K: clear line
-    var buf: [512]u8 = undefined;
-    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s}" ++ " " ** 200 ++ "\x1b[0m\x1b[u", .{
+    var buf: [1024]u8 = undefined;
+    // We print spaces to fill width, then restore.
+    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
         term_height,
         bg_color,
         fg_color,
@@ -384,9 +399,7 @@ pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, stat
         state_text,
     }) catch return;
 
-    // Truncate to terminal width safely
-    const safe_len = @min(status.len, term_width + 30); // 30 for escape codes
-    _ = stdout_file.write(status[0..safe_len]) catch {};
+    _ = stdout_file.write(status) catch {};
 }
 
 // Track if spinner is active to reserve space for it

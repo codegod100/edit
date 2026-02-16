@@ -84,6 +84,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
     else
         stdout_file.writer();
     
+    // Initialize scrolling region (reserves bottom line for status bar)
+    display.setupScrollingRegion(stdout_file);
+    defer display.resetScrollingRegion(stdout_file);
+
     // Initialize timeline display
     display.initTimeline(allocator);
     defer display.deinitTimeline();
@@ -328,6 +332,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         stopSpinner();
         resetCursorStyle(stdout_file);
+
+        // Assistant response is already printed via respond_text tool call usually,
+        // but if not, we should ensure it's in the timeline.
+        // The new runModel adds everything to timeline via addTimelineEntry.
 
         try state.context_window.append(allocator, .assistant, result.response, .{
             .tool_calls = result.tool_calls,
