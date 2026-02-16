@@ -204,6 +204,9 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8, current_input: []const u8) !void {
+    // Save cursor position
+    try stdout.writeAll("\x1b[s");
+    
     // Clear screen and move cursor to top
     try stdout.writeAll("\x1b[2J\x1b[H");
     
@@ -219,6 +222,9 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8,
     
     // Draw prompt at bottom
     try stdout.print("{s}{s}", .{ current_prompt, current_input });
+    
+    // Restore cursor position (now at end of prompt+input)
+    try stdout.writeAll("\x1b[u");
 }
 
 pub fn getTerminalHeight() usize {

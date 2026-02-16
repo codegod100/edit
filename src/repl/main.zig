@@ -138,14 +138,24 @@ pub fn run(allocator: std.mem.Allocator) !void {
     while (true) {
         cancel.resetCancelled();
 
+        // Get active model info for prompt
+        const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
+        
         // Prompt
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
+        
+        // Get current directory name
+        const cwd_name = std.fs.path.basename(cwd);
+        
         try prompt_buf.appendSlice(allocator, "zagent");
+        if (active) |a| {
+            try prompt_buf.writer(allocator).print(":{s}", .{a.provider_id});
+        }
         if (state.selected_model) |m| {
-            try prompt_buf.writer(allocator).print(":{s}", .{m.model_id});
+            try prompt_buf.writer(allocator).print("/{s}", .{m.model_id});
             if (state.reasoning_effort) |e| try prompt_buf.writer(allocator).print("({s})", .{e});
         }
-        try prompt_buf.appendSlice(allocator, "> ");
+        try prompt_buf.writer(allocator).print(" [{s}]> ", .{cwd_name});
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
@@ -179,8 +189,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // Run Model
-        const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
+        // Run Model (active already retrieved for prompt)
         if (active == null) {
             try stdout.print("No active model/provider. Use /connect or /model.\n", .{});
             continue;
