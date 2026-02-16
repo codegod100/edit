@@ -19,6 +19,8 @@ pub const executeInlineToolCalls = @import("tools.zig").executeInlineToolCalls;
 // Helper functions
 pub const toolDefsToLlm = @import("turn.zig").toolDefsToLlm;
 pub const isCancelled = @import("turn.zig").isCancelled;
+pub const setToolOutputCallback = @import("legacy.zig").setToolOutputCallback;
+pub const ToolOutputCallback = @import("legacy.zig").ToolOutputCallback;
 
 // Subagent handling
 pub const subagentThreadMain = @import("subagent.zig").subagentThreadMain;

@@ -10,6 +10,24 @@ const cancel = @import("../cancel.zig");
 const subagent = @import("../subagent.zig");
 const turn = @import("turn.zig");
 
+// Tool output callback type for timeline integration
+// Takes a pre-formatted string and adds it to timeline
+pub const ToolOutputCallback = *const fn ([]const u8) void;
+
+var g_tool_output_callback: ?ToolOutputCallback = null;
+
+pub fn setToolOutputCallback(callback: ?ToolOutputCallback) void {
+    g_tool_output_callback = callback;
+}
+
+fn toolOutput(comptime fmt: []const u8, args: anytype) void {
+    if (g_tool_output_callback) |callback| {
+        var buf: [1024]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        callback(text);
+    }
+}
+
 // Simplified bridge-based tool loop - uses Bun AI SDK
 pub fn runModel(
     allocator: std.mem.Allocator,
@@ -297,7 +315,7 @@ pub fn runModel(
                 };
                 th.detach();
 
-                try stdout.print("• subagent {s} {s}\n", .{ task_type_str, id });
+                toolOutput("• subagent {s} {s}", .{ task_type_str, id });
 
                 const sys_prompt = subagent.SubagentManager.getSystemPrompt(task_type);
                 const out = try std.fmt.allocPrint(
@@ -321,35 +339,35 @@ pub fn runModel(
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
                     if (is_rg) {
-                        try stdout.print("• Search {s}\n", .{cmd});
+                        toolOutput("• Search {s}", .{cmd});
                     } else {
-                        try stdout.print("• Ran {s}\n", .{cmd});
+                        toolOutput("• Ran {s}", .{cmd});
                     }
 
                 } else {
-                    try stdout.print("• Ran {s}\n", .{tc.tool});
+                    toolOutput("• Ran {s}", .{tc.tool});
                 }
             } else if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |path| {
                 defer arena_alloc.free(path);
                 if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
                     if (try tools.parseReadParamsFromArgs(arena_alloc, tc.args)) |params| {
                         if (params.offset) |off| {
-                            try stdout.print("• {s} {s} [{d}:{d}]\n", .{ tc.tool, path, off, params.limit orelse 0 });
+                            toolOutput("• {s} {s} [{d}:{d}]", .{ tc.tool, path, off, params.limit orelse 0 });
                         } else {
-                            try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                            toolOutput("• {s} {s}", .{ tc.tool, path });
                         }
                     } else {
-                        try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                        toolOutput("• {s} {s}", .{ tc.tool, path });
                     }
                 } else {
-                    try stdout.print("• {s} {s}\n", .{ tc.tool, path });
+                    toolOutput("• {s} {s}", .{ tc.tool, path });
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 // Extract and show the text content
                 const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
-                try stdout.print("{s}⛬{s} {s}\n", .{ display.C_CYAN, display.C_RESET, text });
+                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, text });
             } else {
-                try stdout.print("• {s}\n", .{tc.tool});
+                toolOutput("• {s}", .{tc.tool});
             }
 
             if (std.mem.eql(u8, tc.tool, "respond_text")) {

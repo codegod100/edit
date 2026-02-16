@@ -227,6 +227,14 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try state.context_window.append(allocator, .user, line, .{});
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
+        // Set up tool output callback to add to timeline
+        model_loop.setToolOutputCallback(struct {
+            fn callback(text: []const u8) void {
+                display.addTimelineEntry("{s}", .{text});
+            }
+        }.callback);
+        defer model_loop.setToolOutputCallback(null);
+
         // Arena for per-turn allocations (context prompt, model result, etc.)
         var turn_arena = std.heap.ArenaAllocator.init(allocator);
         defer turn_arena.deinit();

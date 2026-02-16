@@ -12,6 +12,8 @@ pub const executeInlineToolCalls = main.executeInlineToolCalls;
 pub const callModelDirect = main.callModelDirect;
 pub const toolDefsToLlm = main.toolDefsToLlm;
 pub const isCancelled = main.isCancelled;
+pub const setToolOutputCallback = main.setToolOutputCallback;
+pub const ToolOutputCallback = main.ToolOutputCallback;
 
 // Re-export types
 pub const SubagentThreadArgs = main.SubagentThreadArgs;
