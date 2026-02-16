@@ -38,8 +38,9 @@ pub fn deinitToolOutputArena() void {
 
 pub fn toolOutput(comptime fmt: []const u8, args: anytype) void {
     if (g_tool_output_callback) |callback| {
-        var buf: [1024]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        var buf: [4096]u8 = undefined;
+        // Use fmt ++ "\n" to ensure a newline is always present
+        const text = std.fmt.bufPrint(&buf, fmt ++ "\n", args) catch return;
         // Use arena to allocate persistent copy
         if (g_tool_output_arena) |*arena| {
             const copy = arena.allocator().alloc(u8, text.len) catch return;
@@ -128,6 +129,8 @@ pub fn runModel(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
+    try logger.transcriptWrite("\n>>> User: {s}\n", .{user_input});
+
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
 
@@ -140,7 +143,7 @@ pub fn runModel(
 
     const system_prompt = custom_system_prompt orelse "You are a highly capable software engineering assistant. Your goal is to help the user with their task efficiently and accurately.\n\n" ++
         "1. **Analyze First**: Before making changes, use `grep` and `read_file` to understand the existing codebase, architectural patterns, and naming conventions. Mimic the style and structure of the project.\n" ++
-        "2. **Plan Your Work**: For multi-step tasks, you MUST use `todo_add` to create a detailed plan. Update your progress with `todo_update` as you complete each step. Break down complex tasks into smaller, manageable chunks.\n" ++
+        "2. **Plan Your Work**: For multi-step tasks, you MUST use `todo_add` to create a detailed plan. Update your progress with `todo_update` as you complete each step. Use `set_status` to provide high-level updates on what you are doing (e.g., 'figuring out why build failed').\n" ++
         "3. **Be Precise**: When editing files, provide exact matches for `find` or `oldString`. Avoid introducing redundant or messy code. If you notice a pattern (like provider IDs), follow it strictly.\n" ++
         "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
         "5. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
@@ -219,6 +222,9 @@ pub fn runModel(
         }
 
         // Response is arena-allocated, no need to deinit individual fields
+        if (response.reasoning.len > 0) {
+            try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{response.reasoning});
+        }
 
         try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
 
@@ -238,6 +244,7 @@ pub fn runModel(
         if (response.tool_calls.len == 0) {
             const trimmed_text = std.mem.trim(u8, response.text, " \t\r\n");
             if (trimmed_text.len > 0) {
+                try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{response.text});
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response.text });
                 return .{
                     .response = try allocator.dupe(u8, response.text),
@@ -340,6 +347,8 @@ pub fn runModel(
 
             tool_calls += 1;
 
+            try logger.transcriptWrite("\n[Tool Call] {s}({s})\n", .{ tc.tool, tc.args });
+
             if (std.mem.eql(u8, tc.tool, "subagent_spawn")) {
                 const msg = "{\"error\":\"Subagent support has been removed\"}";
                 try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
@@ -352,12 +361,11 @@ pub fn runModel(
                     defer allocator.free(cmd);
                     const c = std.mem.trim(u8, cmd, " \t\r\n");
                     const is_rg = std.mem.eql(u8, c, "rg") or std.mem.startsWith(u8, c, "rg ");
+                    const display_cmd = if (cmd.len > 60) cmd[0..60] else cmd;
                     if (is_rg) {
-                        const display_cmd = if (cmd.len > 80) cmd[cmd.len - 80 ..] else cmd;
                         display.setSpinnerStateWithText(.search, display_cmd);
                         toolOutput("• Search {s}", .{cmd});
                     } else {
-                        const display_cmd = if (cmd.len > 80) cmd[cmd.len - 80 ..] else cmd;
                         display.setSpinnerStateWithText(.bash, display_cmd);
                         toolOutput("• Ran {s}", .{cmd});
                     }
@@ -368,8 +376,7 @@ pub fn runModel(
             } else if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |path| {
                 defer arena_alloc.free(path);
                 if (std.mem.eql(u8, tc.tool, "read") or std.mem.eql(u8, tc.tool, "read_file")) {
-                    const display_path = if (path.len > 80) path[path.len - 80 ..] else path;
-                    display.setSpinnerStateWithText(.reading, display_path);
+                    display.setSpinnerState(.reading);
                     if (try tools.parseReadParamsFromArgs(arena_alloc, tc.args)) |params| {
                         if (params.offset) |off| {
                             toolOutput("• {s} {s} [{d}:{d}]", .{ tc.tool, path, off, params.limit orelse 0 });
@@ -380,8 +387,7 @@ pub fn runModel(
                         toolOutput("• {s} {s}", .{ tc.tool, path });
                     }
                 } else {
-                    const display_path = if (path.len > 80) path[path.len - 80 ..] else path;
-                    display.setSpinnerStateWithText(.writing, display_path);
+                    display.setSpinnerState(.writing);
                     toolOutput("• {s} {s}", .{ tc.tool, path });
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
@@ -391,7 +397,7 @@ pub fn runModel(
                 const unescaped = unescapeJsonString(&unescape_buf, text);
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, unescaped });
             } else {
-                display.setSpinnerStateWithText(.tool, tc.tool);
+                display.setSpinnerState(.tool);
                 toolOutput("• {s}", .{tc.tool});
             }
 
@@ -434,6 +440,7 @@ pub fn runModel(
             }
 
             const clean_result = try display.stripAnsi(arena_alloc, result);
+            try logger.transcriptWrite("[Result]\n{s}\n", .{clean_result});
             try turn_results.append(arena_alloc, clean_result);
             arena_alloc.free(result);
 
