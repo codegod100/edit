@@ -201,13 +201,24 @@ pub fn runModel(
                 if (total_todos > 0) {
                     if (completed < total_todos) {
                         extended = true;
-                        reason = "Task incomplete. Auto-extending to allow completion.";
-                        try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                        try w.writer(arena_alloc).print(
-                            "{f}",
-                            .{std.json.fmt("Step limit extended. You have pending todos. Please proceed with the next task.", .{})},
-                        );
-                        try w.appendSlice(arena_alloc, "}");
+                        const remaining = total_todos - completed;
+                        if (remaining == 1) {
+                            reason = "Almost done (1 item left). Extending for final push.";
+                            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                            try w.writer(arena_alloc).print(
+                                "{f}",
+                                .{std.json.fmt("Step limit extended. You are on the last item of your plan! Finish strong.", .{})},
+                            );
+                            try w.appendSlice(arena_alloc, "}");
+                        } else {
+                            reason = "Task incomplete. Auto-extending to allow completion.";
+                            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                            try w.writer(arena_alloc).print(
+                                "{f}",
+                                .{std.json.fmt("Step limit extended. You have pending todos. Please proceed with the next task.", .{})},
+                            );
+                            try w.appendSlice(arena_alloc, "}");
+                        }
                     } else {
                         // All done but no respond_text yet
                         extended = true;
