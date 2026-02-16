@@ -215,43 +215,19 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Get terminal dimensions
         const term_width = display.terminalColumns();
         const term_height = display.getTerminalHeight();
-        const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
-        // 1. Vertical spacing before box
-        try stdout.writeAll("\n");
-
-        // 2. Pre-render the entire box
-        // Total outer width will be box_width + 2
-        // Top
-        try stdout.print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
-        var bw: usize = 0;
-        while (bw < box_width) : (bw += 1) try stdout.writeAll("\xe2\x94\x80"); // ─
-        try stdout.print("\xe2\x95\xae{s}\n", .{display.C_RESET}); // ╮
-        
-        // Middle (Empty)
-        try stdout.print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET });
-        bw = 0;
-        // box_width total inner - 3 for " > "
-        while (bw < box_width - 3) : (bw += 1) try stdout.writeAll(" ");
-        try stdout.print("{s}\xe2\x94\x82{s}\n", .{ display.C_CYAN, display.C_RESET }); // │
-        
-        // Bottom
-        try stdout.print("{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
-        bw = 0;
-        while (bw < box_width) : (bw += 1) try stdout.writeAll("\xe2\x94\x80"); // ─
-        try stdout.print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
-
-        // 3. Move cursor UP 2 lines and forward 5 chars to get into the "│ > " position
-        try stdout.writeAll("\x1b[2A\x1b[5G");
-
-        // Read Line (passing empty prompt because we already printed it)
+        // Read Line (it will draw its own box)
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
             if (line_opt) |line| {
-                try stdout.writeAll(line);
+                // To maintain UI consistency, draw a static box for queued lines
+                const display_lines = [_][]const u8{ line };
+                const box = try display.renderBox(allocator, "", &display_lines, 80);
+                defer allocator.free(box);
+                try stdout.writeAll(box);
             }
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);

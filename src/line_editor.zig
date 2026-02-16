@@ -36,105 +36,6 @@ pub fn stdOutFile() std.fs.File {
     @compileError("No supported stdout API in this Zig version");
 }
 
-pub fn applyEditKey(
-    allocator: std.mem.Allocator,
-    current: []const u8,
-    key: EditKey,
-    character: u8,
-    autocompleteCommandFn: *const fn ([]const u8) []const u8,
-) ![]u8 {
-    return switch (key) {
-        .tab => allocator.dupe(u8, autocompleteCommandFn(current)),
-        .backspace => {
-            if (current.len == 0) return allocator.dupe(u8, current);
-            return allocator.dupe(u8, current[0 .. current.len - 1]);
-        },
-        .character => {
-            if (character < 32 or character == 127) return allocator.dupe(u8, current);
-            var out = try allocator.alloc(u8, current.len + 1);
-            @memcpy(out[0..current.len], current);
-            out[current.len] = character;
-            return out;
-        },
-        .enter => allocator.dupe(u8, current),
-        else => allocator.dupe(u8, current),
-    };
-}
-
-pub fn applyEditKeyAtCursor(
-    allocator: std.mem.Allocator,
-    current: []const u8,
-    key: EditKey,
-    character: u8,
-    cursor_pos: usize,
-    autocompleteCommandFn: *const fn ([]const u8) []const u8,
-) !mentions.LineEditResult {
-    const pos = @min(cursor_pos, current.len);
-
-    return switch (key) {
-        .tab => {
-            if (try mentions.autocompleteMentionAtCursor(allocator, current, pos)) |completed| {
-                return completed;
-            }
-            const text = try allocator.dupe(u8, autocompleteCommandFn(current));
-            return .{ .text = text, .cursor_pos = text.len };
-        },
-        .backspace => {
-            if (pos == 0) {
-                const text = try allocator.dupe(u8, current);
-                return .{ .text = text, .cursor_pos = 0 };
-            }
-            const new_len = current.len - 1;
-            const text = try allocator.alloc(u8, new_len);
-            @memcpy(text[0 .. pos - 1], current[0 .. pos - 1]);
-            @memcpy(text[pos - 1 ..], current[pos..]);
-            return .{ .text = text, .cursor_pos = pos - 1 };
-        },
-        .delete => {
-            if (pos >= current.len) {
-                const text = try allocator.dupe(u8, current);
-                return .{ .text = text, .cursor_pos = pos };
-            }
-            const new_len = current.len - 1;
-            const text = try allocator.alloc(u8, new_len);
-            @memcpy(text[0..pos], current[0..pos]);
-            @memcpy(text[pos..], current[pos + 1 ..]);
-            return .{ .text = text, .cursor_pos = pos };
-        },
-        .character => {
-            if (character < 32 or character == 127) {
-                const text = try allocator.dupe(u8, current);
-                return .{ .text = text, .cursor_pos = pos };
-            }
-            const text = try allocator.alloc(u8, current.len + 1);
-            @memcpy(text[0..pos], current[0..pos]);
-            text[pos] = character;
-            @memcpy(text[pos + 1 ..], current[pos..]);
-            return .{ .text = text, .cursor_pos = pos + 1 };
-        },
-        .left => {
-            const text = try allocator.dupe(u8, current);
-            return .{ .text = text, .cursor_pos = if (pos > 0) pos - 1 else 0 };
-        },
-        .right => {
-            const text = try allocator.dupe(u8, current);
-            return .{ .text = text, .cursor_pos = if (pos < current.len) pos + 1 else current.len };
-        },
-        .home => {
-            const text = try allocator.dupe(u8, current);
-            return .{ .text = text, .cursor_pos = 0 };
-        },
-        .end => {
-            const text = try allocator.dupe(u8, current);
-            return .{ .text = text, .cursor_pos = current.len };
-        },
-        .enter => {
-            const text = try allocator.dupe(u8, current);
-            return .{ .text = text, .cursor_pos = pos };
-        },
-    };
-}
-
 pub fn readPromptLine(
     allocator: std.mem.Allocator,
     stdin_file: std.fs.File,
@@ -143,19 +44,18 @@ pub fn readPromptLine(
     prompt: []const u8,
     history: *context.CommandHistory,
 ) !?[]u8 {
+    _ = prompt;
 
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
-        try stdout.writeAll(prompt);
+        try stdout.writeAll("> ");
         const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) orelse return null;
-        // Print the line so it appears in the pre-rendered box
-        try stdout.writeAll(line);
         return line;
     };
 
     var raw = original;
     raw.lflag.ICANON = false;
     raw.lflag.ECHO = false;
-    raw.lflag.ISIG = false;
+    raw.lflag.ISIG = true; // Keep ISIG for Ctrl+C
     if (builtin.os.tag == .linux) {
         raw.cc[6] = 1;
         raw.cc[5] = 0;
@@ -164,12 +64,15 @@ pub fn readPromptLine(
         raw.cc[17] = 0;
     }
     std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
-        // If terminal setup fails (e.g., Ctrl+C pressed), fall back to simple mode
         std.log.debug("Failed to set raw mode: {any}", .{err});
+        try stdout.writeAll("> ");
         return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
     };
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
+    const display = @import("display.zig");
+    try stdout.writeAll(display.C_CYAN ++ "> " ++ display.C_RESET);
+    
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -180,98 +83,63 @@ pub fn readPromptLine(
     var buf: [1]u8 = undefined;
     
     // History navigation state
-    var history_index: ?usize = null; // null means not navigating history (editing current)
-    var saved_line: []u8 = &.{}; // Line being edited before history navigation
+    var history_index: ?usize = null;
+    var saved_line: []u8 = &.{};
 
     while (true) {
         const n = try stdin_file.read(&buf);
-        if (n == 0) {
-            if (line.len == 0) return null;
-            return try allocator.dupe(u8, line);
-        }
+        if (n == 0) break;
 
         const ch = buf[0];
 
         // Escape sequence (arrow keys, etc.)
         if (ch == 27) {
-            // Check for escape sequence [X
             var seq_buf: [2]u8 = undefined;
             const seq_n = stdin_file.read(&seq_buf) catch 0;
             if (seq_n >= 2 and seq_buf[0] == '[') {
                 switch (seq_buf[1]) {
-                    'D' => { // Left arrow
+                    'D' => { // Left
                         if (cursor_pos > 0) {
                             cursor_pos -= 1;
                             try stdout.writeAll("\x1b[D");
                         }
                     },
-                    'C' => { // Right arrow
+                    'C' => { // Right
                         if (cursor_pos < line.len) {
                             cursor_pos += 1;
                             try stdout.writeAll("\x1b[C");
                         }
                     },
-                    'A' => { // Up arrow - previous history entry
+                    'A' => { // Up - History
                         if (history.items.items.len == 0) continue;
-                        
-                        // Save current line if starting history navigation
                         if (history_index == null) {
                             saved_line = try arena_alloc.dupe(u8, line);
                             history_index = history.items.items.len;
                         }
-                        
                         if (history_index.? > 0) {
                             history_index.? -= 1;
-                            const history_entry = history.items.items[history_index.?];
-                            
-                            // Clear current line and load history entry
-                            // Move cursor to end of current line first
-                            while (cursor_pos < line.len) {
-                                cursor_pos += 1;
-                                try stdout.writeAll("\x1b[C");
-                            }
-                            // Clear from cursor to beginning of line
-                            for (0..line.len) |_| {
-                                try stdout.writeAll("\x08 \x08");
-                            }
-                            
-                            line = try arena_alloc.dupe(u8, history_entry);
+                            const entry = history.items.items[history_index.?];
+                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
+                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+                            line = try arena_alloc.dupe(u8, entry);
                             cursor_pos = line.len;
                             try stdout.writeAll(line);
                         }
                     },
-                    'B' => { // Down arrow - next history entry
+                    'B' => { // Down - History
                         if (history_index == null) continue;
-                        
                         if (history_index.? < history.items.items.len - 1) {
                             history_index.? += 1;
-                            const history_entry = history.items.items[history_index.?];
-                            
-                            // Clear current line and load history entry
-                            while (cursor_pos < line.len) {
-                                cursor_pos += 1;
-                                try stdout.writeAll("\x1b[C");
-                            }
-                            for (0..line.len) |_| {
-                                try stdout.writeAll("\x08 \x08");
-                            }
-                            
-                            line = try arena_alloc.dupe(u8, history_entry);
+                            const entry = history.items.items[history_index.?];
+                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
+                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+                            line = try arena_alloc.dupe(u8, entry);
                             cursor_pos = line.len;
                             try stdout.writeAll(line);
                         } else {
-                            // At end of history, restore saved line
                             history_index = null;
-                            
-                            // Clear current line
-                            while (cursor_pos < line.len) {
-                                cursor_pos += 1;
-                                try stdout.writeAll("\x1b[C");
-                            }
-                            for (0..line.len) |_| {
-                                try stdout.writeAll("\x08 \x08");
-                            }
-                            
+                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
+                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
                             line = try arena_alloc.dupe(u8, saved_line);
                             cursor_pos = line.len;
                             try stdout.writeAll(line);
@@ -289,28 +157,9 @@ pub fn readPromptLine(
                             try stdout.writeAll("\x1b[C");
                         }
                     },
-                    '3' => { // Delete key (ESC [ 3 ~)
-                        var tilde_buf: [1]u8 = undefined;
-                        _ = stdin_file.read(&tilde_buf) catch {};
-                        if (cursor_pos < line.len) {
-                            const new_len = line.len - 1;
-                            const new_line = try arena_alloc.alloc(u8, new_len);
-                            @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
-                            @memcpy(new_line[cursor_pos..], line[cursor_pos + 1 ..]);
-                            // arena freed on defer
-                            line = new_line;
-                            // Redraw from cursor to end
-                            try stdout.writeAll(line[cursor_pos..]);
-                            try stdout.writeAll(" ");
-                            for (0..line.len - cursor_pos + 1) |_| {
-                                try stdout.writeAll("\x1b[D");
-                            }
-                        }
-                    },
                     else => {},
                 }
             } else {
-                // Just ESC - cancel
                 cancel.setCancelled();
                 try stdout.print("\n^C (cancelled)\n", .{});
                 return try allocator.dupe(u8, "");
@@ -318,113 +167,71 @@ pub fn readPromptLine(
             continue;
         }
 
-        if (ch == 3) { // Ctrl+C
-            return null;
-        }
+        if (ch == 3) return null; // Ctrl+C
 
-        if (ch == 1) { // Ctrl+A - beginning of line
-            while (cursor_pos > 0) {
-                cursor_pos -= 1;
-                try stdout.writeAll("\x1b[D");
-            }
-            continue;
-        }
+        if (ch == 13 or ch == 10) { // Enter
+            // Now draw the beautiful box!
+            // First, clear the current input line "> ..."
+            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
+            for (0..line.len + 2) |_| try stdout.writeAll("\x08 \x08");
+            try stdout.writeAll("\r\x1b[K"); // Extra clear
 
-        if (ch == 5) { // Ctrl+E - end of line
-            while (cursor_pos < line.len) {
-                cursor_pos += 1;
-                try stdout.writeAll("\x1b[C");
-            }
-            continue;
-        }
+            const wrapped_lines = [_][]const u8{ line };
+            const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
+            defer allocator.free(box);
+            try stdout.writeAll(box);
+            try stdout.writeAll("\n");
 
-        if (ch == 11) { // Ctrl+K - kill to end of line
-            if (cursor_pos < line.len) {
-                const display = @import("display.zig");
-                const term_width = display.terminalColumns();
-                const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
-                const input_area_width = box_width - 3;
-                
-                const remaining = input_area_width - cursor_pos;
-                var p: usize = 0;
-                while (p < remaining) : (p += 1) try stdout.writeAll(" ");
-                p = 0;
-                while (p < remaining) : (p += 1) try stdout.writeAll("\x1b[D");
-
-                line = try arena_alloc.dupe(u8, line[0..cursor_pos]);
-            }
-            continue;
-        }
-
-        if (ch == 21) { // Ctrl+U - kill whole line
-            // Move cursor to beginning of input (don't delete prompt prefix)
-            while (cursor_pos > 0) {
-                cursor_pos -= 1;
-                try stdout.writeAll("\x1b[D");
-            }
-            // Clear to the trailing border
-            // We need to calculate how many spaces to write to fill the box back up
-            const display = @import("display.zig");
-            const term_width = display.terminalColumns();
-            const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
-            const input_area_width = box_width - 3; // Total - prefix " > " - suffix "│"
-            
-            var p: usize = 0;
-            while (p < input_area_width) : (p += 1) try stdout.writeAll(" ");
-            
-            // Move back to start of input area
-            p = 0;
-            while (p < input_area_width) : (p += 1) try stdout.writeAll("\x1b[D");
-
-            line = try arena_alloc.dupe(u8, &.{});
-            cursor_pos = 0;
-            continue;
-        }
-
-        if (ch == '\n' or ch == '\r') {
-            try stdout.print("\n", .{});
             return try allocator.dupe(u8, line);
         }
 
         if (ch == 127 or ch == 8) { // Backspace
             if (cursor_pos > 0) {
-                const new_len = line.len - 1;
-                const new_line = try arena_alloc.alloc(u8, new_len);
-                @memcpy(new_line[0 .. cursor_pos - 1], line[0 .. cursor_pos - 1]);
-                @memcpy(new_line[cursor_pos - 1 ..], line[cursor_pos..]);
-                // arena freed on defer
-                line = new_line;
+                const next_line = try arena_alloc.alloc(u8, line.len - 1);
+                @memcpy(next_line[0 .. cursor_pos - 1], line[0 .. cursor_pos - 1]);
+                @memcpy(next_line[cursor_pos - 1 ..], line[cursor_pos..]);
+                line = next_line;
                 cursor_pos -= 1;
-                // Move cursor back, clear character, move back again
                 try stdout.writeAll("\x08 \x08");
-                // Redraw rest of line
                 if (cursor_pos < line.len) {
                     try stdout.writeAll(line[cursor_pos..]);
                     try stdout.writeAll(" ");
-                    for (0..line.len - cursor_pos + 1) |_| {
-                        try stdout.writeAll("\x1b[D");
-                    }
+                    for (0..line.len - cursor_pos + 1) |_| try stdout.writeAll("\x1b[D");
                 }
             }
             continue;
         }
 
-        if (ch >= 32 and ch < 127) { // Printable character
-            const new_line = try arena_alloc.alloc(u8, line.len + 1);
-            @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
-            new_line[cursor_pos] = ch;
-            @memcpy(new_line[cursor_pos + 1 ..], line[cursor_pos..]);
-            // arena freed on defer
-            line = new_line;
-            // Insert character at cursor position
+        if (ch == 21) { // Ctrl+U - kill whole line
+            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
+            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+            line = try arena_alloc.dupe(u8, &.{});
+            cursor_pos = 0;
+            continue;
+        }
+
+        if (ch == 11) { // Ctrl+K - kill to end
+            if (cursor_pos < line.len) {
+                const remaining = line.len - cursor_pos;
+                for (0..remaining) |_| try stdout.writeAll(" ");
+                for (0..remaining) |_| try stdout.writeAll("\x1b[D");
+                line = try arena_alloc.dupe(u8, line[0..cursor_pos]);
+            }
+            continue;
+        }
+
+        if (ch >= 32 and ch < 127) { // Char
+            const next_line = try arena_alloc.alloc(u8, line.len + 1);
+            @memcpy(next_line[0..cursor_pos], line[0..cursor_pos]);
+            next_line[cursor_pos] = ch;
+            @memcpy(next_line[cursor_pos + 1 ..], line[cursor_pos..]);
+            line = next_line;
             try stdout.writeAll(line[cursor_pos..]);
             cursor_pos += 1;
-            // Move cursor back to position after inserted char
-            for (0..line.len - cursor_pos) |_| {
-                try stdout.writeAll("\x1b[D");
-            }
+            for (0..line.len - cursor_pos) |_| try stdout.writeAll("\x1b[D");
         }
     }
+    return try allocator.dupe(u8, line);
 }
 
 pub fn drainQueuedLinesFromStdin(
