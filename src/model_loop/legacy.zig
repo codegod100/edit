@@ -192,6 +192,17 @@ pub fn runModel(
             turn.toolDefsToLlm(tools.definitions[0..]),
             active.reasoning_effort,
         );
+        
+        if (turn.isCancelled()) {
+            return .{
+                .response = try allocator.dupe(u8, "Operation cancelled by user."),
+                .reasoning = try allocator.dupe(u8, response.reasoning),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try utils.joinPaths(allocator, paths.items),
+            };
+        }
+
         // Response is arena-allocated, no need to deinit individual fields
 
         try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
@@ -212,6 +223,13 @@ pub fn runModel(
         if (response.tool_calls.len == 0) {
             if (response.text.len > 0) {
                 toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response.text });
+                return .{
+                    .response = try allocator.dupe(u8, response.text),
+                    .reasoning = try allocator.dupe(u8, response.reasoning),
+                    .tool_calls = tool_calls,
+                    .error_count = 0,
+                    .files_touched = try utils.joinPaths(allocator, paths.items),
+                };
             }
             no_tool_retries += 1;
             if (no_tool_retries <= 2) {

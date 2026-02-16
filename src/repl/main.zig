@@ -30,6 +30,7 @@ fn spinnerThread(stdout_file: std.fs.File) void {
     var buf: [256]u8 = undefined;
     var state_buf: [192]u8 = undefined;
     while (g_spinner_running.load(.acquire)) {
+        cancel.pollForEscape();
         const state_text = display.getSpinnerStateText(&state_buf);
         
         // Print spinner above the prompt box using relative positioning
@@ -297,6 +298,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         g_callback_prompt = prompt;
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
+                cancel.pollForEscape();
                 display.addTimelineEntry("{s}", .{text});
                 if (g_callback_stdout_file) |f| {
                     if (g_callback_prompt) |p| {
@@ -327,6 +329,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
 
         logger.info("Calling runModel for line: {s}", .{line});
+        cancel.beginProcessing();
+        cancel.enableRawMode();
+        defer cancel.disableRawMode();
+
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {

@@ -342,31 +342,19 @@ pub fn readPromptLine(
 
         if (ch == 11) { // Ctrl+K - kill to end of line
             if (cursor_pos < line.len) {
-                // Clear from cursor to end
-                for (cursor_pos..line.len) |_| {
-                    try stdout.writeAll(" \x1b[C");
-                }
-                for (cursor_pos..line.len) |_| {
-                    try stdout.writeAll("\x1b[D");
-                }
-                for (cursor_pos..line.len) |_| {
-                    try stdout.writeAll(" \x1b[D");
-                }
-                // Truncate line at cursor position
+                try stdout.writeAll("\x1b[K");
                 line = try arena_alloc.dupe(u8, line[0..cursor_pos]);
             }
             continue;
         }
 
         if (ch == 21) { // Ctrl+U - kill whole line
-            // Clear entire line
-            while (cursor_pos < line.len) {
-                cursor_pos += 1;
-                try stdout.writeAll("\x1b[C");
+            // Move cursor to beginning, clear to end
+            while (cursor_pos > 0) {
+                cursor_pos -= 1;
+                try stdout.writeAll("\x1b[D");
             }
-            for (0..line.len) |_| {
-                try stdout.writeAll("\x08 \x08");
-            }
+            try stdout.writeAll("\x1b[K");
             line = &.{};
             cursor_pos = 0;
             continue;
