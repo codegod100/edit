@@ -356,7 +356,7 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
     if (parsed.value.choices) |choices| {
         if (choices.len > 0) {
             const c = choices[0];
-
+            
             // Build result step by step with proper cleanup
             var text: []u8 = &.{};
             var reasoning: []u8 = &.{};
@@ -408,6 +408,7 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
             };
         }
     }
+
 
     if (raw.len > 0 and raw[0] != '{' and raw[0] != '[') {
         const cap = @min(raw.len, 500);

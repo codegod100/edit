@@ -210,6 +210,9 @@ pub fn runModel(
         try w.writer(arena_alloc).writeAll("]}");
 
         if (response.tool_calls.len == 0) {
+            if (response.text.len > 0) {
+                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response.text });
+            }
             no_tool_retries += 1;
             if (no_tool_retries <= 2) {
                 try w.appendSlice(
@@ -231,9 +234,11 @@ pub fn runModel(
                 continue;
             }
             const finish_reason = if (response.finish_reason.len > 0) response.finish_reason else "none";
+            const msg = "Model did not return required tool-call format. Try again or switch model/provider.";
             toolOutput("{s}Stop:{s} model failed protocol: no tool call after retries (finish_reason={s}).", .{ display.C_DIM, display.C_RESET, finish_reason });
+            toolOutput("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, msg });
             return .{
-                .response = try allocator.dupe(u8, "Model did not return required tool-call format. Try again or switch model/provider."),
+                .response = try allocator.dupe(u8, msg),
                 .reasoning = try allocator.dupe(u8, response.reasoning),
                 .tool_calls = tool_calls,
                 .error_count = 1,
@@ -469,9 +474,11 @@ pub fn runModel(
     }
 
     toolOutput("{s}Stop:{s} reached maximum step limit ({d}).", .{ display.C_DIM, display.C_RESET, max_iterations });
+    const msg = "Reached maximum iterations. Task may be incomplete.";
+    toolOutput("{s}Note:{s} {s}", .{ display.C_YELLOW, display.C_RESET, msg });
 
     return .{
-        .response = try allocator.dupe(u8, "Reached maximum iterations. Task may be incomplete."),
+        .response = try allocator.dupe(u8, msg),
         .reasoning = try allocator.dupe(u8, ""),
         .tool_calls = tool_calls,
         .error_count = 0,

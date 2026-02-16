@@ -314,8 +314,8 @@ pub fn clearScreenAndRedrawTimeline(stdout_file: std.fs.File, current_prompt: []
     const reserved_lines = prompt_lines + spinner_buffer;
     const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
 
-    // Clear the whole screen and move cursor to top-left
-    try stdout_file.writeAll("\x1b[2J\x1b[H");
+    // Move to top-left and clear everything below it (avoids scrollback pollution)
+    try stdout_file.writeAll("\x1b[H\x1b[J");
 
     // Lock timeline for reading
     g_timeline_mutex.lock();

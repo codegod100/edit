@@ -18,6 +18,7 @@ const todo = @import("../todo.zig");
 const display = @import("../display.zig");
 const cancel = @import("../cancel.zig");
 const line_editor = @import("../line_editor.zig");
+const logger = @import("../logger.zig");
 
 // Spinner state for showing processing indicator
 var g_spinner_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -38,7 +39,7 @@ fn spinnerThread(stdout_file: std.fs.File) void {
         display.g_stdout_mutex.lock();
         
         _ = stdout_file.write("\x1b[s") catch {}; // Save
-        _ = stdout_file.write("\x1b[2A\r") catch {}; // Move up 2 lines and to start
+        _ = stdout_file.write("\x1b[4A\r") catch {}; // Move up 4 lines and to start
         const spinner_str = std.fmt.bufPrint(&buf, "{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
         _ = stdout_file.write("\x1b[u") catch {}; // Restore to input line
@@ -325,14 +326,17 @@ pub fn run(allocator: std.mem.Allocator) !void {
             try startSpinner(stdout_file);
         }
 
+        logger.info("Calling runModel for line: {s}", .{line});
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {
             stopSpinner();
+            logger.err("runModel failed with error: {any}", .{err});
             display.addTimelineEntry("{s}Error:{s} {s}\n", .{ display.C_RED, display.C_RESET, @errorName(err) });
             // Error already in timeline, continue loop to redraw at end
             continue;
         };
+        logger.info("runModel completed successfully", .{});
 
         stopSpinner();
         resetCursorStyle(stdout_file);

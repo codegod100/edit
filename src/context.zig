@@ -217,9 +217,11 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
 }
 
 pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow, project_hash: u64) !void {
+    const logger = @import("logger.zig");
     const path = try contextPathAlloc(allocator, base_path, project_hash);
     defer allocator.free(path);
 
+    logger.info("Saving context to {s}...", .{path});
     const dir_path = std.fs.path.dirname(path) orelse return;
     std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -258,6 +260,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     var file = try std.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(out.items);
+    logger.info("Saved context ({d} turns, {d} bytes)", .{ window.turns.items.len, out.items.len });
 }
 
 // --- Context compaction and summarization ---
