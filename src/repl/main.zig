@@ -196,9 +196,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Ensure vertical spacing before new prompt
         try stdout.writeAll("\n");
 
-        // Get active model info for prompt
+        // Force a status bar refresh for current turn info
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
-        
+        if (active) |a| {
+            display.setStatusBarInfo(a.provider_id, a.model_id, cwd);
+        } else {
+            display.setStatusBarInfo("none", "none", cwd);
+        }
+        display.renderStatusBar(stdout_file, " ", "Thinking...");
+
         // Get terminal width/height for box and logging
         const term_width = display.terminalColumns();
         const term_height = display.getTerminalHeight();
@@ -206,17 +212,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
-        // 1. Print Model/Path Info ABOVE the box
+        // 1. Vertical spacing before box
         try stdout.writeAll("\n");
-        if (active) |a| {
-            if (state.selected_model) |m| {
-                try stdout.print(" {s}{s}{s} {s}{s}{s} @ ", .{ 
-                    display.C_ORANGE, a.provider_id, display.C_RESET,
-                    display.C_YELLOW, m.model_id, display.C_RESET 
-                });
-            }
-        }
-        try stdout.print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
 
         // 2. Pre-render the entire box
         // Top

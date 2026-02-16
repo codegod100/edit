@@ -36,6 +36,28 @@ var g_spinner_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 var g_spinner_custom_text: [128]u8 = undefined;
 var g_spinner_custom_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
+// Status bar info
+var g_status_provider: [64]u8 = undefined;
+var g_status_provider_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var g_status_model: [64]u8 = undefined;
+var g_status_model_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var g_status_path: [256]u8 = undefined;
+var g_status_path_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+pub fn setStatusBarInfo(provider_id: []const u8, model_id: []const u8, path: []const u8) void {
+    const p_len = @min(provider_id.len, g_status_provider.len);
+    @memcpy(g_status_provider[0..p_len], provider_id[0..p_len]);
+    g_status_provider_len.store(p_len, .release);
+
+    const m_len = @min(model_id.len, g_status_model.len);
+    @memcpy(g_status_model[0..m_len], model_id[0..m_len]);
+    g_status_model_len.store(m_len, .release);
+
+    const path_len = @min(path.len, g_status_path.len);
+    @memcpy(g_status_path[0..path_len], path[0..path_len]);
+    g_status_path_len.store(path_len, .release);
+}
+
 pub fn setSpinnerState(state: SpinnerState) void {
     g_spinner_state.store(@intFromEnum(state), .release);
     g_spinner_custom_len.store(0, .release);
@@ -383,30 +405,36 @@ pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
 
 pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, state_text: []const u8) void {
     const term_height = getTerminalHeight();
+    const term_width = terminalColumns();
 
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
 
     // Target the absolute last line (outside the scrolling region)
-    // \x1b[s: save cursor
-    // \x1b[<H>;1H: move to line H, col 1
-    // \x1b[K: clear line
-    // \x1b[u: restore cursor
-    
     const bg_color = "\x1b[48;5;235m"; // Dark grey background
     const fg_color = "\x1b[38;5;250m"; // Light grey foreground
+    const accent_color = "\x1b[38;5;110m"; // Soft blue for labels
     
+    const p_len = g_status_provider_len.load(.acquire);
+    const m_len = g_status_model_len.load(.acquire);
+    const path_len = g_status_path_len.load(.acquire);
+
     var buf: [1024]u8 = undefined;
-    // We print spaces to fill width, then restore.
-    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
+    const status = std.fmt.bufPrint(&buf, "\x1b[s\x1b[{d};1H{s}{s} {s} {s} {s} {s}/{s} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
         term_height,
         bg_color,
         fg_color,
         spinner_frame,
         state_text,
+        accent_color,
+        g_status_provider[0..p_len],
+        g_status_model[0..m_len],
+        fg_color,
+        g_status_path[0..path_len],
     }) catch return;
 
-    _ = stdout_file.write(status) catch {};
+    const safe_len = @min(status.len, term_width + 50); // 50 for escape codes
+    _ = stdout_file.write(status[0..safe_len]) catch {};
 }
 
 // Track if spinner is active to reserve space for it
