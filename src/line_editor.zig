@@ -337,19 +337,42 @@ pub fn readPromptLine(
 
         if (ch == 11) { // Ctrl+K - kill to end of line
             if (cursor_pos < line.len) {
-                try stdout.writeAll("\x1b[K");
+                const display = @import("display.zig");
+                const term_width = display.terminalColumns();
+                const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
+                const input_area_width = box_width - 3;
+                
+                const remaining = input_area_width - cursor_pos;
+                var p: usize = 0;
+                while (p < remaining) : (p += 1) try stdout.writeAll(" ");
+                p = 0;
+                while (p < remaining) : (p += 1) try stdout.writeAll("\x1b[D");
+
                 line = try arena_alloc.dupe(u8, line[0..cursor_pos]);
             }
             continue;
         }
 
         if (ch == 21) { // Ctrl+U - kill whole line
-            // Move cursor to beginning, clear to end
+            // Move cursor to beginning of input (don't delete prompt prefix)
             while (cursor_pos > 0) {
                 cursor_pos -= 1;
                 try stdout.writeAll("\x1b[D");
             }
-            try stdout.writeAll("\x1b[K");
+            // Clear to the trailing border
+            // We need to calculate how many spaces to write to fill the box back up
+            const display = @import("display.zig");
+            const term_width = display.terminalColumns();
+            const box_width = if (term_width > 80) 80 else if (term_width > 4) term_width - 2 else 78;
+            const input_area_width = box_width - 3; // Total - prefix " > " - suffix "│"
+            
+            var p: usize = 0;
+            while (p < input_area_width) : (p += 1) try stdout.writeAll(" ");
+            
+            // Move back to start of input area
+            p = 0;
+            while (p < input_area_width) : (p += 1) try stdout.writeAll("\x1b[D");
+
             line = try arena_alloc.dupe(u8, &.{});
             cursor_pos = 0;
             continue;
