@@ -218,10 +218,19 @@ pub fn run(allocator: std.mem.Allocator) !void {
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
+        // Print the prompt prefix
+        try stdout.writeAll(display.C_CYAN ++ "> " ++ display.C_RESET);
+
         // Read Line
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
+            if (line_opt) |line| {
+                try stdout.writeAll(line);
+                try stdout.writeAll("\n");
+                // Clear the temporary scripted line so the boxed version can take its place
+                try stdout.writeAll("\r\x1b[K\x1b[A\r\x1b[K"); 
+            }
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
         }
@@ -233,14 +242,18 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const line = line_opt.?;
         defer allocator.free(line);
 
-        if (line.len == 0) continue;
+        if (line.len == 0) {
+            // If empty line, we still need to clear the "> " prefix to stay clean
+            try stdout.writeAll("\r\x1b[K");
+            continue;
+        }
 
         // Box the input in the timeline (for both manual and scripted runs)
         const wrapped_lines = [_][]const u8{ line };
         const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
         defer allocator.free(box);
         
-        display.addTimelineEntry("{s}\n", .{box});
+        display.addTimelineEntry("{s}", .{box});
 
         // History
         try history.append(allocator, line);

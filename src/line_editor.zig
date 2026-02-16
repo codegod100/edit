@@ -47,7 +47,6 @@ pub fn readPromptLine(
     _ = prompt;
 
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
-        try stdout.writeAll("> ");
         const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) orelse return null;
         return line;
     };
@@ -65,14 +64,10 @@ pub fn readPromptLine(
     }
     std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
         std.log.debug("Failed to set raw mode: {any}", .{err});
-        try stdout.writeAll("> ");
         return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
     };
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
-    const display = @import("display.zig");
-    try stdout.writeAll(display.C_CYAN ++ "> " ++ display.C_RESET);
-    
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
