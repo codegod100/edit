@@ -277,10 +277,9 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
         }
     }
     
-    // If we have room left, add a blank line separator
-    if (lines_remaining > 0) {
+    // Fill remaining space to push prompt to bottom
+    while (lines_remaining > 0) : (lines_remaining -= 1) {
         try stdout.writeAll("\n");
-        lines_remaining -= 1;
     }
     
     // Draw prompt box at bottom
