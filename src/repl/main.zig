@@ -141,22 +141,33 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
-        // Prompt with box around ">" and system info below
+        // Prompt with horizontal box style
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         
-        // Box around ">"
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x8c\xe2\x94\x80>\n"); // ┌─>
+        // Top border: ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+        try prompt_buf.appendSlice(allocator, "\xe2\x95\xad"); // ╭
+        for (0..100) |_| {
+            try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
+        }
+        try prompt_buf.appendSlice(allocator, "\xe2\x95\xae\n"); // ╮
         
-        // System info below
+        // Middle line with ">": │ >                                                                                          │
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >                                                                                                    \xe2\x94\x82\n"); // │ ... │
+        
+        // Bottom border: ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+        try prompt_buf.appendSlice(allocator, "\xe2\x95\xb0"); // ╰
+        for (0..100) |_| {
+            try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
+        }
+        try prompt_buf.appendSlice(allocator, "\xe2\x95\xaf\n"); // ╯
+        
+        // System info line below box
         if (active) |a| {
             if (state.selected_model) |m| {
-                try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}/{s}\n", .{ a.provider_id, m.model_id });
-            } else {
-                try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}\n", .{a.provider_id});
+                try prompt_buf.writer(allocator).print(" {s}/{s} @ ", .{ a.provider_id, m.model_id });
             }
         }
-        try prompt_buf.writer(allocator).print("\xe2\x94\x82 {s}\n", .{cwd});
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x94\xe2\x94\x80 "); // └─ 
+        try prompt_buf.writer(allocator).print("{s}\n", .{std.fs.path.basename(cwd)});
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
