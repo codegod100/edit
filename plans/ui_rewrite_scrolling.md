@@ -35,6 +35,68 @@ Use the ANSI `DECSTBM` escape sequence (`\x1b[1;<height-1>r`) to define a scroll
 
     - [x] Removed absolute cursor positioning hacks. Prompt scrolls normally.
 
+
+
+## Post-Mortem & Corrections (The "What we fucked up")
+
+
+
+### The Issues
+
+1.  **Input Outside the Box**: We print the whole box, then the line editor starts. This puts the user's typing *below* the box rather than *inside* it.
+
+2.  **Missing Newlines**: Assistant output doesn't force a newline before the next box, causing "Just let me know what you need!╭───" mashed-together lines.
+
+3.  **Layout Redundancy**: The `cwd` and model info are below the box, making it feel disjointed.
+
+4.  **Cursor Jump**: Without relative positioning, the line editor can't "find" the input line inside the previously printed box.
+
+
+
+### The Fix (Phase 2)
+
+
+
+- [x] **Vertical Spacing**: Ensure every assistant response or tool result ends with an explicit double newline before the next prompt starts.
+
+
+
+- [x] **Containerized Input**: 
+
+
+
+    - [x] Print the TOP and MIDDLE (with `│ > `) parts of the box.
+
+
+
+    - [x] Start the line editor *right there*.
+
+
+
+    - [x] Print the BOTTOM of the box *after* the user hits Enter.
+
+
+
+- [x] **Refined Status Bar**: Ensure the status bar doesn't flicker or overwrite the bottom line of the scrolling region.
+
+
+
+- [x] **Transcript Logic**: Ensure the transcript records the full conversation flow.
+
+
+
+## Corrected Verification Steps
+
+- [ ] Type `hello`: Input appears exactly after `│ > `.
+
+- [ ] Long assistant response: Box starts on a clean new line.
+
+- [ ] Scroll back: Boxes look like distinct "bubbles" in the history.
+
+- [ ] Status bar: Stays solid blue/grey at the very bottom.
+
+
+
 ### 3. Verification
 -   Test with long outputs (e.g., `ls -R /`) to ensure the status bar doesn't move.
 -   Verify that manual scrolling (mouse wheel/PgUp) reveals the entire history without missing lines.

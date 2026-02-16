@@ -193,6 +193,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
     while (true) {
         cancel.resetCancelled();
 
+        // Ensure vertical spacing before new prompt
+        try stdout.writeAll("\n");
+
         // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
@@ -200,57 +203,35 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const term_width = display.terminalColumns();
         const box_width = if (term_width > 4) term_width - 2 else 78;
         
-        // Prompt with horizontal box style - fit to screen
-        var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
-        
-        // Top border: ╭────────────────────╮ (colored cyan)
-        try prompt_buf.writer(allocator).print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
-        var bw: usize = 0;
-        while (bw < box_width) : (bw += 1) {
-            try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
-        }
-        try prompt_buf.writer(allocator).print("\xe2\x95\xae{s}\n", .{display.C_RESET}); // ╮
-        
-        // Middle line with ">": │ >  ... │ (colored borders, extra space after >)
-        // Inner width = box_width. Content: " > " (3 chars) + spaces (box_width - 4) + " " (1 char) = box_width
-        try prompt_buf.writer(allocator).print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET }); // │ + space + > + space
-        bw = 0;
-        while (bw < box_width - 4) : (bw += 1) { // Fill with box_width - 4 spaces
-            try prompt_buf.appendSlice(allocator, " ");
-        }
-        try prompt_buf.writer(allocator).print(" {s}\xe2\x94\x82{s}\n", .{ display.C_CYAN, display.C_RESET }); // space + │
-        
-        // Bottom border: ╰────────────────────╯ (colored cyan)
-        try prompt_buf.writer(allocator).print("{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
-        bw = 0;
-        while (bw < box_width) : (bw += 1) {
-            try prompt_buf.appendSlice(allocator, "\xe2\x94\x80"); // ─
-        }
-        try prompt_buf.writer(allocator).print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
-        
-        // System info line below box - show model and path with colors
+        // 1. Print Model/Path Info ABOVE the box
+        try stdout.writeAll("\n");
         if (active) |a| {
             if (state.selected_model) |m| {
-                try prompt_buf.writer(allocator).print(" {s}{s}{s} {s}{s}{s} @ ", .{ 
+                try stdout.print(" {s}{s}{s} {s}{s}{s} @ ", .{ 
                     display.C_ORANGE, a.provider_id, display.C_RESET,
                     display.C_YELLOW, m.model_id, display.C_RESET 
                 });
             }
         }
-        try prompt_buf.writer(allocator).print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
-        try prompt_buf.writer(allocator).print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
-        const prompt = try prompt_buf.toOwnedSlice(allocator);
-        defer allocator.free(prompt);
+        try stdout.print("{s}{s}{s}\n", .{ display.C_GREEN, cwd, display.C_RESET });
 
-        // Print the prompt box (will scroll naturally)
-        try stdout.writeAll(prompt);
+        // 2. Print Top Border: ╭────────────────────╮ (colored cyan)
+        try stdout.print("{s}\xe2\x95\xad", .{display.C_CYAN}); // ╭
+        var bw: usize = 0;
+        while (bw < box_width) : (bw += 1) {
+            try stdout.writeAll("\xe2\x94\x80"); // ─
+        }
+        try stdout.print("\xe2\x95\xae{s}\n", .{display.C_RESET}); // ╮
+        
+        // 3. Print Middle Line Prefix: │ > 
+        try stdout.print("{s}\xe2\x94\x82{s} > ", .{ display.C_CYAN, display.C_RESET });
 
-        // Read Line
+        // Read Line (passing empty prompt because we already printed the prefix)
         var line_opt: ?[]u8 = null;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
         } else {
-            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, prompt, &history);
+            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
         }
 
         if (line_opt == null) {
@@ -259,6 +240,15 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
         const line = line_opt.?;
         defer allocator.free(line);
+
+        // 4. Print Bottom Border: ╰────────────────────╯ (colored cyan)
+        // We need to move to column 1 first if the line editor ended elsewhere
+        try stdout.print("\r{s}\xe2\x95\xb0", .{display.C_CYAN}); // ╰
+        bw = 0;
+        while (bw < box_width) : (bw += 1) {
+            try stdout.writeAll("\xe2\x94\x80"); // ─
+        }
+        try stdout.print("\xe2\x95\xaf{s}\n", .{display.C_RESET}); // ╯
 
         if (line.len == 0) continue;
 
