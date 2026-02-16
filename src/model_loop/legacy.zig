@@ -174,17 +174,56 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    var max_iterations: usize = 12;
+    var max_iterations: usize = 25;
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
-        // ADAPTIVE STEP LIMIT: If we are near the end but have a high completion rate, grant extra steps
-        if (iter == max_iterations - 2) {
+        // ADAPTIVE STEP LIMIT: If we are near the end, check if we should extend
+        if (iter == max_iterations - 1) {
             const completed = todo_list.completedCount();
             const total_todos = todo_list.totalCount();
-            if (total_todos > 0 and (@as(f32, @floatFromInt(completed)) / @as(f32, @floatFromInt(total_todos)) >= 0.75)) {
-                max_iterations += 5;
-                toolOutput("{s}Note:{s} task near completion ({d}/{d}); granting 5 extra steps for final push.", .{ display.C_DIM, display.C_RESET, completed, total_todos });
+            
+            var extended = false;
+            var reason: []const u8 = "";
+
+            if (max_iterations < 50) {
+                if (total_todos > 0) {
+                    if (completed < total_todos) {
+                        extended = true;
+                        reason = "Task incomplete. Auto-extending to allow completion.";
+                        try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                        try w.writer(arena_alloc).print(
+                            "{f}",
+                            .{std.json.fmt("Step limit extended. You have pending todos. Please proceed with the next task.", .{})},
+                        );
+                        try w.appendSlice(arena_alloc, "}");
+                    } else {
+                        // All done but no respond_text yet
+                        extended = true;
+                        reason = "All todos completed but no finish. Extending to allow wrap-up.";
+                        try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                        try w.writer(arena_alloc).print(
+                            "{f}",
+                            .{std.json.fmt("Step limit extended. You have marked all todos as done. Please provide your final summary via respond_text.", .{})},
+                        );
+                        try w.appendSlice(arena_alloc, "}");
+                    }
+                } else {
+                    // No plan yet, running long
+                    extended = true;
+                    reason = "Running long without a plan. Extending.";
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                    try w.writer(arena_alloc).print(
+                        "{f}",
+                        .{std.json.fmt("Step limit extended. You have been running for a while. Please create a plan using todo_add or finish the task.", .{})},
+                    );
+                    try w.appendSlice(arena_alloc, "}");
+                }
+            }
+
+            if (extended) {
+                max_iterations += 10;
+                toolOutput("{s}Note:{s} {s} (Limit: {d})", .{ display.C_YELLOW, display.C_RESET, reason, max_iterations });
             }
         }
 
