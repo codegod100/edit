@@ -167,7 +167,8 @@ pub fn readPromptLine(
     try stdout.print("{s}", .{prompt});
 
     var line = try allocator.alloc(u8, 0);
-    defer allocator.free(line);
+    // Note: line is reallocated during editing, so no defer free here
+    var cursor_pos: usize = 0;
     var buf: [1]u8 = undefined;
 
     while (true) {
@@ -179,13 +180,73 @@ pub fn readPromptLine(
 
         const ch = buf[0];
 
+        // Escape sequence (arrow keys, etc.)
         if (ch == 27) {
-            cancel.setCancelled();
-            try stdout.print("\n^C (cancelled)\n", .{});
-            return try allocator.dupe(u8, "");
+            // Check for escape sequence [X
+            var seq_buf: [2]u8 = undefined;
+            const seq_n = stdin_file.read(&seq_buf) catch 0;
+            if (seq_n >= 2 and seq_buf[0] == '[') {
+                switch (seq_buf[1]) {
+                    'D' => { // Left arrow
+                        if (cursor_pos > 0) {
+                            cursor_pos -= 1;
+                            try stdout.writeAll("\x1b[D");
+                        }
+                    },
+                    'C' => { // Right arrow
+                        if (cursor_pos < line.len) {
+                            cursor_pos += 1;
+                            try stdout.writeAll("\x1b[C");
+                        }
+                    },
+                    'A' => { // Up arrow - history (simplified: just ignore for now)
+                        // TODO: implement history navigation
+                    },
+                    'B' => { // Down arrow - history (simplified: just ignore for now)
+                        // TODO: implement history navigation
+                    },
+                    'H' => { // Home
+                        while (cursor_pos > 0) {
+                            cursor_pos -= 1;
+                            try stdout.writeAll("\x1b[D");
+                        }
+                    },
+                    'F' => { // End
+                        while (cursor_pos < line.len) {
+                            cursor_pos += 1;
+                            try stdout.writeAll("\x1b[C");
+                        }
+                    },
+                    '3' => { // Delete key (ESC [ 3 ~)
+                        var tilde_buf: [1]u8 = undefined;
+                        _ = stdin_file.read(&tilde_buf) catch {};
+                        if (cursor_pos < line.len) {
+                            const new_len = line.len - 1;
+                            const new_line = try allocator.alloc(u8, new_len);
+                            @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
+                            @memcpy(new_line[cursor_pos..], line[cursor_pos + 1 ..]);
+                            allocator.free(line);
+                            line = new_line;
+                            // Redraw from cursor to end
+                            try stdout.writeAll(line[cursor_pos..]);
+                            try stdout.writeAll(" ");
+                            for (0..line.len - cursor_pos + 1) |_| {
+                                try stdout.writeAll("\x1b[D");
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            } else {
+                // Just ESC - cancel
+                cancel.setCancelled();
+                try stdout.print("\n^C (cancelled)\n", .{});
+                return try allocator.dupe(u8, "");
+            }
+            continue;
         }
 
-        if (ch == 3) {
+        if (ch == 3) { // Ctrl+C
             return null;
         }
 
@@ -194,18 +255,43 @@ pub fn readPromptLine(
             return try allocator.dupe(u8, line);
         }
 
-        if (ch == 127 or ch == 8) {
-            if (line.len > 0) {
-                line = try allocator.realloc(line, line.len - 1);
-                _ = try stdout.writeAll("\x08 \x08");
+        if (ch == 127 or ch == 8) { // Backspace
+            if (cursor_pos > 0) {
+                const new_len = line.len - 1;
+                const new_line = try allocator.alloc(u8, new_len);
+                @memcpy(new_line[0 .. cursor_pos - 1], line[0 .. cursor_pos - 1]);
+                @memcpy(new_line[cursor_pos - 1 ..], line[cursor_pos..]);
+                allocator.free(line);
+                line = new_line;
+                cursor_pos -= 1;
+                // Move cursor back, clear character, move back again
+                try stdout.writeAll("\x08 \x08");
+                // Redraw rest of line
+                if (cursor_pos < line.len) {
+                    try stdout.writeAll(line[cursor_pos..]);
+                    try stdout.writeAll(" ");
+                    for (0..line.len - cursor_pos + 1) |_| {
+                        try stdout.writeAll("\x1b[D");
+                    }
+                }
             }
             continue;
         }
 
-        if (ch >= 32 and ch < 127) {
-            line = try allocator.realloc(line, line.len + 1);
-            line[line.len - 1] = ch;
-            try stdout.print("{c}", .{ch});
+        if (ch >= 32 and ch < 127) { // Printable character
+            const new_line = try allocator.alloc(u8, line.len + 1);
+            @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
+            new_line[cursor_pos] = ch;
+            @memcpy(new_line[cursor_pos + 1 ..], line[cursor_pos..]);
+            allocator.free(line);
+            line = new_line;
+            // Insert character at cursor position
+            try stdout.writeAll(line[cursor_pos..]);
+            cursor_pos += 1;
+            // Move cursor back to position after inserted char
+            for (0..line.len - cursor_pos) |_| {
+                try stdout.writeAll("\x1b[D");
+            }
         }
     }
 }
