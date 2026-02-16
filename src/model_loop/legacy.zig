@@ -178,6 +178,17 @@ pub fn runModel(
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
+        // EARLY PLAN CHECK: If we are at step 5 and still have no plan, nudge the agent
+        if (iter == 5 and todo_list.totalCount() == 0) {
+            toolOutput("{s}Note:{s} No plan detected after 5 steps. Prompting creation.", .{ display.C_YELLOW, display.C_RESET });
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("You have executed 5 steps but have not created a plan (via todo_add) yet. For complex tasks, please create a todo list now to track your progress.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+
         // ADAPTIVE STEP LIMIT: If we are near the end, check if we should extend
         if (iter == max_iterations - 1) {
             const completed = todo_list.completedCount();
