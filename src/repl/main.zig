@@ -144,9 +144,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Prompt
         var prompt_buf: std.ArrayListUnmanaged(u8) = .empty;
         
-        // Get current directory name
-        const cwd_name = std.fs.path.basename(cwd);
-        
         try prompt_buf.appendSlice(allocator, "zagent");
         if (active) |a| {
             try prompt_buf.writer(allocator).print(":{s}", .{a.provider_id});
@@ -155,7 +152,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
             try prompt_buf.writer(allocator).print("/{s}", .{m.model_id});
             if (state.reasoning_effort) |e| try prompt_buf.writer(allocator).print("({s})", .{e});
         }
-        try prompt_buf.writer(allocator).print(" [{s}]> ", .{cwd_name});
+        try prompt_buf.writer(allocator).print(" [{s}]> ", .{cwd});
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 
