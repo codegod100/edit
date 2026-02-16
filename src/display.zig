@@ -286,7 +286,9 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     try stdout.print("{s}", .{current_prompt});
     
     // Position cursor: go up to middle line and to column 4 (after "│ >")
-    try stdout.writeAll("\x1b[2A"); // Move up 2 lines
+    // After printing prompt (ends with \n), cursor is at start of new line
+    // Need to go up 3 lines: from below system info -> system info -> bottom border -> middle line
+    try stdout.writeAll("\x1b[3A"); // Move up 3 lines
     try stdout.writeAll("\x1b[4G"); // Move to column 4 (after "│ >")
 }
 
