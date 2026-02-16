@@ -21,6 +21,6 @@ pub const ReplState = struct {
         self.allocator.free(self.provider_states);
         if (self.selected_model) |*s| s.deinit(self.allocator);
         if (self.reasoning_effort) |e| self.allocator.free(e);
-        // providers is usually static or owned elsewhere, check main.zig
+        provider.deinitProviderSpecs();
     }
 };

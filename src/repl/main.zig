@@ -114,7 +114,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     try std.fs.cwd().makePath(config_dir);
 
     // Load initial data
-    const provider_specs = try provider.loadProviderSpecs(provider_alloc);
+    const provider_specs = try provider.loadProviderSpecs(provider_alloc, config_dir);
     // Providers are static configuration, but we might want them in state.
     // Spec says []const ProviderSpec. We can keep it.
 

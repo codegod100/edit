@@ -15,6 +15,12 @@ pub const ProviderSpec = struct {
     display_name: []const u8,
     env_vars: []const []const u8,
     models: []const Model,
+    // Configuration fields moved here from hardcoded getProviderConfig
+    endpoint: []const u8,
+    models_endpoint: ?[]const u8 = null,
+    referer: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
 };
 
 pub const ProviderState = struct {
@@ -43,177 +49,201 @@ pub const ProviderConfig = struct {
     user_agent: ?[]const u8,
 };
 
+// Global storage for loaded specs so getProviderConfig can access them
+// In a more complex app we'd pass this around, but for now this keeps
+// compatibility with the existing pure function signature of getProviderConfig.
+var g_provider_specs: ?[]ProviderSpec = null;
+var g_specs_allocator: ?std.mem.Allocator = null;
+
+pub fn deinitProviderSpecs() void {
+    if (g_specs_allocator) |allocator| {
+        if (g_provider_specs) |specs| {
+            for (specs) |spec| {
+                allocator.free(spec.id);
+                allocator.free(spec.display_name);
+                for (spec.env_vars) |ev| allocator.free(ev);
+                allocator.free(spec.env_vars);
+                for (spec.models) |m| {
+                    allocator.free(m.id);
+                    allocator.free(m.display_name);
+                }
+                allocator.free(spec.models);
+                allocator.free(spec.endpoint);
+                if (spec.models_endpoint) |me| allocator.free(me);
+                if (spec.referer) |r| allocator.free(r);
+                if (spec.title) |t| allocator.free(t);
+                if (spec.user_agent) |ua| allocator.free(ua);
+            }
+            allocator.free(specs);
+        }
+    }
+    g_provider_specs = null;
+}
+
 // ============================================================
-// Hardcoded Provider Specs (3 providers)
+// Hardcoded Provider Specs (Fallbacks)
 // ============================================================
 
-pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
+fn loadDefaultSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
     var specs = try std.ArrayListUnmanaged(ProviderSpec).initCapacity(allocator, 5);
 
     // OpenAI
-    {
-        const id = try allocator.dupe(u8, "openai");
-        const display_name = try allocator.dupe(u8, "OpenAI");
-        const env_vars = try allocator.alloc([]const u8, 1);
-        env_vars[0] = try allocator.dupe(u8, "OPENAI_API_KEY");
-        const models = try allocator.alloc(Model, 2);
-        models[0] = .{
-            .id = try allocator.dupe(u8, "gpt-4o"),
-            .display_name = try allocator.dupe(u8, "GPT-4o"),
-        };
-        models[1] = .{
-            .id = try allocator.dupe(u8, "o3-mini"),
-            .display_name = try allocator.dupe(u8, "o3-mini"),
-        };
-        try specs.append(allocator, .{
-            .id = id,
-            .display_name = display_name,
-            .env_vars = env_vars,
-            .models = models,
-        });
-    }
-
-    // OpenCode
-    {
-        const id = try allocator.dupe(u8, "opencode");
-        const display_name = try allocator.dupe(u8, "OpenCode");
-        const env_vars = try allocator.alloc([]const u8, 1);
-        env_vars[0] = try allocator.dupe(u8, "OPENCODE_API_KEY");
-        const models = try allocator.alloc(Model, 1);
-        models[0] = .{
-            .id = try allocator.dupe(u8, "kimi-k2.5"),
-            .display_name = try allocator.dupe(u8, "Kimi K2.5"),
-        };
-        try specs.append(allocator, .{
-            .id = id,
-            .display_name = display_name,
-            .env_vars = env_vars,
-            .models = models,
-        });
-    }
+    try specs.append(allocator, .{
+        .id = try allocator.dupe(u8, "openai"),
+        .display_name = try allocator.dupe(u8, "OpenAI"),
+        .env_vars = blk: {
+            const ev = try allocator.alloc([]const u8, 1);
+            ev[0] = try allocator.dupe(u8, "OPENAI_API_KEY");
+            break :blk ev;
+        },
+        .models = blk: {
+            const m = try allocator.alloc(Model, 2);
+            m[0] = .{ .id = try allocator.dupe(u8, "gpt-4o"), .display_name = try allocator.dupe(u8, "GPT-4o") };
+            m[1] = .{ .id = try allocator.dupe(u8, "o3-mini"), .display_name = try allocator.dupe(u8, "o3-mini") };
+            break :blk m;
+        },
+        .endpoint = try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions"),
+        .models_endpoint = try allocator.dupe(u8, "https://api.openai.com/v1/models"),
+    });
 
     // OpenRouter
-    {
-        const id = try allocator.dupe(u8, "openrouter");
-        const display_name = try allocator.dupe(u8, "OpenRouter");
-        const env_vars = try allocator.alloc([]const u8, 1);
-        env_vars[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
-        const models = try allocator.alloc(Model, 6);
-        models[0] = .{
-            .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet"),
-            .display_name = try allocator.dupe(u8, "Claude 3.5 Sonnet"),
-        };
-        models[1] = .{
-            .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet"),
-            .display_name = try allocator.dupe(u8, "Claude 3.7 Sonnet"),
-        };
-        models[2] = .{
-            .id = try allocator.dupe(u8, "deepseek/deepseek-chat"),
-            .display_name = try allocator.dupe(u8, "DeepSeek V3"),
-        };
-        models[3] = .{
-            .id = try allocator.dupe(u8, "deepseek/deepseek-r1"),
-            .display_name = try allocator.dupe(u8, "DeepSeek R1"),
-        };
-        models[4] = .{
-            .id = try allocator.dupe(u8, "x-ai/grok-4.1-fast"),
-            .display_name = try allocator.dupe(u8, "Grok 4.1 Fast"),
-        };
-        models[5] = .{
-            .id = try allocator.dupe(u8, "openai/gpt-oss-120b"),
-            .display_name = try allocator.dupe(u8, "GPT-OSS 120B"),
-        };
-        try specs.append(allocator, .{
-            .id = id,
-            .display_name = display_name,
-            .env_vars = env_vars,
-            .models = models,
-        });
-    }
-
-    // GitHub Copilot
-    {
-        const id = try allocator.dupe(u8, "github-copilot");
-        const display_name = try allocator.dupe(u8, "GitHub Copilot");
-        const env_vars = try allocator.alloc([]const u8, 1);
-        env_vars[0] = try allocator.dupe(u8, "GITHUB_TOKEN");
-        const models = try allocator.alloc(Model, 2);
-        models[0] = .{
-            .id = try allocator.dupe(u8, "github-copilot/gpt-4o"),
-            .display_name = try allocator.dupe(u8, "GPT-4o"),
-        };
-        models[1] = .{
-            .id = try allocator.dupe(u8, "github-copilot/gpt-4.1"),
-            .display_name = try allocator.dupe(u8, "GPT-4.1"),
-        };
-        try specs.append(allocator, .{
-            .id = id,
-            .display_name = display_name,
-            .env_vars = env_vars,
-            .models = models,
-        });
-    }
+    try specs.append(allocator, .{
+        .id = try allocator.dupe(u8, "openrouter"),
+        .display_name = try allocator.dupe(u8, "OpenRouter"),
+        .env_vars = blk: {
+            const ev = try allocator.alloc([]const u8, 1);
+            ev[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
+            break :blk ev;
+        },
+        .models = blk: {
+            const m = try allocator.alloc(Model, 6);
+            m[0] = .{ .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet"), .display_name = try allocator.dupe(u8, "Claude 3.5 Sonnet") };
+            m[1] = .{ .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet"), .display_name = try allocator.dupe(u8, "Claude 3.7 Sonnet") };
+            m[2] = .{ .id = try allocator.dupe(u8, "deepseek/deepseek-chat"), .display_name = try allocator.dupe(u8, "DeepSeek V3") };
+            m[3] = .{ .id = try allocator.dupe(u8, "deepseek/deepseek-r1"), .display_name = try allocator.dupe(u8, "DeepSeek R1") };
+            m[4] = .{ .id = try allocator.dupe(u8, "x-ai/grok-4.1-fast"), .display_name = try allocator.dupe(u8, "Grok 4.1 Fast") };
+            m[5] = .{ .id = try allocator.dupe(u8, "openai/gpt-oss-120b"), .display_name = try allocator.dupe(u8, "GPT-OSS 120B") };
+            break :blk m;
+        },
+        .endpoint = try allocator.dupe(u8, "https://openrouter.ai/api/v1/chat/completions"),
+        .models_endpoint = try allocator.dupe(u8, "https://openrouter.ai/api/v1/models"),
+        .referer = try allocator.dupe(u8, "https://zagent.local/"),
+        .title = try allocator.dupe(u8, "zagent"),
+    });
 
     // Z.AI
-    {
-        const id = try allocator.dupe(u8, "zai");
-        const display_name = try allocator.dupe(u8, "Z.AI");
-        const env_vars = try allocator.alloc([]const u8, 1);
-        env_vars[0] = try allocator.dupe(u8, "ZAI_API_KEY");
-        const models = try allocator.alloc(Model, 1);
-        models[0] = .{
-            .id = try allocator.dupe(u8, "glm-4.7"),
-            .display_name = try allocator.dupe(u8, "GLM-4.7"),
-        };
-        try specs.append(allocator, .{
-            .id = id,
-            .display_name = display_name,
-            .env_vars = env_vars,
-            .models = models,
-        });
-    }
+    try specs.append(allocator, .{
+        .id = try allocator.dupe(u8, "zai"),
+        .display_name = try allocator.dupe(u8, "Z.AI"),
+        .env_vars = blk: {
+            const ev = try allocator.alloc([]const u8, 1);
+            ev[0] = try allocator.dupe(u8, "ZAI_API_KEY");
+            break :blk ev;
+        },
+        .models = blk: {
+            const m = try allocator.alloc(Model, 1);
+            m[0] = .{ .id = try allocator.dupe(u8, "glm-4.7"), .display_name = try allocator.dupe(u8, "GLM-4.7") };
+            break :blk m;
+        },
+        .endpoint = try allocator.dupe(u8, "https://api.z.ai/api/coding/paas/v4/chat/completions"),
+        .models_endpoint = try allocator.dupe(u8, "https://api.z.ai/api/coding/paas/v4/models"),
+        .referer = try allocator.dupe(u8, "https://z.ai/"),
+        .title = try allocator.dupe(u8, "zagent"),
+        .user_agent = try allocator.dupe(u8, "zagent/0.1"),
+    });
 
     return specs.toOwnedSlice(allocator);
 }
 
 // ============================================================
-// Provider Config (endpoints)
+// Provider Config (JSON loading)
 // ============================================================
 
-pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
-    if (std.mem.eql(u8, provider_id, "openrouter")) {
-        return .{
-            .endpoint = "https://openrouter.ai/api/v1/chat/completions",
-            .models_endpoint = "https://openrouter.ai/api/v1/models",
-            .referer = "https://zagent.local/",
-            .title = "zagent",
-            .user_agent = null,
+pub fn loadProviderSpecs(allocator: std.mem.Allocator, config_dir: []const u8) ![]ProviderSpec {
+    const settings_path = try std.fs.path.join(allocator, &.{ config_dir, "settings.json" });
+    defer allocator.free(settings_path);
+
+    const file = std.fs.openFileAbsolute(settings_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            const specs = try loadDefaultSpecs(allocator);
+            g_provider_specs = specs;
+            g_specs_allocator = allocator;
+            return specs;
+        },
+        else => return err,
+    };
+    defer file.close();
+
+    const text = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(text);
+
+    const Json = struct {
+        providers: []struct {
+            id: []const u8,
+            display_name: []const u8,
+            env_vars: []const []const u8,
+            endpoint: []const u8,
+            models_endpoint: ?[]const u8 = null,
+            referer: ?[]const u8 = null,
+            title: ?[]const u8 = null,
+            user_agent: ?[]const u8 = null,
+            models: []const struct {
+                id: []const u8,
+                display_name: []const u8,
+            },
+        },
+    };
+
+    var parsed = try std.json.parseFromSlice(Json, allocator, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var specs = try std.ArrayListUnmanaged(ProviderSpec).initCapacity(allocator, parsed.value.providers.len);
+    for (parsed.value.providers) |p| {
+        const env_vars = try allocator.alloc([]const u8, p.env_vars.len);
+        for (p.env_vars, 0..) |ev, i| env_vars[i] = try allocator.dupe(u8, ev);
+
+        const models = try allocator.alloc(Model, p.models.len);
+        for (p.models, 0..) |m, i| models[i] = .{
+            .id = try allocator.dupe(u8, m.id),
+            .display_name = try allocator.dupe(u8, m.display_name),
         };
-    } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        return .{
-            .endpoint = "https://api.githubcopilot.com/chat/completions",
-            .models_endpoint = "https://api.githubcopilot.com/models",
-            .referer = null,
-            .title = null,
-            .user_agent = "zagent/0.1",
+
+        const spec = ProviderSpec{
+            .id = try allocator.dupe(u8, p.id),
+            .display_name = try allocator.dupe(u8, p.display_name),
+            .env_vars = env_vars,
+            .models = models,
+            .endpoint = try allocator.dupe(u8, p.endpoint),
+            .models_endpoint = if (p.models_endpoint) |me| try allocator.dupe(u8, me) else null,
+            .referer = if (p.referer) |r| try allocator.dupe(u8, r) else null,
+            .title = if (p.title) |t| try allocator.dupe(u8, t) else null,
+            .user_agent = if (p.user_agent) |ua| try allocator.dupe(u8, ua) else null,
         };
-    } else if (std.mem.eql(u8, provider_id, "zai")) {
-        return .{
-            .endpoint = "https://api.z.ai/api/coding/paas/v4/chat/completions",
-            .models_endpoint = "https://api.z.ai/api/coding/paas/v4/models",
-            .referer = "https://z.ai/",
-            .title = "zagent",
-            .user_agent = "zagent/0.1",
-        };
-    } else if (std.mem.eql(u8, provider_id, "opencode")) {
-        return .{
-            .endpoint = "https://opencode.ai/zen/v1/chat/completions",
-            .models_endpoint = "https://opencode.ai/zen/v1/models",
-            .referer = "https://opencode.ai/",
-            .title = "opencode",
-            .user_agent = "opencode/0.1.0 (linux; x86_64)",
-        };
+        try specs.append(allocator, spec);
     }
+
+    const final_specs = try specs.toOwnedSlice(allocator);
+    g_provider_specs = final_specs;
+    g_specs_allocator = allocator;
+    return final_specs;
+}
+
+pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
+    if (g_provider_specs) |specs| {
+        for (specs) |spec| {
+            if (std.mem.eql(u8, spec.id, provider_id)) {
+                return .{
+                    .endpoint = spec.endpoint,
+                    .models_endpoint = spec.models_endpoint,
+                    .referer = spec.referer,
+                    .title = spec.title,
+                    .user_agent = spec.user_agent,
+                };
+            }
+        }
+    }
+    
+    // Hardcoded fallbacks if nothing loaded or found (unlikely in practice)
     return .{
         .endpoint = "https://api.openai.com/v1/chat/completions",
         .models_endpoint = "https://api.openai.com/v1/models",
