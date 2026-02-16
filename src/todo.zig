@@ -106,20 +106,55 @@ pub const TodoList = struct {
         const w = result.writer(allocator);
 
         if (self.items.items.len == 0) {
-            try w.print("No todos.\n", .{});
+            try w.print("No tasks in the todo list.\n", .{});
             return result.toOwnedSlice(allocator);
         }
 
-        try w.print("Todos ({d} total):\n", .{self.items.items.len});
+        const C_CYAN = "\x1b[36m";
+        const C_GREEN = "\x1b[32m";
+        const C_GREY = "\x1b[90m";
+        const C_YELLOW = "\x1b[33m";
+        const C_RESET = "\x1b[0m";
+        const C_DIM = "\x1b[2m";
+        const C_BOLD = "\x1b[1m";
+
+        // Borders using hex escapes for consistency (50 width)
+        const top_edge = "\xe2\x95\xad" ++ ("\xe2\x94\x80" ** 50) ++ "\xe2\x95\xae";
+        const mid_edge = "\xe2\x94\x9c" ++ ("\xe2\x94\x80" ** 50) ++ "\xe2\x94\xa4";
+        const bot_edge = "\xe2\x95\xb0" ++ ("\xe2\x94\x80" ** 50) ++ "\xe2\x95\xaf";
+        const v_line = "\xe2\x94\x82";
+
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{top_edge});
+        try w.print(C_DIM ++ "{s}" ++ C_RESET ++ "  " ++ C_BOLD ++ C_CYAN ++ "Plan & Progress" ++ C_RESET ++ " " ** 33 ++ C_DIM ++ "{s}\n" ++ C_RESET, .{ v_line, v_line });
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{mid_edge});
 
         for (self.items.items) |item| {
-            const status_icon = switch (item.status) {
-                .pending => "[ ]",
-                .in_progress => "[→]",
-                .done => "[✓]",
+            const icon = switch (item.status) {
+                .pending => C_GREY ++ "\xe2\x97\x8b" ++ C_RESET, // ○
+                .in_progress => C_YELLOW ++ "\xe2\x97\x8f" ++ C_RESET, // ●
+                .done => C_GREEN ++ "\xe2\x9c\x93" ++ C_RESET, // ✓
             };
-            try w.print("  {s} {s}: {s}\n", .{ status_icon, item.id, item.description });
+            
+            const desc_color = if (item.status == .done) C_GREY else if (item.status == .in_progress) C_BOLD else "";
+
+            const max_desc = 44;
+            const display_desc = if (item.description.len > max_desc) item.description[0..max_desc] else item.description;
+            const padding = 50 - 4 - display_desc.len;
+
+            try w.print(C_DIM ++ "{s}" ++ C_RESET ++ " {s}  {s}{s}" ++ C_RESET, .{ 
+                v_line,
+                icon, 
+                desc_color, 
+                display_desc,
+            });
+
+            var p: usize = 0;
+            while (p < padding) : (p += 1) try w.writeByte(' ');
+
+            try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{v_line});
         }
+
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{bot_edge});
 
         return result.toOwnedSlice(allocator);
     }

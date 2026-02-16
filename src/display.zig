@@ -61,11 +61,9 @@ pub fn getSpinnerStateText(buf: []u8) []const u8 {
     };
 
     if (custom_len > 0) {
-        // Format: "state: custom_text"
-        const fmt = std.fmt.bufPrint(buf, "{s}: {s}", .{ state_name, g_spinner_custom_text[0..custom_len] }) catch state_name;
-        return fmt;
+        return std.fmt.bufPrint(buf, "{s}: {s}", .{ state_name, g_spinner_custom_text[0..custom_len] }) catch state_name;
     }
-    return state_name;
+    return "Thinking...";
 }
 
 /// Get the current braille spinner frame. Call periodically to animate.
@@ -249,7 +247,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     if (total == 0) return;
 
     const trunc = total > (HEAD + TAIL);
-    const MAX_WIDTH: usize = 120;
+    const MAX_WIDTH: usize = 500;
 
     if (!trunc) {
         var printed_any = false;
@@ -266,7 +264,8 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 printed_any = true;
                 
                 if (trimmed.len > MAX_WIDTH) {
-                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, trimmed[0..MAX_WIDTH], C_RESET });
+                    const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
                 } else {
                     addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, trimmed, C_RESET });
                 }
@@ -281,7 +280,8 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
         printed_any = true;
         const line = output[r.start..r.end];
         if (line.len > MAX_WIDTH) {
-            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, line[0..MAX_WIDTH], C_RESET });
+            const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
         } else {
             addTimelineEntry("{s}{s}{s}{s}", .{ prefix, C_GREY, line, C_RESET });
         }
@@ -296,12 +296,22 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
         const r = tail[(first + t) % TAIL];
         const line = output[r.start..r.end];
         if (line.len > MAX_WIDTH) {
-            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}", .{ C_GREY, line[0..MAX_WIDTH], C_RESET, "" });
+            const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
+            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}", .{ C_GREY, line[0..safe_len], C_RESET, "" });
         } else {
             addTimelineEntry("    {s}{s}{s}", .{ C_GREY, line, C_RESET });
         }
     }
 }
+
+fn findUtf8SafeLen(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
+    var i = max;
+    // Walk back to start of UTF-8 character (not 10xxxxxx)
+    while (i > 0 and (text[i] & 0xc0) == 0x80) : (i -= 1) {}
+    return i;
+}
+
 
 pub fn describeModelQueryError(err: anyerror) []const u8 {
     return switch (err) {

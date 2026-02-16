@@ -60,7 +60,7 @@ pub fn init() void {
         var act: linux.Sigaction = .{
             .handler = .{ .handler = @as(linux.Sigaction.handler_fn, @ptrCast(&sigintHandler)) },
             .mask = std.mem.zeroes(linux.sigset_t),
-            .flags = linux.SA.RESTART,
+            .flags = 0,
         };
         var old: linux.Sigaction = undefined;
         _ = linux.sigaction(linux.SIG.INT, &act, &old);
@@ -106,7 +106,8 @@ pub fn enableRawMode() void {
         var raw = orig;
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
-        raw.lflag.ISIG = false;
+        // Keep ISIG enabled so Ctrl+C still works as a signal
+        // raw.lflag.ISIG = false; 
         // VMIN=0, VTIME=0 for non-blocking
         if (builtin.os.tag == .linux) {
             raw.cc[6] = 0; // VMIN

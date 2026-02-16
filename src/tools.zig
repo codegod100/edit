@@ -1,5 +1,6 @@
 const std = @import("std");
 const todo = @import("todo.zig");
+const display = @import("display.zig");
 
 const cancel = @import("cancel.zig");
 
@@ -126,6 +127,11 @@ pub const definitions = [_]ToolDef{
     .{ .name = "todo_list", .description = "List all todo items with their current status.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
     .{ .name = "todo_remove", .description = "Remove a todo item by ID.", .parameters_json = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Todo item ID to remove\"}},\"required\":[\"id\"],\"additionalProperties\":false}" },
     .{ .name = "todo_clear_done", .description = "Clear all completed todo items.", .parameters_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}" },
+    .{
+        .name = "set_status",
+        .description = "Updates the spinner with a high-level summary of what you are currently doing (e.g., 'Debugging build failure', 'Refactoring types'). Use this to keep the user informed of your intent.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"string\",\"description\":\"A concise, human-readable summary of the current activity\"}},\"required\":[\"status\"],\"additionalProperties\":false}",
+    },
     .{
         .name = "get_file_outline",
         .description = "Retrieves a structural outline of a source file (functions, structs, etc.) to understand its architecture without reading the full implementation.",
@@ -338,6 +344,12 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         const desc = p.value.description orelse return NamedToolError.InvalidArguments;
 
         const id = try todo_list.add(desc);
+
+        // Show the list automatically
+        const list_out = try todo_list.list(allocator);
+        defer allocator.free(list_out);
+        try display.printTruncatedCommandOutput(null, list_out);
+
         return std.fmt.allocPrint(allocator, "Added todo {s}: {s}", .{ id, desc });
     }
 
@@ -356,6 +368,21 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
 
         const success = try todo_list.update(id, status);
         if (success) {
+            // If setting to in_progress, update spinner status automatically
+            if (status == .in_progress) {
+                for (todo_list.items.items) |item| {
+                    if (std.mem.eql(u8, item.id, id)) {
+                        display.setSpinnerStateWithText(.thinking, item.description);
+                        break;
+                    }
+                }
+            }
+
+            // Show the list automatically
+            const list_out = try todo_list.list(allocator);
+            defer allocator.free(list_out);
+            try display.printTruncatedCommandOutput(null, list_out);
+
             return std.fmt.allocPrint(allocator, "Updated todo {s} to {s}", .{ id, status_str });
         } else {
             return std.fmt.allocPrint(allocator, "Todo {s} not found", .{id});
@@ -379,6 +406,15 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     if (std.mem.eql(u8, name, "todo_clear_done")) {
         todo_list.clearDone();
         return std.fmt.allocPrint(allocator, "Cleared all completed todos", .{});
+    }
+
+    if (std.mem.eql(u8, name, "set_status")) {
+        const A = struct { status: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const status = p.value.status orelse return NamedToolError.InvalidArguments;
+        display.setSpinnerStateWithText(.thinking, status);
+        return std.fmt.allocPrint(allocator, "Status updated to: {s}", .{status});
     }
 
     if (std.mem.eql(u8, name, "get_file_outline")) {

@@ -15,7 +15,13 @@ SCENARIO_PROMPT="Implement a new multiplication feature in examples/calculator/m
 
 if [[ $# -gt 0 ]]; then
   PROMPT="$*"
-  env HOME="$ZAGENT_HOME" printf '%s\n/quit\n' "$PROMPT" | "$ZAGENT_BIN"
+  env HOME="$ZAGENT_HOME" "$ZAGENT_BIN" <<EOF
+$PROMPT
+/quit
+EOF
 else
-  env HOME="$ZAGENT_HOME" printf '%s\n/quit\n' "$SCENARIO_PROMPT" | "$ZAGENT_BIN"
+  env HOME="$ZAGENT_HOME" "$ZAGENT_BIN" <<EOF
+$SCENARIO_PROMPT
+/quit
+EOF
 fi
