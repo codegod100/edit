@@ -536,9 +536,9 @@ pub fn runModel(
         }
     }
 
-    toolOutput("{s}Stop:{s} reached maximum step limit ({d}).", .{ display.C_DIM, display.C_RESET, max_iterations });
-    const msg = "Reached maximum iterations. Task may be incomplete.";
-    toolOutput("{s}Note:{s} {s}", .{ display.C_YELLOW, display.C_RESET, msg });
+    toolOutput("{s}Stop:{s} Step limit reached ({d}).", .{ display.C_RED, display.C_RESET, max_iterations });
+    const msg = "Task paused (max steps). Use 'continue' to resume or give new instructions.";
+    toolOutput("{s}»{s} {s}", .{ display.C_RED, display.C_RESET, msg });
 
     return .{
         .response = try allocator.dupe(u8, msg),
