@@ -10,15 +10,10 @@ build
 
 # Build artifacts and binaries
 *.o
-main
-test
 
 # Output files
 output.txt
 *.png
-
-# Temporary scripts
-plot_pi4.py
 
 # Misc
 *.swp
