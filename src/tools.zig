@@ -993,7 +993,7 @@ test "apply_patch rejects empty patch" {
     const allocator = std.testing.allocator;
     var todo_list2 = todo.TodoList.init(allocator);
     defer todo_list2.deinit();
-    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}", &todo_list2, null);
+    const output = try executeNamed(allocator, "apply_patch", "{\"patchText\":\"*** Begin Patch\\n*** End Patch\"}", &todo_list2);
     defer allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "empty patch") != null);
 }
@@ -1002,7 +1002,7 @@ test "path guard rejects parent traversal" {
     const allocator = std.testing.allocator;
     var todo_list3 = todo.TodoList.init(allocator);
     defer todo_list3.deinit();
-    const out = try executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3, null);
+    const out = try executeNamed(allocator, "read_file", "{\"path\":\"../outside.txt\"}", &todo_list3);
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "outside the workspace") != null);
 }

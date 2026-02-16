@@ -8,6 +8,7 @@ const display = @import("../display.zig");
 const tool_routing = @import("../tool_routing.zig");
 const todo = @import("../todo.zig");
 const cancel = @import("../cancel.zig");
+const logger = @import("../logger.zig");
 
 const turn = @import("turn.zig");
 

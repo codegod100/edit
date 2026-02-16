@@ -33,23 +33,17 @@ fn spinnerThread(stdout_file: std.fs.File) void {
         
         // Print spinner above the prompt box using relative positioning
         // We are currently at the input line (│ > ).
-        // Rows in prompt:
-        // 1: Top border
-        // 2: Input row (we are here)
-        // 3: Bottom border
-        // 4: System info
-        
-        // To get to the line ABOVE the top border, we need to move up 2 lines from the input row.
         
         // Lock stdout for atomic update
         display.g_stdout_mutex.lock();
-        defer display.g_stdout_mutex.unlock();
         
         _ = stdout_file.write("\x1b[s") catch {}; // Save
         _ = stdout_file.write("\x1b[2A\r") catch {}; // Move up 2 lines and to start
         const spinner_str = std.fmt.bufPrint(&buf, "{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
         _ = stdout_file.write("\x1b[u") catch {}; // Restore to input line
+        
+        display.g_stdout_mutex.unlock();
         
         frame_idx = (frame_idx + 1) % frames.len;
         std.Thread.sleep(80 * std.time.ns_per_ms);
