@@ -208,6 +208,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         } else {
             display.setStatusBarInfo("none", "none", cwd);
         }
+        
+        var state_buf: [128]u8 = undefined;
+        display.renderStatusBar(stdout_file, " ", display.getSpinnerStateText(&state_buf));
 
         // Get terminal dimensions
         const term_width = display.terminalColumns();
