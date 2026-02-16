@@ -129,7 +129,14 @@ pub const TodoList = struct {
             try lines.append(allocator, line);
         }
 
-        return display.renderBox(allocator, "Plan & Progress", lines.items, 60);
+        var max_width: usize = "Plan & Progress".len + 10;
+        for (self.items.items) |item| {
+            const line_len = item.description.len + 6; // icon + padding
+            if (line_len > max_width) max_width = line_len;
+        }
+        max_width = @min(max_width, 100);
+
+        return display.renderBox(allocator, "Plan & Progress", lines.items, max_width);
     }
 
     pub fn totalCount(self: *const TodoList) usize {

@@ -209,10 +209,19 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     var head_limit: usize = 5;
     var tail_limit: usize = 5;
 
-    // If the output looks like a box, give it more vertical room
-    if (std.mem.startsWith(u8, output, "╭") or std.mem.startsWith(u8, output, "\xe2\x95\xad")) {
-        head_limit = 50;
-        tail_limit = 50;
+    // If the output looks like a box, give it more vertical room.
+    // Detection is robust: check for raw box char OR ANSI-dimmed box char.
+    const is_box = blk: {
+        if (output.len < 3) break :blk false;
+        // Check first 16 bytes for any box-drawing characters
+        const check_len = @min(output.len, 16);
+        break :blk std.mem.indexOf(u8, output[0..check_len], "╭") != null or 
+                 std.mem.indexOf(u8, output[0..check_len], "\xe2\x95\xad") != null;
+    };
+
+    if (is_box) {
+        head_limit = 100;
+        tail_limit = 5; // Minimal tail for safety
     }
 
     const Range = struct { start: usize, end: usize, important: bool = false };
