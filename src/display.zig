@@ -385,6 +385,9 @@ pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
     const height = getTerminalHeight();
     if (height < 3) return; // Need at least 3 lines for status + space
     
+    // Clear screen and move to top-left
+    _ = stdout_file.write("\x1b[2J\x1b[H") catch {};
+
     // DECSTBM: Set Top and Bottom Margins
     // We reserve the LAST line for status.
     // Margins are 1-based.
