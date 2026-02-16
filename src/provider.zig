@@ -5,16 +5,10 @@ const client = @import("llm/client.zig");
 // Types
 // ============================================================
 
-pub const Model = struct {
-    id: []const u8,
-    display_name: []const u8,
-};
-
 pub const ProviderSpec = struct {
     id: []const u8,
-    display_name: []const u8,
     env_vars: []const []const u8,
-    models: []const Model,
+    models: []const []const u8,
     // Configuration fields moved here from hardcoded getProviderConfig
     endpoint: []const u8,
     models_endpoint: ?[]const u8 = null,
@@ -25,10 +19,9 @@ pub const ProviderSpec = struct {
 
 pub const ProviderState = struct {
     id: []const u8,
-    display_name: []const u8,
     key: ?[]const u8,
     connected: bool,
-    models: []const Model,
+    models: []const []const u8,
 };
 
 pub const EnvPair = struct {
@@ -60,12 +53,10 @@ pub fn deinitProviderSpecs() void {
         if (g_provider_specs) |specs| {
             for (specs) |spec| {
                 allocator.free(spec.id);
-                allocator.free(spec.display_name);
                 for (spec.env_vars) |ev| allocator.free(ev);
                 allocator.free(spec.env_vars);
                 for (spec.models) |m| {
-                    allocator.free(m.id);
-                    allocator.free(m.display_name);
+                    allocator.free(m);
                 }
                 allocator.free(spec.models);
                 allocator.free(spec.endpoint);
@@ -90,16 +81,15 @@ fn loadDefaultSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
     // OpenAI
     try specs.append(allocator, .{
         .id = try allocator.dupe(u8, "openai"),
-        .display_name = try allocator.dupe(u8, "OpenAI"),
         .env_vars = blk: {
             const ev = try allocator.alloc([]const u8, 1);
             ev[0] = try allocator.dupe(u8, "OPENAI_API_KEY");
             break :blk ev;
         },
         .models = blk: {
-            const m = try allocator.alloc(Model, 2);
-            m[0] = .{ .id = try allocator.dupe(u8, "gpt-4o"), .display_name = try allocator.dupe(u8, "GPT-4o") };
-            m[1] = .{ .id = try allocator.dupe(u8, "o3-mini"), .display_name = try allocator.dupe(u8, "o3-mini") };
+            const m = try allocator.alloc([]const u8, 2);
+            m[0] = try allocator.dupe(u8, "gpt-4o");
+            m[1] = try allocator.dupe(u8, "o3-mini");
             break :blk m;
         },
         .endpoint = try allocator.dupe(u8, "https://api.openai.com/v1/chat/completions"),
@@ -109,20 +99,19 @@ fn loadDefaultSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
     // OpenRouter
     try specs.append(allocator, .{
         .id = try allocator.dupe(u8, "openrouter"),
-        .display_name = try allocator.dupe(u8, "OpenRouter"),
         .env_vars = blk: {
             const ev = try allocator.alloc([]const u8, 1);
             ev[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
             break :blk ev;
         },
         .models = blk: {
-            const m = try allocator.alloc(Model, 6);
-            m[0] = .{ .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet"), .display_name = try allocator.dupe(u8, "Claude 3.5 Sonnet") };
-            m[1] = .{ .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet"), .display_name = try allocator.dupe(u8, "Claude 3.7 Sonnet") };
-            m[2] = .{ .id = try allocator.dupe(u8, "deepseek/deepseek-chat"), .display_name = try allocator.dupe(u8, "DeepSeek V3") };
-            m[3] = .{ .id = try allocator.dupe(u8, "deepseek/deepseek-r1"), .display_name = try allocator.dupe(u8, "DeepSeek R1") };
-            m[4] = .{ .id = try allocator.dupe(u8, "x-ai/grok-4.1-fast"), .display_name = try allocator.dupe(u8, "Grok 4.1 Fast") };
-            m[5] = .{ .id = try allocator.dupe(u8, "openai/gpt-oss-120b"), .display_name = try allocator.dupe(u8, "GPT-OSS 120B") };
+            const m = try allocator.alloc([]const u8, 6);
+            m[0] = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet");
+            m[1] = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet");
+            m[2] = try allocator.dupe(u8, "deepseek/deepseek-chat");
+            m[3] = try allocator.dupe(u8, "deepseek/deepseek-r1");
+            m[4] = try allocator.dupe(u8, "x-ai/grok-4.1-fast");
+            m[5] = try allocator.dupe(u8, "openai/gpt-oss-120b");
             break :blk m;
         },
         .endpoint = try allocator.dupe(u8, "https://openrouter.ai/api/v1/chat/completions"),
@@ -134,15 +123,14 @@ fn loadDefaultSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
     // Z.AI
     try specs.append(allocator, .{
         .id = try allocator.dupe(u8, "zai"),
-        .display_name = try allocator.dupe(u8, "Z.AI"),
         .env_vars = blk: {
             const ev = try allocator.alloc([]const u8, 1);
             ev[0] = try allocator.dupe(u8, "ZAI_API_KEY");
             break :blk ev;
         },
         .models = blk: {
-            const m = try allocator.alloc(Model, 1);
-            m[0] = .{ .id = try allocator.dupe(u8, "glm-4.7"), .display_name = try allocator.dupe(u8, "GLM-4.7") };
+            const m = try allocator.alloc([]const u8, 1);
+            m[0] = try allocator.dupe(u8, "glm-4.7");
             break :blk m;
         },
         .endpoint = try allocator.dupe(u8, "https://api.z.ai/api/coding/paas/v4/chat/completions"),
@@ -180,17 +168,13 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator, config_dir: []const u8) !
     const Json = struct {
         providers: []struct {
             id: []const u8,
-            display_name: []const u8,
             env_vars: []const []const u8,
             endpoint: []const u8,
             models_endpoint: ?[]const u8 = null,
             referer: ?[]const u8 = null,
             title: ?[]const u8 = null,
             user_agent: ?[]const u8 = null,
-            models: []const struct {
-                id: []const u8,
-                display_name: []const u8,
-            },
+            models: []const []const u8,
         },
     };
 
@@ -202,15 +186,11 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator, config_dir: []const u8) !
         const env_vars = try allocator.alloc([]const u8, p.env_vars.len);
         for (p.env_vars, 0..) |ev, i| env_vars[i] = try allocator.dupe(u8, ev);
 
-        const models = try allocator.alloc(Model, p.models.len);
-        for (p.models, 0..) |m, i| models[i] = .{
-            .id = try allocator.dupe(u8, m.id),
-            .display_name = try allocator.dupe(u8, m.display_name),
-        };
+        const models = try allocator.alloc([]const u8, p.models.len);
+        for (p.models, 0..) |m, i| models[i] = try allocator.dupe(u8, m);
 
         const spec = ProviderSpec{
             .id = try allocator.dupe(u8, p.id),
-            .display_name = try allocator.dupe(u8, p.display_name),
             .env_vars = env_vars,
             .models = models,
             .endpoint = try allocator.dupe(u8, p.endpoint),
@@ -275,7 +255,6 @@ pub fn resolveProviderStates(
         const single_key = if (spec.env_vars.len == 1) found_value else null;
         try out.append(allocator, .{
             .id = spec.id,
-            .display_name = spec.display_name,
             .key = single_key,
             .connected = true,
             .models = spec.models,
@@ -315,7 +294,7 @@ fn findEnvValue(names: []const []const u8, env: []const EnvPair) ?[]const u8 {
 // Default Model Selection
 // ============================================================
 
-pub fn defaultModelIDForProvider(provider_id: []const u8, models: []const Model) ?[]const u8 {
+pub fn defaultModelIDForProvider(provider_id: []const u8, models: []const []const u8) ?[]const u8 {
     const openai_priority = [_][]const u8{ "gpt-5-nano", "gpt-5-mini", "gpt-4o-mini" };
     const anthropic_priority = [_][]const u8{ "haiku", "sonnet" };
     const generic_priority = [_][]const u8{ "haiku", "flash", "nano", "mini" };
@@ -328,12 +307,12 @@ pub fn defaultModelIDForProvider(provider_id: []const u8, models: []const Model)
         generic_priority[0..];
 
     for (priority) |needle| {
-        for (models) |model| {
-            if (std.mem.indexOf(u8, model.id, needle) != null) return model.id;
+        for (models) |model_id| {
+            if (std.mem.indexOf(u8, model_id, needle) != null) return model_id;
         }
     }
 
-    if (models.len > 0) return models[0].id;
+    if (models.len > 0) return models[0];
     return null;
 }
 

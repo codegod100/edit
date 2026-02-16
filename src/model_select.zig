@@ -24,7 +24,6 @@ pub const ModelSelection = struct {
 pub const ModelOption = struct {
     provider_id: []const u8,
     model_id: []const u8,
-    display_name: []const u8,
 };
 
 pub fn envPairsForProviders(
@@ -97,8 +96,8 @@ pub fn providerHasModel(providers: []const provider.ProviderSpec, provider_id: [
     // stale local catalogs. `/model` already does an optional live check for OpenRouter.
     if (std.mem.eql(u8, provider_id, "openrouter")) return true;
     const spec = findProviderSpecByID(providers, provider_id) orelse return false;
-    for (spec.models) |model| {
-        if (std.mem.eql(u8, model.id, model_id)) return true;
+    for (spec.models) |m_id| {
+        if (std.mem.eql(u8, m_id, model_id)) return true;
     }
     return false;
 }
@@ -107,14 +106,14 @@ pub fn chooseDefaultModelForConnected(state: provider.ProviderState) ?[]const u8
     if (std.mem.eql(u8, state.id, "openai") and state.key != null and auth.isLikelyOAuthToken(state.key.?)) {
         // Subscription/OAuth token uses the Codex backend: default to a Codex model.
         var best: ?[]const u8 = null;
-        for (state.models) |m| {
-            if (!utils.isCodexModelId(m.id)) continue;
+        for (state.models) |m_id| {
+            if (!utils.isCodexModelId(m_id)) continue;
             // Prefer newer/larger by simple lexical bias, falling back to first match.
-            if (best == null) best = m.id else if (std.mem.lessThan(u8, best.?, m.id)) best = m.id;
+            if (best == null) best = m_id else if (std.mem.lessThan(u8, best.?, m_id)) best = m_id;
         }
         if (best) |b| return b;
         // No codex model found - return first available model for OAuth fallback
-        if (state.models.len > 0) return state.models[0].id;
+        if (state.models.len > 0) return state.models[0];
         return null;
     }
     return provider.defaultModelIDForProvider(state.id, state.models);
@@ -191,10 +190,10 @@ pub fn collectModelOptions(
                 }
 
                 // Add catalog models that are allowed.
-                for (spec.models) |m| {
-                    if (seen.contains(m.id)) {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
-                        _ = seen.remove(m.id);
+                for (spec.models) |m_id| {
+                    if (seen.contains(m_id)) {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
+                        _ = seen.remove(m_id);
                     }
                 }
 
@@ -202,28 +201,28 @@ pub fn collectModelOptions(
                 var it = seen.keyIterator();
                 while (it.next()) |key_ptr| {
                     const id = key_ptr.*;
-                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = id, .display_name = id });
+                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = id });
                 }
                 continue;
             } else {
                 if (copilot_live_allowlist) {
                     // If Copilot model listing fails, fall back to static catalog.
-                    for (spec.models) |m| {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+                    for (spec.models) |m_id| {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
                     }
                     continue;
                 }
-                for (spec.models) |m| {
-                    if (utils.isCodexModelId(m.id)) {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+                for (spec.models) |m_id| {
+                    if (utils.isCodexModelId(m_id)) {
+                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
                     }
                 }
                 continue;
             }
         }
 
-        for (spec.models) |m| {
-            try out.append(allocator, .{ .provider_id = spec.id, .model_id = m.id, .display_name = m.display_name });
+        for (spec.models) |m_id| {
+            try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
         }
     }
     return out.toOwnedSlice(allocator);
@@ -237,7 +236,7 @@ pub fn filterModelOptions(allocator: std.mem.Allocator, options: []const ModelOp
     errdefer out.deinit(allocator);
 
     for (options) |o| {
-        if (utils.containsIgnoreCase(o.model_id, q) or utils.containsIgnoreCase(o.display_name, q) or utils.containsIgnoreCase(o.provider_id, q)) {
+        if (utils.containsIgnoreCase(o.model_id, q) or utils.containsIgnoreCase(o.provider_id, q)) {
             try out.append(allocator, o);
         }
     }
@@ -253,13 +252,11 @@ pub fn resolveGlobalModelPick(options: []const ModelOption, pick: []const u8) ?M
     for (options) |m| {
         if (std.mem.eql(u8, m.model_id, pick)) return m;
         if (std.mem.eql(u8, m.provider_id, pick)) return m;
-        if (std.mem.eql(u8, m.display_name, pick)) return m;
     }
 
     for (options) |m| {
         if (std.mem.eql(u8, m.provider_id, pick)) return m;
         if (utils.containsIgnoreCase(m.model_id, pick)) return m;
-        if (utils.containsIgnoreCase(m.display_name, pick)) return m;
     }
     return null;
 }
@@ -268,13 +265,13 @@ pub fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
     return if (options.len == 1) options[0] else null;
 }
 
-pub fn resolveModelPick(models: []const provider.Model, pick: []const u8) ?provider.Model {
+pub fn resolveModelPick(models: []const []const u8, pick: []const u8) ?[]const u8 {
     const n = std.fmt.parseInt(usize, pick, 10) catch null;
     if (n) |idx| {
         if (idx > 0 and idx <= models.len) return models[idx - 1];
     }
-    for (models) |m| {
-        if (std.mem.eql(u8, m.id, pick)) return m;
+    for (models) |m_id| {
+        if (std.mem.eql(u8, m_id, pick)) return m_id;
     }
     return null;
 }
@@ -335,7 +332,7 @@ pub fn chooseProvider(
     try stdout.print("Connect a provider:\n", .{});
     for (provider_specs, 0..) |p, idx| {
         const status = if (isConnected(p.id, connected)) "connected" else "not connected";
-        try stdout.print("  {d}) {s} [{s}]\n", .{ idx + 1, p.display_name, status });
+        try stdout.print("  {d}) {s} [{s}]\n", .{ idx + 1, p.id, status });
     }
     const choice_opt = try promptLineFn(allocator, stdin, stdout, "Provider number or id: ");
     if (choice_opt == null) return null;

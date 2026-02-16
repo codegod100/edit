@@ -75,7 +75,7 @@ pub fn interactiveModelSelect(
 
     try stdout.print("Select model:\n", .{});
     for (filtered, 0..) |m, i| {
-        try stdout.print("  {d}) {s}/{s} ({s})\n", .{ i + 1, m.provider_id, m.model_id, m.display_name });
+        try stdout.print("  {d}) {s}/{s}\n", .{ i + 1, m.provider_id, m.model_id });
     }
 
     const model_pick_opt = try promptLine(allocator, stdin, stdout, "Model number or id: ");
@@ -190,7 +190,7 @@ fn buildFilterPreviewBlock(allocator: std.mem.Allocator, options: []const model_
     const limit = @min(filtered.len, 6);
     var i: usize = 0;
     while (i < limit) : (i += 1) {
-        try w.print("\n  {d}) {s}/{s} ({s})", .{ i + 1, filtered[i].provider_id, filtered[i].model_id, filtered[i].display_name });
+        try w.print("\n  {d}) {s}/{s}", .{ i + 1, filtered[i].provider_id, filtered[i].model_id });
     }
     if (filtered.len > limit) {
         try w.print("\n  ... and {d} more", .{filtered.len - limit});

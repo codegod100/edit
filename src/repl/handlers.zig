@@ -24,7 +24,7 @@ fn formatProvidersOutput(allocator: std.mem.Allocator, provider_specs: []const p
     for (provider_specs) |p| {
         const state = model_select.findConnectedProvider(states, p.id);
         const status = if (state != null) "connected" else "not connected";
-        try w.print("- {s} ({s}) [{s}]\n", .{ p.display_name, p.id, status });
+        try w.print("- {s} [{s}]\n", .{ p.id, status });
 
         if (state) |s| {
             if (s.key) |k| {
