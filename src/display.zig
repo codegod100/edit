@@ -450,7 +450,7 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
     // Title line if present
     if (title.len > 0) {
         try w.print(C_DIM ++ "{s}" ++ C_RESET ++ "  " ++ C_BOLD ++ C_CYAN ++ "{s}" ++ C_RESET, .{ s.vertical, title });
-        const padding = inner_width - 2 - title.len;
+        const padding = if (inner_width > title.len + 2) inner_width - 2 - title.len else 0;
         i = 0;
         while (i < padding) : (i += 1) try w.writeByte(' ');
         try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
@@ -461,15 +461,42 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
         try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.mid_right});
     }
 
-    // Content
+    // Content with ANSI-aware wrapping
     for (lines) |line| {
-        try w.print(C_DIM ++ "{s}" ++ C_RESET ++ " ", .{s.vertical});
-        const display_line = if (line.len > inner_width - 2) line[0 .. inner_width - 2] else line;
-        try w.writeAll(display_line);
-        const padding = inner_width - 1 - display_line.len;
-        i = 0;
-        while (i < padding) : (i += 1) try w.writeByte(' ');
-        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+        var start: usize = 0;
+        while (start < line.len or line.len == 0) {
+            try w.print(C_DIM ++ "{s}" ++ C_RESET ++ " ", .{s.vertical});
+            
+            var visible_count: usize = 0;
+            var j: usize = start;
+            while (j < line.len and visible_count < width - 4) {
+                if (line[j] == 0x1b and j + 1 < line.len and line[j + 1] == '[') {
+                    const esc_start = j;
+                    j += 2;
+                    while (j < line.len and !((line[j] >= 'A' and line[j] <= 'Z') or line[j] == 'm')) : (j += 1) {}
+                    j += 1;
+                    try w.writeAll(line[esc_start..j]);
+                    continue;
+                }
+                
+                // UTF-8 start byte
+                const len = std.unicode.utf8ByteSequenceLength(line[j]) catch 1;
+                try w.writeAll(line[j .. j + len]);
+                j += len;
+                visible_count += 1;
+            }
+            
+            const end = j;
+            const padding = (width - 4) - visible_count;
+            var p: usize = 0;
+            while (p < padding) : (p += 1) try w.writeByte(' ');
+            
+            try w.print(" " ++ C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+            
+            start = end;
+            if (start >= line.len and line.len > 0) break;
+            if (line.len == 0) break;
+        }
     }
 
     // Bottom

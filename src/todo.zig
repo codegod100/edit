@@ -124,8 +124,8 @@ pub const TodoList = struct {
                 .in_progress => C_YELLOW ++ "●" ++ C_RESET,
                 .done => C_GREEN ++ "✓" ++ C_RESET,
             };
-            const desc_color = if (item.status == .done) C_GREY else if (item.status == .in_progress) C_BOLD else "";
-            const line = try std.fmt.allocPrint(allocator, "{s}  {s}{s}" ++ C_RESET, .{ icon, desc_color, item.description });
+            const desc_prefix = if (item.status == .done) C_GREY else if (item.status == .in_progress) C_BOLD else "";
+            const line = try std.fmt.allocPrint(allocator, "{s}  {s}{s}", .{ icon, desc_prefix, item.description });
             try lines.append(allocator, line);
         }
 
