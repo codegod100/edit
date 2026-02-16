@@ -166,8 +166,12 @@ pub fn readPromptLine(
 
     // Initial draw of timeline + prompt
     const display = @import("display.zig");
-    try display.clearScreenAndRedrawTimeline(stdout, prompt, "");
-
+    try display.clearScreenAndRedrawTimeline(stdout, prompt, "> ");
+    
+    // Position cursor after "> " on the middle line of the box
+    // The prompt has 3 lines: top border, middle with >, bottom border
+    // We need to position cursor on the middle line after "> "
+    
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();

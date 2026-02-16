@@ -157,12 +157,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xae\n"); // ╮
         
         // Middle line with ">": │ > ... │
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ >
+        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82 >"); // │ > (2 display chars)
         bw = 0;
-        while (bw < box_width - 3) : (bw += 1) {
+        while (bw < box_width - 2) : (bw += 1) { // Fill remaining width minus "│ >" and "│"
             try prompt_buf.appendSlice(allocator, " ");
         }
-        try prompt_buf.appendSlice(allocator, "\xe2\x94\x82\n"); // │
+        try prompt_buf.appendSlice(allocator, " \xe2\x94\x82\n"); // space + │
         
         // Bottom border: ╰────────────────────╯
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xb0"); // ╰
@@ -172,13 +172,13 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
         try prompt_buf.appendSlice(allocator, "\xe2\x95\xaf\n"); // ╯
         
-        // System info line below box
+        // System info line below box - show full path
         if (active) |a| {
             if (state.selected_model) |m| {
                 try prompt_buf.writer(allocator).print(" {s}/{s} @ ", .{ a.provider_id, m.model_id });
             }
         }
-        try prompt_buf.writer(allocator).print("{s}\n", .{std.fs.path.basename(cwd)});
+        try prompt_buf.writer(allocator).print("{s}\n", .{cwd});
         const prompt = try prompt_buf.toOwnedSlice(allocator);
         defer allocator.free(prompt);
 

@@ -204,9 +204,6 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8, current_input: []const u8) !void {
-    // Save cursor position
-    try stdout.writeAll("\x1b[s");
-    
     // Clear screen and move cursor to top
     try stdout.writeAll("\x1b[2J\x1b[H");
     
@@ -215,16 +212,22 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8,
         try stdout.print("{s}\n", .{entry});
     }
     
-    // Add separator if we have entries
-    if (g_timeline_entries.items.len > 0) {
-        try stdout.writeAll("\n");
+    // Draw prompt box at bottom (box already includes system info)
+    try stdout.print("{s}", .{current_prompt});
+    
+    // Move cursor to middle line of box, after "> "
+    // Count lines in prompt to position correctly
+    var line_count: usize = 0;
+    for (current_prompt) |c| {
+        if (c == '\n') line_count += 1;
     }
-    
-    // Draw prompt at bottom
-    try stdout.print("{s}{s}", .{ current_prompt, current_input });
-    
-    // Restore cursor position (now at end of prompt+input)
-    try stdout.writeAll("\x1b[u");
+    // Move up to middle line (3 lines in box: top, middle, bottom + info line)
+    // Cursor is currently at end of prompt, move up 2 lines and to column 3 (after "│ ")
+    if (line_count >= 3) {
+        try stdout.writeAll("\x1b[2A"); // Move up 2 lines
+        try stdout.writeAll("\x1b[3G"); // Move to column 3 (after "│ ")
+        try stdout.print("{s}", .{current_input});
+    }
 }
 
 pub fn getTerminalHeight() usize {
