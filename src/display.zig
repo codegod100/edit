@@ -204,21 +204,43 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 }
 
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8, current_input: []const u8) !void {
+    // Get terminal height
+    const term_height = getTerminalHeight();
+    
     // Clear screen and move cursor to top
     try stdout.writeAll("\x1b[2J\x1b[H");
     
-    // Draw timeline entries
-    for (g_timeline_entries.items) |entry| {
+    // Count lines in prompt (box + system info = 4 lines typically)
+    var prompt_lines: usize = 0;
+    for (current_prompt) |c| {
+        if (c == '\n') prompt_lines += 1;
+    }
+    if (prompt_lines == 0) prompt_lines = 4;
+    
+    // Calculate available space for timeline
+    const reserved_lines = prompt_lines + 1;
+    const available_height = if (term_height > reserved_lines) term_height - reserved_lines else 5;
+    
+    // Draw timeline entries from top (show most recent at bottom of timeline area)
+    var lines_drawn: usize = 0;
+    const entries_to_show = @min(g_timeline_entries.items.len, available_height);
+    const start_idx = g_timeline_entries.items.len - entries_to_show;
+    
+    for (g_timeline_entries.items[start_idx..]) |entry| {
         try stdout.print("{s}\n", .{entry});
+        lines_drawn += 1;
+    }
+    
+    // Fill remaining space to push prompt to bottom
+    while (lines_drawn < available_height) : (lines_drawn += 1) {
+        try stdout.writeAll("\n");
     }
     
     // Draw prompt box at bottom
-    // The prompt has 4 lines: top border, middle with "> ", bottom border, system info
     try stdout.print("{s}", .{current_prompt});
     
     // Position cursor inside the box on the middle line, after "> "
-    // Cursor is at end of system info line, move up 2 lines to middle line
-    try stdout.writeAll("\x1b[2A"); // Move up 2 lines (from info line to middle line)
+    try stdout.writeAll("\x1b[2A"); // Move up 2 lines
     try stdout.writeAll("\x1b[3G"); // Move to column 3 (after "│ ")
     try stdout.print("{s}", .{current_input});
 }
