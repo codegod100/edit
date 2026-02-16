@@ -7,6 +7,7 @@ const display = @import("../display.zig");
 const tool_routing = @import("../tool_routing.zig");
 const todo = @import("../todo.zig");
 const cancel = @import("../cancel.zig");
+const logger = @import("../logger.zig");
 const legacy = @import("legacy.zig");
 
 pub fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
@@ -26,6 +27,7 @@ pub fn runModelTurnWithTools(
     todo_list: *todo.TodoList,
 ) !active_module.RunTurnResult {
     var context_prompt = try allocator.dupe(u8, user_input);
+    try logger.transcriptWrite("\n>>> User: {s}\n", .{user_input});
     var forced_repo_probe_done = false;
     var forced_mutation_probe_done = false;
     var forced_completion_probe_done = false;
@@ -200,6 +202,7 @@ pub fn runModelTurnWithTools(
             }
 
             allocator.free(context_prompt);
+            try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{final});
             return .{
                 .response = final,
                 .reasoning = try allocator.dupe(u8, ""),
@@ -243,6 +246,7 @@ pub fn runModelTurnWithTools(
             }
 
             allocator.free(context_prompt);
+            try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{final});
             return .{
                 .response = final,
                 .reasoning = try allocator.dupe(u8, ""),
@@ -264,6 +268,7 @@ pub fn runModelTurnWithTools(
         }
 
         tool_calls += 1;
+        try logger.transcriptWrite("\n[Tool Call] {s}({s})\n", .{ routed.?.tool, routed.?.arguments_json });
         if (tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
             if (!utils.containsPath(paths.items, p)) {
                 try paths.append(p);
@@ -275,18 +280,13 @@ pub fn runModelTurnWithTools(
         const call_id = try std.fmt.allocPrint(allocator, "toolcall-{d}", .{step + 1});
         defer allocator.free(call_id);
 
-        // Set initial spinner state (will be updated with details after parsing)
+        // Set initial spinner state
         if (tools.isReadToolName(routed.?.tool)) {
             display.setSpinnerState(.reading);
         } else if (tools.isMutatingToolName(routed.?.tool)) {
             display.setSpinnerState(.writing);
         } else if (std.mem.eql(u8, routed.?.tool, "bash")) {
-            if (tools.parseBashCommandFromArgs(allocator, routed.?.arguments_json)) |cmd| {
-                defer allocator.free(cmd);
-                display.setSpinnerStateWithText(.bash, cmd);
-            } else {
-                display.setSpinnerState(.bash);
-            }
+            display.setSpinnerState(.bash);
         } else {
             display.setSpinnerState(.tool);
         }
@@ -294,19 +294,6 @@ pub fn runModelTurnWithTools(
 
         const started_ms = std.time.milliTimestamp();
         const file_path = tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
-
-        // Update spinner with file path details now that we have them
-        if (tools.isReadToolName(routed.?.tool)) {
-            if (file_path) |fp| {
-                const display_fp = if (fp.len > 80) fp[fp.len - 80 ..] else fp;
-                display.setSpinnerStateWithText(.reading, display_fp);
-            }
-        } else if (tools.isMutatingToolName(routed.?.tool)) {
-            if (file_path) |fp| {
-                const display_fp = if (fp.len > 80) fp[fp.len - 80 ..] else fp;
-                display.setSpinnerStateWithText(.writing, display_fp);
-            }
-        }
 
         const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
             const failed_ms = std.time.milliTimestamp();
@@ -343,6 +330,7 @@ pub fn runModelTurnWithTools(
 
         const clean_out = try display.stripAnsi(allocator, tool_out);
         defer allocator.free(clean_out);
+        try logger.transcriptWrite("[Result]\n{s}\n", .{clean_out});
 
         // Reset spinner to thinking state for next iteration
         display.setSpinnerState(.thinking);
