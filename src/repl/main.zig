@@ -29,7 +29,8 @@ fn spinnerThread(stdout_file: std.fs.File) void {
     while (g_spinner_running.load(.acquire)) {
         cancel.pollForEscape();
         const state_text = display.getSpinnerStateText(&state_buf);
-        const frame = display.getSpinnerFrame();
+        const state = display.g_spinner_state.load(.acquire);
+        const frame = if (state == 0) " " else display.getSpinnerFrame();
         
         display.renderStatusBar(stdout_file, frame, state_text);
         
@@ -196,14 +197,17 @@ pub fn run(allocator: std.mem.Allocator) !void {
         // Ensure vertical spacing before new prompt
         try stdout.writeAll("\n");
 
-        // Force a status bar refresh for current turn info
+        // Set state to idle while waiting for input
+        display.setSpinnerState(.idle);
+
+        // Get active model info for prompt
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
+        
         if (active) |a| {
             display.setStatusBarInfo(a.provider_id, a.model_id, cwd);
         } else {
             display.setStatusBarInfo("none", "none", cwd);
         }
-        display.renderStatusBar(stdout_file, " ", "Thinking...");
 
         // Get terminal width/height for box and logging
         const term_width = display.terminalColumns();
@@ -303,6 +307,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const turn_alloc = turn_arena.allocator();
 
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
+
+        display.setSpinnerState(.thinking);
 
         // Show spinner while model is processing
         if (stdout_file.isTty()) {

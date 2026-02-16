@@ -24,15 +24,16 @@ var spinner_last_update: i64 = 0;
 
 /// Spinner states for monitoring what the model is doing
 pub const SpinnerState = enum(u8) {
-    thinking = 0,
-    tool = 1,
-    reading = 2,
-    writing = 3,
-    bash = 4,
-    search = 5,
+    idle = 0,
+    thinking = 1,
+    tool = 2,
+    reading = 3,
+    writing = 4,
+    bash = 5,
+    search = 6,
 };
 
-var g_spinner_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+pub var g_spinner_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 var g_spinner_custom_text: [128]u8 = undefined;
 var g_spinner_custom_len: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
@@ -79,8 +80,9 @@ pub fn getSpinnerStateText(buf: []u8) []const u8 {
     }
 
     return switch (state) {
-        1, 2, 3, 4, 5 => "Running...",
-        else => "Thinking...",
+        0 => "Ready",
+        1 => "Thinking...",
+        else => "Running...",
     };
 }
 
