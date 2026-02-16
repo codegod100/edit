@@ -280,8 +280,18 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 line_start = i + 1;
                 if (trimmed.len == 0) continue;
 
-                const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
-                printed_any = true;
+                var prefix: []const u8 = "    ";
+                if (!printed_any) {
+                    printed_any = true;
+                    // If this is a box, don't use the L-bracket prefix
+                    if (std.mem.startsWith(u8, trimmed, "╭") or std.mem.startsWith(u8, trimmed, "\xe2\x95\xad")) {
+                        prefix = "";
+                    } else {
+                        prefix = "  \xe2\x94\x94 ";
+                    }
+                } else if (std.mem.startsWith(u8, trimmed, "╭") or std.mem.startsWith(u8, trimmed, "\xe2\x95\xad")) {
+                    prefix = "";
+                }
                 
                 if (trimmed.len > MAX_WIDTH) {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
@@ -296,9 +306,19 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
 
     var printed_any = false;
     for (head[0..HEAD]) |r| {
-        const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
-        printed_any = true;
         const line = output[r.start..r.end];
+        var prefix: []const u8 = "    ";
+        if (!printed_any) {
+            printed_any = true;
+            if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad")) {
+                prefix = "";
+            } else {
+                prefix = "  \xe2\x94\x94 ";
+            }
+        } else if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad")) {
+            prefix = "";
+        }
+
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
             addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
@@ -312,16 +332,17 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
-    while (t < tail_len) : (t += 1) {
-        const r = tail[(first + t) % TAIL];
-        const line = output[r.start..r.end];
-        if (line.len > MAX_WIDTH) {
-            const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-            addTimelineEntry("    {s}{s}{s}\xe2\x80\xa6{s}\n", .{ C_GREY, line[0..safe_len], C_RESET, "" });
-        } else {
-            addTimelineEntry("    {s}{s}{s}\n", .{ C_GREY, line, C_RESET });
+        while (t < tail_len) : (t += 1) {
+            const r = tail[(first + t) % TAIL];
+            const line = output[r.start..r.end];
+            const prefix = if (std.mem.startsWith(u8, line, "╭") or std.mem.startsWith(u8, line, "\xe2\x95\xad") or std.mem.startsWith(u8, line, "│") or std.mem.startsWith(u8, line, "\xe2\x94\x82") or std.mem.startsWith(u8, line, "╰") or std.mem.startsWith(u8, line, "\xe2\x95\xb0")) "" else "    ";
+            if (line.len > MAX_WIDTH) {
+                const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
+                addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
+            } else {
+                addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
+            }
         }
-    }
 }
 
 fn findUtf8SafeLen(text: []const u8, max: usize) usize {
@@ -399,6 +420,65 @@ pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
 
     // Initial status bar draw so it's not empty
     renderStatusBar(stdout_file, " ", "Ready");
+}
+
+pub const BoxStyle = struct {
+    top_left: []const u8 = "\xe2\x95\xad", // ╭
+    top_right: []const u8 = "\xe2\x95\xae", // ╮
+    bottom_left: []const u8 = "\xe2\x95\xb0", // ╰
+    bottom_right: []const u8 = "\xe2\x95\xaf", // ╯
+    horizontal: []const u8 = "\xe2\x94\x80", // ─
+    vertical: []const u8 = "\xe2\x94\x82", // │
+    mid_left: []const u8 = "\xe2\x94\x9c", // ├
+    mid_right: []const u8 = "\xe2\x94\xa4", // ┤
+};
+
+pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const []const u8, width: usize) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    const s = BoxStyle{};
+
+    const inner_width = width - 2;
+
+    // Top
+    try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.top_left});
+    var i: usize = 0;
+    while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
+    try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.top_right});
+
+    // Title line if present
+    if (title.len > 0) {
+        try w.print(C_DIM ++ "{s}" ++ C_RESET ++ "  " ++ C_BOLD ++ C_CYAN ++ "{s}" ++ C_RESET, .{ s.vertical, title });
+        const padding = inner_width - 2 - title.len;
+        i = 0;
+        while (i < padding) : (i += 1) try w.writeByte(' ');
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+
+        try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.mid_left});
+        i = 0;
+        while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.mid_right});
+    }
+
+    // Content
+    for (lines) |line| {
+        try w.print(C_DIM ++ "{s}" ++ C_RESET ++ " ", .{s.vertical});
+        const display_line = if (line.len > inner_width - 2) line[0 .. inner_width - 2] else line;
+        try w.writeAll(display_line);
+        const padding = inner_width - 1 - display_line.len;
+        i = 0;
+        while (i < padding) : (i += 1) try w.writeByte(' ');
+        try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.vertical});
+    }
+
+    // Bottom
+    try w.print(C_DIM ++ "{s}" ++ C_RESET, .{s.bottom_left});
+    i = 0;
+    while (i < inner_width) : (i += 1) try w.writeAll(s.horizontal);
+    try w.print(C_DIM ++ "{s}\n" ++ C_RESET, .{s.bottom_right});
+
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
