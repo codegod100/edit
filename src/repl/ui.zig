@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const display = @import("../display.zig"); // Use display.zig for terminal logic
 const model_select = @import("../model_select.zig"); // Core logic for model selection
-const pm = @import("../provider_manager.zig");
+const provider = @import("../provider.zig");
 const context = @import("../context.zig");
 
 // --- Helper Functions ---
@@ -45,8 +45,8 @@ pub fn interactiveModelSelect(
     stdin: anytype,
     stdout: anytype,
     stdin_file: std.fs.File,
-    providers: []const pm.ProviderSpec,
-    connected: []const pm.ProviderState,
+    providers: []const provider.ProviderSpec,
+    connected: []const provider.ProviderState,
     only_provider_id: ?[]const u8,
 ) !?model_select.ModelSelection {
     const options = try model_select.collectModelOptions(allocator, providers, connected, only_provider_id);

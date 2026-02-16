@@ -1,13 +1,13 @@
 const std = @import("std");
-const pm = @import("../provider_manager.zig");
+const provider = @import("../provider.zig");
 const context = @import("../context.zig");
 const todo = @import("../todo.zig");
 const config_store = @import("../config_store.zig");
 
 pub const ReplState = struct {
     allocator: std.mem.Allocator,
-    providers: []const pm.ProviderSpec,
-    provider_states: []pm.ProviderState,
+    providers: []const provider.ProviderSpec,
+    provider_states: []provider.ProviderState,
     selected_model: ?config_store.SelectedModel,
     context_window: context.ContextWindow,
     todo_list: todo.TodoList,
@@ -18,7 +18,6 @@ pub const ReplState = struct {
     pub fn deinit(self: *ReplState) void {
         self.context_window.deinit(self.allocator);
         self.todo_list.deinit();
-        for (self.provider_states) |*s| s.deinit(self.allocator);
         self.allocator.free(self.provider_states);
         if (self.selected_model) |*s| s.deinit(self.allocator);
         if (self.reasoning_effort) |e| self.allocator.free(e);

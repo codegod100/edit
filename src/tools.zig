@@ -516,7 +516,7 @@ fn replaceTextStrict(allocator: std.mem.Allocator, original: []const u8, find: [
     }
     if (!replace_all and matches > 1) return NamedToolError.InvalidArguments;
 
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     var cursor: usize = 0;
@@ -531,9 +531,9 @@ fn replaceTextStrict(allocator: std.mem.Allocator, original: []const u8, find: [
 }
 
 fn replaceByTrimmedLines(allocator: std.mem.Allocator, original: []const u8, find: []const u8, repl: []const u8) !?[]u8 {
-    var original_lines: std.ArrayList([]const u8) = .empty;
+    var original_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer original_lines.deinit(allocator);
-    var find_lines: std.ArrayList([]const u8) = .empty;
+    var find_lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer find_lines.deinit(allocator);
 
     var oit = std.mem.splitScalar(u8, original, '\n');
@@ -603,7 +603,7 @@ fn zigFmtDiagnostics(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
 }
 
 fn collectPatchDiagnostics(allocator: std.mem.Allocator, patch_text: []const u8) !?[]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, patch_text, '\n');
@@ -644,7 +644,7 @@ const HunkLine = struct {
 };
 
 fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
-    var lines: std.ArrayList([]const u8) = .empty;
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lines.deinit(allocator);
 
     var it = std.mem.splitScalar(u8, patch_text, '\n');
@@ -665,7 +665,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
     if (end_idx == null or end_idx.? <= 0) return NamedToolError.InvalidArguments;
 
     var i: usize = 1;
-    var summary: std.ArrayList(u8) = .empty;
+    var summary: std.ArrayListUnmanaged(u8) = .empty;
     defer summary.deinit(allocator);
 
     while (i < end_idx.?) {
@@ -679,7 +679,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
             const path = std.mem.trim(u8, line[14..], " \t");
             i += 1;
 
-            var content_lines: std.ArrayList([]const u8) = .empty;
+            var content_lines: std.ArrayListUnmanaged([]const u8) = .empty;
             defer content_lines.deinit(allocator);
             while (i < end_idx.? and !std.mem.startsWith(u8, lines.items[i], "*** ")) : (i += 1) {
                 const cl = lines.items[i];
@@ -716,7 +716,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
             defer allocator.free(original);
             const original_trailing_nl = original.len > 0 and original[original.len - 1] == '\n';
 
-            var original_lines: std.ArrayList([]const u8) = .empty;
+            var original_lines: std.ArrayListUnmanaged([]const u8) = .empty;
             defer original_lines.deinit(allocator);
             var oit = std.mem.splitScalar(u8, original, '\n');
             while (oit.next()) |raw| {
@@ -726,7 +726,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
                 _ = original_lines.pop();
             }
 
-            var out_lines: std.ArrayList([]const u8) = .empty;
+            var out_lines: std.ArrayListUnmanaged([]const u8) = .empty;
             defer out_lines.deinit(allocator);
             var cursor: usize = 0;
 
@@ -738,7 +738,7 @@ fn applyPatchText(allocator: std.mem.Allocator, patch_text: []const u8) ![]u8 {
                 if (!std.mem.startsWith(u8, lines.items[i], "@@")) return NamedToolError.InvalidArguments;
                 i += 1;
 
-                var hunk: std.ArrayList(HunkLine) = .empty;
+                var hunk: std.ArrayListUnmanaged(HunkLine) = .empty;
                 defer hunk.deinit(allocator);
                 while (i < end_idx.? and !std.mem.startsWith(u8, lines.items[i], "@@") and !std.mem.startsWith(u8, lines.items[i], "*** ")) : (i += 1) {
                     const hl = lines.items[i];

@@ -33,10 +33,10 @@ pub fn runModelTurnWithTools(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const multi_step_mutation = tool_routing.isLikelyMultiStepMutationRequest(raw_user_request);
     var tool_calls: usize = 0;
-    var paths: std.ArrayList([]u8) = .empty;
+    var paths = std.ArrayList([]u8).init(allocator);
     defer {
         for (paths.items) |p| allocator.free(p);
-        paths.deinit(allocator);
+        paths.deinit();
     }
 
     var step: usize = 0;
@@ -112,9 +112,9 @@ pub fn runModelTurnWithTools(
         }
 
         if (routed == null and mutation_request and !forced_completion_probe_done and step < soft_limit) {
-            var touched: std.ArrayList([]const u8) = .empty;
-            defer touched.deinit(allocator);
-            for (paths.items) |p| try touched.append(allocator, p);
+            var touched = std.ArrayList([]const u8).init(allocator);
+            defer touched.deinit();
+            for (paths.items) |p| try touched.append(p);
 
             const missing_required = tool_routing.hasUnmetRequiredEdits(raw_user_request, touched.items);
             if ((multi_step_mutation and tool_calls < 2) or missing_required) {
@@ -153,9 +153,9 @@ pub fn runModelTurnWithTools(
             }
 
             if (mutation_request) {
-                var touched: std.ArrayList([]const u8) = .empty;
-                defer touched.deinit(allocator);
-                for (paths.items) |p| try touched.append(allocator, p);
+                var touched = std.ArrayList([]const u8).init(allocator);
+                defer touched.deinit();
+                for (paths.items) |p| try touched.append(p);
                 if (tool_routing.hasUnmetRequiredEdits(raw_user_request, touched.items) or (multi_step_mutation and tool_calls < 2)) {
                     allocator.free(context_prompt);
                     return .{
@@ -266,7 +266,7 @@ pub fn runModelTurnWithTools(
         tool_calls += 1;
         if (tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |p| {
             if (!utils.containsPath(paths.items, p)) {
-                try paths.append(allocator, p);
+                try paths.append(p);
             } else {
                 allocator.free(p);
             }

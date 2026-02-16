@@ -13,7 +13,7 @@ pub fn executeInlineToolCalls(
     todo_list: *todo.TodoList,
 ) !?[]u8 {
     _ = stdout; // Still needed for printTruncatedCommandOutput
-    var result_buf: std.ArrayList(u8) = .empty;
+    var result_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer result_buf.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, response, '\n');
@@ -41,7 +41,7 @@ pub fn executeInlineToolCalls(
                 }
             }
             if (!found) {
-                try paths.append(allocator, p);
+                try paths.append(p);
             } else {
                 allocator.free(p);
             }

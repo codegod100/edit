@@ -26,7 +26,7 @@ pub fn buildCodexBody(
     messages_json: []const u8,
     tool_defs: ?[]const types.ToolRouteDef,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -36,10 +36,10 @@ pub fn buildCodexBody(
 
     if (parsed.value != .array) return types.QueryError.ModelResponseParseError;
 
-    var instructions: std.ArrayList(u8) = .empty;
+    var instructions: std.ArrayListUnmanaged(u8) = .empty;
     defer instructions.deinit(allocator);
 
-    var input: std.ArrayList(u8) = .empty;
+    var input: std.ArrayListUnmanaged(u8) = .empty;
     defer input.deinit(allocator);
     const w_in = input.writer(allocator);
 
@@ -101,11 +101,11 @@ pub fn buildCodexBody(
 }
 
 pub fn parseCodexStream(allocator: std.mem.Allocator, raw: []const u8) !types.ChatResponse {
-    var out_text: std.ArrayList(u8) = .empty;
+    var out_text: std.ArrayListUnmanaged(u8) = .empty;
     defer out_text.deinit(allocator);
 
     var current_tool_name: ?[]u8 = null;
-    var current_tool_args: std.ArrayList(u8) = .empty;
+    var current_tool_args: std.ArrayListUnmanaged(u8) = .empty;
     defer current_tool_args.deinit(allocator);
 
     var lines = std.mem.splitScalar(u8, raw, '\n');

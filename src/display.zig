@@ -59,7 +59,7 @@ pub fn getSpinnerStateText(buf: []u8) []const u8 {
         5 => "search",
         else => "think",
     };
-    
+
     if (custom_len > 0) {
         // Format: "state: custom_text"
         const fmt = std.fmt.bufPrint(buf, "{s}: {s}", .{ state_name, g_spinner_custom_text[0..custom_len] }) catch state_name;
@@ -134,7 +134,7 @@ pub fn buildToolResultEventLine(
     const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
     const status_symbol = if (std.mem.eql(u8, status, "ok")) "✓" else "✗";
 
-    var out = std.ArrayList(u8).init(allocator);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -295,11 +295,11 @@ pub fn setSpinnerActive(active: bool) void {
 pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
     // Skip redraw if spinner is active to avoid stdout conflicts
     if (g_spinner_active.load(.acquire)) return;
-    
+
     // Lock stdout for atomic redraw
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
-    
+
     // Get terminal dimensions first
     const term_height = getTerminalHeight();
 
@@ -324,7 +324,7 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     // Lock timeline for reading
     g_timeline_mutex.lock();
     defer g_timeline_mutex.unlock();
-    
+
     // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;
     for (g_timeline_entries.items) |entry| {
@@ -391,7 +391,7 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
 
     // Enable blinking block cursor (throbbing effect)
     try stdout.writeAll("\x1b[1 q"); // Blinking block cursor
-    
+
     // Ensure cursor is visible and positioned before returning
     try stdout.writeAll("\x1b[?25h"); // Show cursor
 }
@@ -430,7 +430,7 @@ fn isMarkdownTableSeparatorRow(line: []const u8) bool {
     return seen_dash;
 }
 
-fn renderMarkdownTableRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8, use_color: bool) !bool {
+fn renderMarkdownTableRow(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), line: []const u8, use_color: bool) !bool {
     const trimmed = std.mem.trim(u8, line, " \t");
     if (trimmed.len < 3) return false;
     if (trimmed[0] != '|' and std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
@@ -458,7 +458,7 @@ fn renderMarkdownTableRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
 }
 
 pub fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8, use_color: bool) ![]u8 {
-    var out = std.ArrayList(u8).init(allocator);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     var in_code_block = false;
@@ -523,7 +523,7 @@ pub fn renderMarkdownForTerminal(allocator: std.mem.Allocator, input: []const u8
 
 fn appendInlineMarkdown(
     allocator: std.mem.Allocator,
-    out: *std.ArrayList(u8),
+    out: *std.ArrayListUnmanaged(u8),
     text: []const u8,
     use_color: bool,
 ) !void {

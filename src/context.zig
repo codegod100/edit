@@ -238,7 +238,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         turns: []TurnJson,
     };
 
-    var turns: std.ArrayList(TurnJson) = .empty;
+    var turns: std.ArrayListUnmanaged(TurnJson) = .empty;
     defer turns.deinit(allocator);
     for (window.turns.items) |turn| {
         try turns.append(allocator, .{
@@ -251,7 +251,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     }
 
     const payload = ContextJson{ .summary = window.summary, .turns = turns.items };
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
 
@@ -295,7 +295,7 @@ pub fn compactContextWindow(allocator: std.mem.Allocator, window: *ContextWindow
 }
 
 pub fn buildHeuristicSummary(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize) ![]u8 {
-    var summary_buf: std.ArrayList(u8) = .empty;
+    var summary_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer summary_buf.deinit(allocator);
 
     if (window.summary) |existing| {
@@ -321,7 +321,7 @@ pub fn buildHeuristicSummary(allocator: std.mem.Allocator, window: *const Contex
 }
 
 fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextWindow, compact_count: usize, active: ActiveModel) !?[]u8 {
-    var turns_buf: std.ArrayList(u8) = .empty;
+    var turns_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer turns_buf.deinit(allocator);
     const w = turns_buf.writer(allocator);
     var idx: usize = 0;
@@ -354,7 +354,7 @@ fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextW
 
 pub fn buildRelevantTurnIndices(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8, max_turns: usize) ![]usize {
     const ScoredTurn = struct { idx: usize, score: usize };
-    var scored: std.ArrayList(ScoredTurn) = .empty;
+    var scored: std.ArrayListUnmanaged(ScoredTurn) = .empty;
     defer scored.deinit(allocator);
 
     for (window.turns.items, 0..) |turn, idx| {
@@ -375,7 +375,7 @@ pub fn buildRelevantTurnIndices(allocator: std.mem.Allocator, window: *const Con
     }.lessThan);
 
     const take = @min(max_turns, scored.items.len);
-    var selected: std.ArrayList(usize) = .empty;
+    var selected: std.ArrayListUnmanaged(usize) = .empty;
     defer selected.deinit(allocator);
     var i: usize = 0;
     while (i < take) : (i += 1) {
@@ -387,7 +387,7 @@ pub fn buildRelevantTurnIndices(allocator: std.mem.Allocator, window: *const Con
 }
 
 pub fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 

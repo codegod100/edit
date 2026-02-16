@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_bridge = @import("ai_bridge.zig");
-const pm = @import("provider_manager.zig");
+const pm = @import("provider.zig");
 const store = @import("provider_store.zig");
 
 pub const AuthMethod = enum {

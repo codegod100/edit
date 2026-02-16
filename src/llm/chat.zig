@@ -1,6 +1,6 @@
 const std = @import("std");
 const client = @import("client.zig");
-const providers = @import("providers.zig");
+const provider = @import("../provider.zig");
 const codex = @import("codex.zig");
 const types = @import("types.zig");
 const utils = @import("utils.zig");
@@ -34,12 +34,12 @@ pub fn chat(
     const is_opencode_free = std.mem.eql(u8, provider_id, "opencode") and std.mem.indexOf(u8, model_id, "free") != null;
     const real_key = if (is_opencode_free) (if (api_key.len == 0) "public" else api_key) else api_key;
 
-    if (std.mem.eql(u8, provider_id, "openai") and providers.isLikelyOAuthToken(real_key)) {
+    if (std.mem.eql(u8, provider_id, "openai") and provider.isLikelyOAuthToken(real_key)) {
         return chatCodex(allocator, real_key, model_id, messages_json, tool_defs);
     }
 
     if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        const bearer = try providers.effectiveCopilotBearerToken(allocator, real_key);
+        const bearer = try provider.effectiveCopilotBearerToken(allocator, real_key);
         defer allocator.free(bearer);
 
         const first_try = chatCopilotResponses(allocator, bearer, model_id, messages_json, tool_defs);
@@ -68,7 +68,7 @@ pub fn query(
         return queryAnthropic(allocator, key, model_id, prompt, tool_defs);
     }
 
-    var json_prompt: std.ArrayList(u8) = .empty;
+    var json_prompt: std.ArrayListUnmanaged(u8) = .empty;
     defer json_prompt.deinit(allocator);
     try utils.writeJsonString(json_prompt.writer(allocator), prompt);
     const msgs_safe = try std.fmt.allocPrint(allocator, "[{{\"role\":\"user\",\"content\":\"{s}\"}}]", .{json_prompt.items});
@@ -112,7 +112,7 @@ pub fn inferToolCallWithThinking(
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
     defer allocator.free(auth_value);
 
-    const uri = if (providers.isLikelyOAuthToken(key)) "https://chatgpt.com/backend-api/codex/responses" else "https://api.openai.com/v1/chat/completions";
+    const uri = if (provider.isLikelyOAuthToken(key)) "https://chatgpt.com/backend-api/codex/responses" else "https://api.openai.com/v1/chat/completions";
 
     // Simplification: assume standardized chat body for forcing tools.
     const body = try buildChatBodyForRouting(allocator, model_id, prompt, defs, force_tool);
@@ -150,7 +150,7 @@ fn chatGeneric(
     tool_defs: ?[]const types.ToolRouteDef,
     reasoning_effort: ?[]const u8,
 ) !types.ChatResponse {
-    const config = providers.getProviderConfig(provider_id);
+    const config = provider.getProviderConfig(provider_id);
     const body = try buildChatBody(allocator, model_id, messages_json, tool_defs, reasoning_effort);
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
@@ -161,7 +161,7 @@ fn chatGeneric(
     };
     if (config.user_agent) |ua| headers.user_agent = .{ .override = ua };
 
-    var extra_headers: std.ArrayList(std.http.Header) = .empty;
+    var extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer extra_headers.deinit(allocator);
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
@@ -169,7 +169,7 @@ fn chatGeneric(
     const raw = try client.httpRequest(allocator, .POST, config.endpoint, headers, extra_headers.items, body);
     defer allocator.free(raw);
     allocator.free(body); // Free request body after use
-    
+
     if (raw.len == 0) {
         std.log.err("Empty response from {s}", .{config.endpoint});
         return types.QueryError.ModelProviderError;
@@ -224,10 +224,10 @@ fn chatCopilotResponses(
         .authorization = .{ .override = auth_value },
         .content_type = .{ .override = "application/json" },
     };
-    var extra: std.ArrayList(std.http.Header) = .empty;
+    var extra: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer extra.deinit(allocator);
     try extra.append(allocator, .{ .name = "accept", .value = "text/event-stream" });
-    try providers.appendCopilotHeaders(allocator, &extra);
+    try provider.appendCopilotHeaders(allocator, &extra);
 
     const raw = try client.httpRequest(
         allocator,
@@ -249,7 +249,7 @@ fn buildChatBody(
     tool_defs: ?[]const types.ToolRouteDef,
     reasoning_effort: ?[]const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -280,7 +280,7 @@ fn buildChatBodyForRouting(
     defs: []const types.ToolRouteDef,
     force: bool,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
@@ -354,7 +354,7 @@ fn parseChatResponse(allocator: std.mem.Allocator, raw: []const u8) !types.ChatR
             var tool_calls: []types.ToolCall = &.{};
 
             // Parse tool calls first
-            var tools: std.ArrayList(types.ToolCall) = .empty;
+            var tools: std.ArrayListUnmanaged(types.ToolCall) = .empty;
             defer {
                 // If we error before moving to result, cleanup tools
                 if (tool_calls.len == 0) {
@@ -436,7 +436,7 @@ fn extractThinking(allocator: std.mem.Allocator, raw: []const u8) !?[]const u8 {
 fn queryAnthropic(allocator: std.mem.Allocator, api_key: []const u8, model_id: []const u8, prompt: []const u8, tool_defs: ?[]const types.ToolRouteDef) ![]u8 {
     _ = tool_defs; // Not supported
 
-    var prompt_esc: std.ArrayList(u8) = .empty;
+    var prompt_esc: std.ArrayListUnmanaged(u8) = .empty;
     defer prompt_esc.deinit(allocator);
     try utils.writeJsonString(prompt_esc.writer(allocator), prompt);
 

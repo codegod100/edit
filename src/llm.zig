@@ -4,7 +4,7 @@ pub const client = @import("llm/client.zig");
 pub const types = @import("llm/types.zig");
 pub const chat_module = @import("llm/chat.zig");
 pub const models_module = @import("llm/models.zig");
-pub const providers = @import("llm/providers.zig");
+pub const provider = @import("provider.zig");
 
 // Re-export types
 pub const ToolRouteDef = types.ToolRouteDef;
@@ -22,4 +22,4 @@ pub const inferToolCallWithThinking = chat_module.inferToolCallWithThinking;
 pub const getLastProviderError = chat_module.getLastProviderError;
 pub const fetchModelIDs = models_module.fetchModelIDs;
 pub const freeModelIDs = models_module.freeModelIDs;
-pub const getProviderConfig = providers.getProviderConfig;
+pub const getProviderConfig = provider.getProviderConfig;

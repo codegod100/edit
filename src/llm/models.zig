@@ -1,6 +1,6 @@
 const std = @import("std");
 const client = @import("client.zig");
-const providers = @import("providers.zig");
+const provider = @import("../provider.zig");
 const types = @import("types.zig");
 
 pub fn fetchModelIDs(
@@ -9,18 +9,18 @@ pub fn fetchModelIDs(
     provider_id: []const u8,
 ) ![][]u8 {
     const effective_key = if (std.mem.eql(u8, provider_id, "github-copilot"))
-        try providers.effectiveCopilotBearerToken(allocator, api_key)
+        try provider.effectiveCopilotBearerToken(allocator, api_key)
     else
         try allocator.dupe(u8, api_key);
     defer allocator.free(effective_key);
 
-    const use_codex_models = std.mem.eql(u8, provider_id, "openai") and providers.isLikelyOAuthToken(api_key);
+    const use_codex_models = std.mem.eql(u8, provider_id, "openai") and provider.isLikelyOAuthToken(api_key);
     const endpoint = if (use_codex_models)
         "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
     else
-        providers.getModelsEndpoint(provider_id) orelse return types.QueryError.UnsupportedProvider;
+        provider.getModelsEndpoint(provider_id) orelse return types.QueryError.UnsupportedProvider;
 
-    const config = providers.getProviderConfig(provider_id);
+    const config = provider.getProviderConfig(provider_id);
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);
 
@@ -30,12 +30,12 @@ pub fn fetchModelIDs(
     };
     if (config.user_agent) |ua| headers.user_agent = .{ .override = ua };
 
-    var extra_headers: std.ArrayList(std.http.Header) = .empty;
+    var extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer extra_headers.deinit(allocator);
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
     if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        try providers.appendCopilotHeaders(allocator, &extra_headers);
+        try provider.appendCopilotHeaders(allocator, &extra_headers);
     }
 
     const raw = try client.httpRequest(allocator, .GET, endpoint, headers, extra_headers.items, null);
@@ -46,7 +46,7 @@ pub fn fetchModelIDs(
 
     if (parsed.value != .object) return types.QueryError.ModelResponseParseError;
 
-    var out: std.ArrayList([]u8) = .empty;
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (out.items) |s| allocator.free(s);
         out.deinit(allocator);

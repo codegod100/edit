@@ -30,10 +30,9 @@ pub fn main() !void {
 test {
     _ = @import("config_store.zig");
     _ = @import("llm.zig");
-    _ = @import("models_catalog.zig");
+    _ = @import("provider.zig");
     _ = @import("skills.zig");
     _ = @import("repl/main.zig");
-    _ = @import("provider_manager.zig");
     _ = @import("provider_store.zig");
     _ = @import("logger.zig");
     _ = @import("ai_bridge.zig");

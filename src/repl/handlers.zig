@@ -3,7 +3,7 @@ const state_mod = @import("state.zig");
 const commands = @import("commands.zig");
 const ui = @import("ui.zig");
 const auth = @import("../auth.zig");
-const pm = @import("../provider_manager.zig");
+const provider = @import("../provider.zig");
 const store = @import("../provider_store.zig");
 const config_store = @import("../config_store.zig");
 const skills = @import("../skills.zig");
@@ -14,13 +14,13 @@ const utils = @import("../utils.zig");
 const context = @import("../context.zig");
 
 // Helper to format providers output
-fn formatProvidersOutput(allocator: std.mem.Allocator, providers: []const pm.ProviderSpec, states: []const pm.ProviderState) ![]u8 {
+fn formatProvidersOutput(allocator: std.mem.Allocator, provider_specs: []const provider.ProviderSpec, states: []const provider.ProviderState) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     const w = out.writer(allocator);
 
     try w.print("Providers:\n", .{});
-    for (providers) |p| {
+    for (provider_specs) |p| {
         const state = model_select.findConnectedProvider(states, p.id);
         const status = if (state != null) "connected" else "not connected";
         try w.print("- {s} ({s}) [{s}]\n", .{ p.display_name, p.id, status });
@@ -110,15 +110,15 @@ pub fn handleCommand(
                 if (arg.len > 0) try stdout.print("Unknown provider: {s}\n", .{arg});
                 return true;
             }
-            const provider = chosen.?;
+            const spec = chosen.?;
 
-            if (provider.env_vars.len == 0) {
-                try stdout.print("Provider {s} has no API key env mapping.\n", .{provider.id});
+            if (spec.env_vars.len == 0) {
+                try stdout.print("Provider {s} has no API key env mapping.\n", .{spec.id});
                 return true;
             }
 
             var method: auth.AuthMethod = .api;
-            if (auth.supportsSubscription(provider.id)) {
+            if (auth.supportsSubscription(spec.id)) {
                 const method_opt = try ui.promptLine(allocator, stdin, stdout, "Auth method [api/subscription] (default api): ");
                 if (method_opt) |raw| {
                     defer allocator.free(raw);
@@ -126,13 +126,13 @@ pub fn handleCommand(
                 }
             }
 
-            const env_name = provider.env_vars[0];
+            const env_name = spec.env_vars[0];
             var key_slice: []const u8 = "";
             var owned_key: ?[]u8 = null;
             defer if (owned_key) |k| allocator.free(k);
 
             if (method == .subscription) {
-                const sub_key = try auth.connectSubscription(allocator, stdin, stdout, provider.id, ui.promptLine);
+                const sub_key = try auth.connectSubscription(allocator, stdin, stdout, spec.id, ui.promptLine);
                 if (sub_key == null) return true;
                 owned_key = sub_key.?;
                 key_slice = owned_key.?;
@@ -155,13 +155,12 @@ pub fn handleCommand(
             }
 
             try store.upsertFile(allocator, state.config_dir, env_name, key_slice);
-            try stdout.print("Stored {s} in {s}/providers.env\n", .{ env_name, state.config_dir });
+            try stdout.print("Stored {s} in {s}/provider.env\n", .{ env_name, state.config_dir });
 
             // Reload provider states
             // We need to reload stored_pairs first.
             const new_stored = try store.load(allocator, state.config_dir);
             // We need to free old states? ReplState owns them?
-            for (state.provider_states) |*s| s.deinit(allocator);
             allocator.free(state.provider_states);
 
             // We leak the old stored pairs if we don't track them.

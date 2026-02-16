@@ -129,7 +129,7 @@ fn parseContent(allocator: std.mem.Allocator, content: []const u8) ![]StoredPair
 }
 
 fn storePathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ base_path, "providers.env" });
+    return std.fs.path.join(allocator, &.{ base_path, "provider.env" });
 }
 
 test "upsert file stores and updates provider key" {

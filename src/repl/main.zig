@@ -5,7 +5,7 @@ const handlers = @import("handlers.zig");
 const commands = @import("commands.zig");
 const ui = @import("ui.zig");
 const auth = @import("../auth.zig");
-const pm = @import("../provider_manager.zig");
+const provider = @import("../provider.zig");
 const store = @import("../provider_store.zig");
 const config_store = @import("../config_store.zig");
 const skills = @import("../skills.zig");
@@ -13,7 +13,6 @@ const tools = @import("../tools.zig");
 const context = @import("../context.zig");
 const model_loop = @import("../model_loop.zig");
 const model_select = @import("../model_select.zig");
-const catalog = @import("../models_catalog.zig");
 
 const todo = @import("../todo.zig");
 const display = @import("../display.zig");
@@ -102,7 +101,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
     try std.fs.cwd().makePath(config_dir);
 
     // Load initial data
-    const providers = try catalog.loadProviderSpecs(provider_alloc, config_dir);
+    const provider_specs = try provider.loadProviderSpecs(provider_alloc);
     // Providers are static configuration, but we might want them in state.
     // Spec says []const ProviderSpec. We can keep it.
 
@@ -139,12 +138,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
         }
     }
 
-    const provider_states = try model_select.resolveProviderStates(allocator, providers, stored_pairs);
+    const provider_states = try model_select.resolveProviderStates(allocator, provider_specs, stored_pairs);
 
     // Initialize State
     var state = state_mod.ReplState{
         .allocator = allocator,
-        .providers = providers,
+        .providers = provider_specs,
         .provider_states = provider_states,
         .selected_model = null,
         .context_window = context.ContextWindow.init(32000, 20),

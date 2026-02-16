@@ -82,7 +82,7 @@ fn tryRequest(
 
     var allocating_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
 
-    var all_headers: std.ArrayList(std.http.Header) = .empty;
+    var all_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer all_headers.deinit(allocator);
     try all_headers.ensureTotalCapacity(allocator, extra_headers.len + 1);
 
@@ -123,9 +123,6 @@ fn tryRequest(
             }
         },
     }
-
-    // Sync the ArrayList with the writer's final state
-    out = allocating_writer.toArrayList();
 
     if (out.items.len == 0) {
         return error.EmptyResponse;

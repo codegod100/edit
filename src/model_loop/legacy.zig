@@ -56,15 +56,50 @@ fn unescapeJsonString(buf: []u8, input: []const u8) []const u8 {
         if (input[in_idx] == '\\' and in_idx + 1 < input.len) {
             const next = input[in_idx + 1];
             switch (next) {
-                'n' => { buf[out_idx] = '\n'; out_idx += 1; in_idx += 1; },
-                'r' => { buf[out_idx] = '\r'; out_idx += 1; in_idx += 1; },
-                't' => { buf[out_idx] = '\t'; out_idx += 1; in_idx += 1; },
-                '\\' => { buf[out_idx] = '\\'; out_idx += 1; in_idx += 1; },
-                '"' => { buf[out_idx] = '"'; out_idx += 1; in_idx += 1; },
-                'b' => { buf[out_idx] = 0x08; out_idx += 1; in_idx += 1; },
-                'f' => { buf[out_idx] = 0x0c; out_idx += 1; in_idx += 1; },
-                '/' => { buf[out_idx] = '/'; out_idx += 1; in_idx += 1; },
-                else => { buf[out_idx] = input[in_idx]; out_idx += 1; },
+                'n' => {
+                    buf[out_idx] = '\n';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                'r' => {
+                    buf[out_idx] = '\r';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                't' => {
+                    buf[out_idx] = '\t';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                '\\' => {
+                    buf[out_idx] = '\\';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                '"' => {
+                    buf[out_idx] = '"';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                'b' => {
+                    buf[out_idx] = 0x08;
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                'f' => {
+                    buf[out_idx] = 0x0c;
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                '/' => {
+                    buf[out_idx] = '/';
+                    out_idx += 1;
+                    in_idx += 1;
+                },
+                else => {
+                    buf[out_idx] = input[in_idx];
+                    out_idx += 1;
+                },
             }
         } else {
             buf[out_idx] = input[in_idx];
@@ -95,11 +130,11 @@ pub fn runModel(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
 
-    var paths: std.ArrayList([]u8) = .empty;
+    var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
     // Note: paths items are allocated from arena, so no need to free individually
 
-    var w: std.ArrayList(u8) = .empty;
+    var w: std.ArrayListUnmanaged(u8) = .empty;
     defer w.deinit(arena_alloc);
 
     const system_prompt = custom_system_prompt orelse "You are a helpful assistant with access to tools. Use the provided tool interface for any file operations, searching, or bash commands. Prefer bash+rg before reading files unless the user gave an explicit path. Read using explicit offset+limit. Avoid repeating identical tool calls. Finish by calling respond_text. For complex multi-step tasks, use todo_add to create a plan and todo_update to track progress.";
@@ -176,7 +211,9 @@ pub fn runModel(
         if (response.tool_calls.len == 0) {
             no_tool_retries += 1;
             if (no_tool_retries <= 2) {
-                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":",
+                try w.appendSlice(
+                    arena_alloc,
+                    ",{\"role\":\"user\",\"content\":",
                 );
                 if (no_tool_retries == 1) {
                     try w.writer(arena_alloc).print(
@@ -261,8 +298,6 @@ pub fn runModel(
             }
 
             tool_calls += 1;
-
-
 
             if (std.mem.eql(u8, tc.tool, "subagent_spawn")) {
                 // Subagent support removed - return error

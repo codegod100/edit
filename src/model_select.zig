@@ -1,5 +1,5 @@
 const std = @import("std");
-const pm = @import("provider_manager.zig");
+const provider = @import("provider.zig");
 const store = @import("provider_store.zig");
 const ai_bridge = @import("ai_bridge.zig");
 const utils = @import("utils.zig");
@@ -27,7 +27,7 @@ pub const ModelOption = struct {
     display_name: []const u8,
 };
 
-pub fn defaultProviderSpecs() []const pm.ProviderSpec {
+pub fn defaultProviderSpecs() []const provider.ProviderSpec {
     return &.{
         .{
             .id = "anthropic",
@@ -79,18 +79,18 @@ pub fn defaultProviderSpecs() []const pm.ProviderSpec {
 
 pub fn envPairsForProviders(
     allocator: std.mem.Allocator,
-    providers: []const pm.ProviderSpec,
+    providers: []const provider.ProviderSpec,
     stored: []const store.StoredPair,
-) ![]pm.EnvPair {
-    var out = try std.ArrayListUnmanaged(pm.EnvPair).initCapacity(allocator, 0);
+) ![]provider.EnvPair {
+    var out = try std.ArrayListUnmanaged(provider.EnvPair).initCapacity(allocator, 0);
     errdefer out.deinit(allocator);
 
-    for (providers) |provider| {
+    for (providers) |p| {
         // Always include opencode even without API key (free tier uses "public")
-        const is_opencode = std.mem.eql(u8, provider.id, "opencode");
+        const is_opencode = std.mem.eql(u8, p.id, "opencode");
         var found_any = false;
 
-        for (provider.env_vars) |name| {
+        for (p.env_vars) |name| {
             for (stored) |pair| {
                 if (std.mem.eql(u8, pair.name, name)) {
                     try out.append(allocator, .{ .name = pair.name, .value = pair.value });
@@ -103,8 +103,8 @@ pub fn envPairsForProviders(
         }
 
         // For opencode, add a placeholder if no key found so it passes through
-        if (is_opencode and !found_any and provider.env_vars.len > 0) {
-            try out.append(allocator, .{ .name = provider.env_vars[0], .value = "" });
+        if (is_opencode and !found_any and p.env_vars.len > 0) {
+            try out.append(allocator, .{ .name = p.env_vars[0], .value = "" });
         }
     }
 
@@ -113,100 +113,100 @@ pub fn envPairsForProviders(
 
 pub fn resolveProviderStates(
     allocator: std.mem.Allocator,
-    providers: []const pm.ProviderSpec,
+    providers: []const provider.ProviderSpec,
     stored: []const store.StoredPair,
-) ![]pm.ProviderState {
+) ![]provider.ProviderState {
     const env_pairs = try envPairsForProviders(allocator, providers, stored);
     defer allocator.free(env_pairs);
-    return pm.ProviderManager.resolve(allocator, providers, env_pairs, .{});
+    return provider.resolveProviderStates(allocator, providers, env_pairs, .{});
 }
 
-pub fn isConnected(provider_id: []const u8, connected: []const pm.ProviderState) bool {
+pub fn isConnected(provider_id: []const u8, connected: []const provider.ProviderState) bool {
     for (connected) |item| {
         if (std.mem.eql(u8, item.id, provider_id)) return true;
     }
     return false;
 }
 
-pub fn findConnectedProvider(connected: []const pm.ProviderState, provider_id: []const u8) ?pm.ProviderState {
-    for (connected) |provider| {
-        if (std.mem.eql(u8, provider.id, provider_id)) return provider;
+pub fn findConnectedProvider(connected: []const provider.ProviderState, provider_id: []const u8) ?provider.ProviderState {
+    for (connected) |state| {
+        if (std.mem.eql(u8, state.id, provider_id)) return state;
     }
     return null;
 }
 
-pub fn findProviderSpecByID(providers: []const pm.ProviderSpec, provider_id: []const u8) ?pm.ProviderSpec {
-    for (providers) |provider| {
-        if (std.mem.eql(u8, provider.id, provider_id)) return provider;
+pub fn findProviderSpecByID(providers: []const provider.ProviderSpec, provider_id: []const u8) ?provider.ProviderSpec {
+    for (providers) |spec| {
+        if (std.mem.eql(u8, spec.id, provider_id)) return spec;
     }
     return null;
 }
 
-pub fn providerHasModel(providers: []const pm.ProviderSpec, provider_id: []const u8, model_id: []const u8) bool {
+pub fn providerHasModel(providers: []const provider.ProviderSpec, provider_id: []const u8, model_id: []const u8) bool {
     // OpenRouter is an aggregator and its model catalog changes frequently; don't hard-fail on
     // stale local catalogs. `/model` already does an optional live check for OpenRouter.
     if (std.mem.eql(u8, provider_id, "openrouter")) return true;
-    const provider = findProviderSpecByID(providers, provider_id) orelse return false;
-    for (provider.models) |model| {
+    const spec = findProviderSpecByID(providers, provider_id) orelse return false;
+    for (spec.models) |model| {
         if (std.mem.eql(u8, model.id, model_id)) return true;
     }
     return false;
 }
 
-pub fn chooseDefaultModelForConnected(provider: pm.ProviderState) ?[]const u8 {
-    if (std.mem.eql(u8, provider.id, "openai") and provider.key != null and auth.isLikelyOAuthToken(provider.key.?)) {
+pub fn chooseDefaultModelForConnected(state: provider.ProviderState) ?[]const u8 {
+    if (std.mem.eql(u8, state.id, "openai") and state.key != null and auth.isLikelyOAuthToken(state.key.?)) {
         // Subscription/OAuth token uses the Codex backend: default to a Codex model.
         var best: ?[]const u8 = null;
-        for (provider.models) |m| {
+        for (state.models) |m| {
             if (!utils.isCodexModelId(m.id)) continue;
             // Prefer newer/larger by simple lexical bias, falling back to first match.
             if (best == null) best = m.id else if (std.mem.lessThan(u8, best.?, m.id)) best = m.id;
         }
         if (best) |b| return b;
         // No codex model found - return first available model for OAuth fallback
-        if (provider.models.len > 0) return provider.models[0].id;
+        if (state.models.len > 0) return state.models[0].id;
         return null;
     }
-    return pm.ProviderManager.defaultModelIDForProvider(provider.id, provider.models);
+    return provider.defaultModelIDForProvider(state.id, state.models);
 }
 
 const config_store = @import("config_store.zig");
 
 pub fn chooseActiveModel(
-    providers: []const pm.ProviderSpec,
-    connected: []const pm.ProviderState,
+    providers: []const provider.ProviderSpec,
+    connected: []const provider.ProviderState,
     selected: ?config_store.SelectedModel,
     reasoning_effort: ?[]const u8,
 ) ?context.ActiveModel {
     if (selected) |sel| {
-        const provider = findConnectedProvider(connected, sel.provider_id);
+        const state = findConnectedProvider(connected, sel.provider_id);
         if (!providerHasModel(providers, sel.provider_id, sel.model_id)) return null;
-        if (std.mem.eql(u8, sel.provider_id, "openai") and provider != null and provider.?.key != null and auth.isLikelyOAuthToken(provider.?.key.?)) {
+        if (std.mem.eql(u8, sel.provider_id, "openai") and state != null and state.?.key != null and auth.isLikelyOAuthToken(state.?.key.?)) {
             if (!utils.isCodexModelId(sel.model_id)) return null;
         }
         return .{
             .provider_id = sel.provider_id,
             .model_id = sel.model_id,
-            .api_key = if (provider) |p| p.key else null,
+            .api_key = if (state) |p| p.key else null,
             .reasoning_effort = reasoning_effort,
         };
     }
 
     if (connected.len == 0) return null;
-    const provider = connected[0];
-    const default_model = chooseDefaultModelForConnected(provider) orelse return null;
+    const state = connected[0];
+    const default_model = chooseDefaultModelForConnected(state) orelse return null;
     return .{
-        .provider_id = provider.id,
+        .provider_id = state.id,
         .model_id = default_model,
-        .api_key = provider.key,
+        .api_key = state.key,
         .reasoning_effort = reasoning_effort,
     };
 }
 
 pub fn collectModelOptions(
     allocator: std.mem.Allocator,
-    providers: []const pm.ProviderSpec,
-    connected: []const pm.ProviderState,
+    providers: []const provider.ProviderSpec,
+    connected: []const provider.ProviderState,
     only_provider_id: ?[]const u8,
 ) ![]ModelOption {
     var out = try std.ArrayListUnmanaged(ModelOption).initCapacity(allocator, 0);
@@ -318,7 +318,7 @@ pub fn autoPickSingleModel(options: []const ModelOption) ?ModelOption {
     return if (options.len == 1) options[0] else null;
 }
 
-pub fn resolveModelPick(models: []const pm.Model, pick: []const u8) ?pm.Model {
+pub fn resolveModelPick(models: []const provider.Model, pick: []const u8) ?provider.Model {
     const n = std.fmt.parseInt(usize, pick, 10) catch null;
     if (n) |idx| {
         if (idx > 0 and idx <= models.len) return models[idx - 1];
@@ -378,14 +378,14 @@ pub fn chooseProvider(
     allocator: std.mem.Allocator,
     stdin: anytype,
     stdout: anytype,
-    providers: []const pm.ProviderSpec,
-    connected: []const pm.ProviderState,
+    provider_specs: []const provider.ProviderSpec,
+    connected: []const provider.ProviderState,
     promptLineFn: *const fn (std.mem.Allocator, anytype, anytype, []const u8) anyerror!?[]u8,
-) !?pm.ProviderSpec {
+) !?provider.ProviderSpec {
     try stdout.print("Connect a provider:\n", .{});
-    for (providers, 0..) |provider, idx| {
-        const status = if (isConnected(provider.id, connected)) "connected" else "not connected";
-        try stdout.print("  {d}) {s} [{s}]\n", .{ idx + 1, provider.display_name, status });
+    for (provider_specs, 0..) |p, idx| {
+        const status = if (isConnected(p.id, connected)) "connected" else "not connected";
+        try stdout.print("  {d}) {s} [{s}]\n", .{ idx + 1, p.display_name, status });
     }
     const choice_opt = try promptLineFn(allocator, stdin, stdout, "Provider number or id: ");
     if (choice_opt == null) return null;
@@ -395,13 +395,13 @@ pub fn chooseProvider(
 
     const parsed_num = std.fmt.parseInt(usize, choice, 10) catch null;
     if (parsed_num) |n| {
-        if (n > 0 and n <= providers.len) {
-            return providers[n - 1];
+        if (n > 0 and n <= provider_specs.len) {
+            return provider_specs[n - 1];
         }
     }
 
-    for (providers) |provider| {
-        if (std.mem.eql(u8, provider.id, choice)) return provider;
+    for (provider_specs) |p| {
+        if (std.mem.eql(u8, p.id, choice)) return p;
     }
 
     try stdout.print("Unknown provider: {s}\n", .{choice});
