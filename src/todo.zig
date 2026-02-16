@@ -17,11 +17,13 @@ pub const TodoItem = struct {
 pub const TodoList = struct {
     items: std.ArrayListUnmanaged(TodoItem),
     allocator: std.mem.Allocator,
+    next_seq: usize,
 
     pub fn init(allocator: std.mem.Allocator) TodoList {
         return .{
             .items = std.ArrayListUnmanaged(TodoItem).empty,
             .allocator = allocator,
+            .next_seq = 0,
         };
     }
 
@@ -34,15 +36,9 @@ pub const TodoList = struct {
     }
 
     pub fn add(self: *TodoList, description: []const u8) ![]const u8 {
-        // Check for duplicates
-        for (self.items.items) |item| {
-            if (std.mem.eql(u8, item.description, description) and item.status != .done) {
-                return item.id; // Return existing todo ID
-            }
-        }
-
         const timestamp = std.time.milliTimestamp();
-        const id = try std.fmt.allocPrint(self.allocator, "{d}", .{timestamp});
+        const id = try std.fmt.allocPrint(self.allocator, "{d}_{d}", .{ timestamp, self.next_seq });
+        self.next_seq += 1;
 
         const desc = try self.allocator.dupe(u8, description);
 
@@ -236,6 +232,12 @@ pub const TodoList = struct {
             const status = std.meta.stringToEnum(TodoStatus, item_json.status) orelse .pending;
             const id = try self.allocator.dupe(u8, item_json.id);
             const desc = try self.allocator.dupe(u8, item_json.description);
+
+            // Try to recover next_seq from loaded IDs
+            if (std.mem.lastIndexOfScalar(u8, item_json.id, '_')) |idx| {
+                const seq = std.fmt.parseInt(usize, item_json.id[idx + 1 ..], 10) catch 0;
+                if (seq >= self.next_seq) self.next_seq = seq + 1;
+            }
 
             const item = TodoItem{
                 .id = id,
