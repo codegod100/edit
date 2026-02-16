@@ -272,11 +272,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // Add user input to timeline and redraw
-        display.addTimelineEntry("{s}>>{s} {s}", .{ display.C_CYAN, display.C_RESET, line });
-        try display.clearScreenAndRedrawTimeline(stdout, prompt);
-        // Small delay to ensure screen is rendered before spinner starts
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        // Add user input to timeline (redraw later)
+        display.addTimelineEntry("{s}>>{s} {s}\n", .{ display.C_CYAN, display.C_RESET, line });
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
@@ -311,8 +308,8 @@ pub fn run(allocator: std.mem.Allocator) !void {
             ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {
             stopSpinner();
-            display.addTimelineEntry("{s}Error:{s} {s}", .{ display.C_RED, display.C_RESET, @errorName(err) });
-            try display.clearScreenAndRedrawTimeline(stdout, prompt);
+            display.addTimelineEntry("{s}Error:{s} {s}\n", .{ display.C_RED, display.C_RESET, @errorName(err) });
+            // Error already in timeline, continue loop to redraw at end
             continue;
         };
 
