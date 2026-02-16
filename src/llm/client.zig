@@ -107,28 +107,19 @@ fn tryRequest(
         return mapError(err);
     };
 
-    // Check status code
-    switch (result.status) {
-        .ok, .created, .accepted, .no_content => {},
-        .unauthorized => return error.AuthenticationError,
-        .forbidden => return error.Forbidden,
-        .too_many_requests => return error.RateLimited,
-        .bad_request => return error.BadRequest,
-        .internal_server_error, .bad_gateway, .service_unavailable => return error.ServerError,
-        else => {
-            if (@intFromEnum(result.status) >= 500) {
-                return error.ServerError;
-            } else if (@intFromEnum(result.status) >= 400) {
-                return error.BadRequest;
-            }
-        },
+    if (result.status != .ok) {
+        if (result.status == .unauthorized) return error.AuthenticationError;
+        if (result.status == .too_many_requests) return error.RateLimited;
+        if (@intFromEnum(result.status) >= 500) return error.ServerError;
+        return error.BadRequest;
     }
 
-    if (out.items.len == 0) {
+    const body = allocating_writer.written();
+    if (body.len == 0) {
         return error.EmptyResponse;
     }
 
-    return out.toOwnedSlice(allocator);
+    return allocator.dupe(u8, body);
 }
 
 fn mapError(err: anyerror) anyerror {

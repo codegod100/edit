@@ -62,8 +62,10 @@ fn logInternal(level: LogLevel, comptime fmt: []const u8, args: anytype) void {
     var ts_buf: [32]u8 = undefined;
     const ts = timestamp(&ts_buf) catch "UNKNOWN";
 
-    // Log to stderr
-    std.debug.print("[{s}] {s}: " ++ fmt ++ "\n", .{ ts, level_str } ++ args);
+    // Log to stderr only if no log file is open
+    if (log_file == null) {
+        std.debug.print("[{s}] {s}: " ++ fmt ++ "\n", .{ ts, level_str } ++ args);
+    }
 
     // Log to file if available
     if (log_file) |f| {

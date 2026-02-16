@@ -15,12 +15,12 @@ pub fn fetchModelIDs(
     defer allocator.free(effective_key);
 
     const use_codex_models = std.mem.eql(u8, provider_id, "openai") and provider.isLikelyOAuthToken(api_key);
+    const config = provider.getProviderConfig(provider_id);
     const endpoint = if (use_codex_models)
         "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
     else
-        provider.getModelsEndpoint(provider_id) orelse return types.QueryError.UnsupportedProvider;
+        config.models_endpoint orelse return types.QueryError.UnsupportedProvider;
 
-    const config = provider.getProviderConfig(provider_id);
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);
 

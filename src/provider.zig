@@ -37,6 +37,7 @@ pub const Options = struct {
 
 pub const ProviderConfig = struct {
     endpoint: []const u8,
+    models_endpoint: ?[]const u8,
     referer: ?[]const u8,
     title: ?[]const u8,
     user_agent: ?[]const u8,
@@ -47,7 +48,49 @@ pub const ProviderConfig = struct {
 // ============================================================
 
 pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
-    var specs = try std.ArrayListUnmanaged(ProviderSpec).initCapacity(allocator, 3);
+    var specs = try std.ArrayListUnmanaged(ProviderSpec).initCapacity(allocator, 5);
+
+    // OpenAI
+    {
+        const id = try allocator.dupe(u8, "openai");
+        const display_name = try allocator.dupe(u8, "OpenAI");
+        const env_vars = try allocator.alloc([]const u8, 1);
+        env_vars[0] = try allocator.dupe(u8, "OPENAI_API_KEY");
+        const models = try allocator.alloc(Model, 2);
+        models[0] = .{
+            .id = try allocator.dupe(u8, "gpt-4o"),
+            .display_name = try allocator.dupe(u8, "GPT-4o"),
+        };
+        models[1] = .{
+            .id = try allocator.dupe(u8, "o3-mini"),
+            .display_name = try allocator.dupe(u8, "o3-mini"),
+        };
+        try specs.append(allocator, .{
+            .id = id,
+            .display_name = display_name,
+            .env_vars = env_vars,
+            .models = models,
+        });
+    }
+
+    // OpenCode
+    {
+        const id = try allocator.dupe(u8, "opencode");
+        const display_name = try allocator.dupe(u8, "OpenCode");
+        const env_vars = try allocator.alloc([]const u8, 1);
+        env_vars[0] = try allocator.dupe(u8, "OPENCODE_API_KEY");
+        const models = try allocator.alloc(Model, 1);
+        models[0] = .{
+            .id = try allocator.dupe(u8, "kimi-k2.5"),
+            .display_name = try allocator.dupe(u8, "Kimi K2.5"),
+        };
+        try specs.append(allocator, .{
+            .id = id,
+            .display_name = display_name,
+            .env_vars = env_vars,
+            .models = models,
+        });
+    }
 
     // OpenRouter
     {
@@ -55,7 +98,7 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
         const display_name = try allocator.dupe(u8, "OpenRouter");
         const env_vars = try allocator.alloc([]const u8, 1);
         env_vars[0] = try allocator.dupe(u8, "OPENROUTER_API_KEY");
-        const models = try allocator.alloc(Model, 2);
+        const models = try allocator.alloc(Model, 5);
         models[0] = .{
             .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.5-sonnet"),
             .display_name = try allocator.dupe(u8, "Claude 3.5 Sonnet"),
@@ -63,6 +106,18 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
         models[1] = .{
             .id = try allocator.dupe(u8, "openrouter/anthropic/claude-3.7-sonnet"),
             .display_name = try allocator.dupe(u8, "Claude 3.7 Sonnet"),
+        };
+        models[2] = .{
+            .id = try allocator.dupe(u8, "deepseek/deepseek-chat"),
+            .display_name = try allocator.dupe(u8, "DeepSeek V3"),
+        };
+        models[3] = .{
+            .id = try allocator.dupe(u8, "deepseek/deepseek-r1"),
+            .display_name = try allocator.dupe(u8, "DeepSeek R1"),
+        };
+        models[4] = .{
+            .id = try allocator.dupe(u8, "x-ai/grok-4.1-fast"),
+            .display_name = try allocator.dupe(u8, "Grok 4.1 Fast"),
         };
         try specs.append(allocator, .{
             .id = id,
@@ -123,21 +178,45 @@ pub fn loadProviderSpecs(allocator: std.mem.Allocator) ![]ProviderSpec {
 
 pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
     if (std.mem.eql(u8, provider_id, "openrouter")) {
-        return .{ .endpoint = "https://openrouter.ai/api/v1/chat/completions", .referer = "https://zagent.local/", .title = "zagent", .user_agent = null };
+        return .{
+            .endpoint = "https://openrouter.ai/api/v1/chat/completions",
+            .models_endpoint = "https://openrouter.ai/api/v1/models",
+            .referer = "https://zagent.local/",
+            .title = "zagent",
+            .user_agent = null,
+        };
     } else if (std.mem.eql(u8, provider_id, "github-copilot")) {
-        return .{ .endpoint = "https://api.githubcopilot.com/chat/completions", .referer = null, .title = null, .user_agent = "zagent/0.1" };
+        return .{
+            .endpoint = "https://api.githubcopilot.com/chat/completions",
+            .models_endpoint = "https://api.githubcopilot.com/models",
+            .referer = null,
+            .title = null,
+            .user_agent = "zagent/0.1",
+        };
     } else if (std.mem.eql(u8, provider_id, "zai")) {
-        return .{ .endpoint = "https://api.z.ai/api/coding/paas/v4", .referer = "https://z.ai/", .title = "zagent", .user_agent = null };
+        return .{
+            .endpoint = "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            .models_endpoint = "https://api.z.ai/api/coding/paas/v4/models",
+            .referer = "https://z.ai/",
+            .title = "zagent",
+            .user_agent = "zagent/0.1",
+        };
+    } else if (std.mem.eql(u8, provider_id, "opencode")) {
+        return .{
+            .endpoint = "https://opencode.ai/zen/v1/chat/completions",
+            .models_endpoint = "https://opencode.ai/zen/v1/models",
+            .referer = "https://opencode.ai/",
+            .title = "opencode",
+            .user_agent = "opencode/0.1.0 (linux; x86_64)",
+        };
     }
-    return .{ .endpoint = "https://api.openai.com/v1/chat/completions", .referer = null, .title = null, .user_agent = null };
-}
-
-pub fn getModelsEndpoint(provider_id: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, provider_id, "openai")) return "https://api.openai.com/v1/models";
-    if (std.mem.eql(u8, provider_id, "github-copilot")) return "https://api.githubcopilot.com/models";
-    if (std.mem.eql(u8, provider_id, "openrouter")) return "https://openrouter.ai/api/v1/models";
-    if (std.mem.eql(u8, provider_id, "zai")) return "https://api.z.ai/api/coding/paas/v4";
-    return null;
+    return .{
+        .endpoint = "https://api.openai.com/v1/chat/completions",
+        .models_endpoint = "https://api.openai.com/v1/models",
+        .referer = null,
+        .title = null,
+        .user_agent = null,
+    };
 }
 
 // ============================================================

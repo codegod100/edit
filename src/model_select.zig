@@ -27,56 +27,6 @@ pub const ModelOption = struct {
     display_name: []const u8,
 };
 
-pub fn defaultProviderSpecs() []const provider.ProviderSpec {
-    return &.{
-        .{
-            .id = "anthropic",
-            .display_name = "Anthropic",
-            .env_vars = &.{"ANTHROPIC_API_KEY"},
-            .models = &.{
-                .{ .id = "claude-sonnet-4", .display_name = "Claude Sonnet 4" },
-                .{ .id = "claude-haiku-4.5", .display_name = "Claude Haiku 4.5" },
-            },
-        },
-        .{
-            .id = "openai",
-            .display_name = "OpenAI",
-            .env_vars = &.{"OPENAI_API_KEY"},
-            .models = &.{
-                .{ .id = "gpt-5", .display_name = "GPT-5" },
-                .{ .id = "gpt-5-nano", .display_name = "GPT-5 Nano" },
-            },
-        },
-        .{
-            .id = "google",
-            .display_name = "Google",
-            .env_vars = &.{"GOOGLE_GENERATIVE_AI_API_KEY"},
-            .models = &.{
-                .{ .id = "gemini-2.5-pro", .display_name = "Gemini 2.5 Pro" },
-                .{ .id = "gemini-2.5-flash", .display_name = "Gemini 2.5 Flash" },
-            },
-        },
-        .{
-            .id = "openrouter",
-            .display_name = "OpenRouter",
-            .env_vars = &.{"OPENROUTER_API_KEY"},
-            .models = &.{
-                .{ .id = "anthropic/claude-3.5-sonnet", .display_name = "Claude 3.5 Sonnet" },
-                .{ .id = "google/gemini-2.0-flash-001", .display_name = "Gemini 2.0 Flash" },
-                .{ .id = "minimax/minimax-m2.5", .display_name = "MiniMax M2.5" },
-            },
-        },
-        .{
-            .id = "opencode",
-            .display_name = "OpenCode",
-            .env_vars = &.{"OPENCODE_API_KEY"},
-            .models = &.{
-                .{ .id = "kimi-k2.5", .display_name = "Kimi K2.5" },
-            },
-        },
-    };
-}
-
 pub fn envPairsForProviders(
     allocator: std.mem.Allocator,
     providers: []const provider.ProviderSpec,

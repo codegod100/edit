@@ -40,16 +40,16 @@ pub fn listModelsDirect(
         try allocator.dupe(u8, api_key);
     defer allocator.free(effective_key);
 
+    const cfg = config.getProviderConfig(provider_id);
+
     const use_codex_models = std.mem.eql(u8, provider_id, "openai") and auth.isOAuthToken(api_key);
     const endpoint = if (use_codex_models)
         types.Constants.OPENAI_CODEX_MODELS_ENDPOINT
     else
-        config.getModelsEndpoint(provider_id) orelse {
+        cfg.models_endpoint orelse {
             errors.setLastProviderError("provider does not support listing models");
             return errors.ProviderError.UnsupportedProvider;
         };
-
-    const cfg = config.getProviderConfig(provider_id);
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);
@@ -236,16 +236,16 @@ pub fn fetchModelIDsDirect(
         try allocator.dupe(u8, api_key);
     defer allocator.free(effective_key);
 
+    const cfg = config.getProviderConfig(provider_id);
+
     const use_codex_models = std.mem.eql(u8, provider_id, "openai") and auth.isOAuthToken(api_key);
     const endpoint = if (use_codex_models)
         types.Constants.OPENAI_CODEX_MODELS_ENDPOINT
     else
-        config.getModelsEndpoint(provider_id) orelse {
+        cfg.models_endpoint orelse {
             errors.setLastProviderError("provider does not support listing models");
             return errors.ProviderError.UnsupportedProvider;
         };
-
-    const cfg = config.getProviderConfig(provider_id);
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{effective_key});
     defer allocator.free(auth_value);

@@ -27,6 +27,7 @@ pub const ChatResponse = struct {
 
 pub const ProviderConfig = struct {
     endpoint: []const u8,
+    models_endpoint: ?[]const u8,
     referer: ?[]const u8,
     title: ?[]const u8,
     user_agent: ?[]const u8,

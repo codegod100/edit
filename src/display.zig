@@ -57,7 +57,7 @@ pub fn getSpinnerStateText(buf: []u8) []const u8 {
         3 => "write",
         4 => "$",
         5 => "search",
-        else => "think",
+        else => "Thinking",
     };
 
     if (custom_len > 0) {
@@ -166,8 +166,8 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
 
 /// Format command output for timeline and add it via callback
 fn formatTruncatedCommandOutput(output: []const u8) void {
-    const HEAD: usize = 2;
-    const TAIL: usize = 2;
+    const HEAD: usize = 5;
+    const TAIL: usize = 5;
 
     const Range = struct { start: usize, end: usize };
     var head: [HEAD]Range = undefined;
@@ -286,16 +286,15 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
 }
 
 // Track if spinner is active to reserve space for it
-var g_spinner_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+pub var g_spinner_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 pub fn setSpinnerActive(active: bool) void {
     g_spinner_active.store(active, .release);
 }
 
-pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8) !void {
-    // Skip redraw if spinner is active to avoid stdout conflicts
-    if (g_spinner_active.load(.acquire)) return;
-
+/// Redraw the entire screen with timeline and current prompt.
+/// Uses direct File access to avoid buffering issues.
+pub fn clearScreenAndRedrawTimeline(stdout_file: std.fs.File, current_prompt: []const u8) !void {
     // Lock stdout for atomic redraw
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
@@ -311,15 +310,12 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     if (prompt_lines == 0) prompt_lines = 4;
 
     // Reserve extra line as buffer between timeline and prompt
-    // Add extra line for spinner when active
     const spinner_buffer: usize = if (g_spinner_active.load(.acquire)) 2 else 1;
     const reserved_lines = prompt_lines + spinner_buffer;
     const max_timeline_lines = if (term_height > reserved_lines) term_height - reserved_lines else 5;
 
-    // Move cursor to bottom to push content into scrollback, then clear visible area
-    try stdout.print("\x1b[{d}H", .{term_height}); // Move to bottom
-    try stdout.writeAll("\x1b[J"); // Clear from cursor to end (preserves scrollback above)
-    try stdout.writeAll("\x1b[H"); // Move to top to start drawing
+    // Clear the whole screen and move cursor to top-left
+    try stdout_file.writeAll("\x1b[2J\x1b[H");
 
     // Lock timeline for reading
     g_timeline_mutex.lock();
@@ -328,14 +324,16 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
     // Calculate total lines in timeline entries
     var total_entry_lines: usize = 0;
     for (g_timeline_entries.items) |entry| {
-        var lines_in_entry: usize = 1;
+        var lines_in_entry: usize = 0;
         for (entry) |c| {
             if (c == '\n') lines_in_entry += 1;
         }
+        if (entry.len > 0 and entry[entry.len - 1] != '\n') lines_in_entry += 1;
         total_entry_lines += lines_in_entry;
     }
 
     // Determine which entries to show (scrolling if needed)
+    // We want to fill exactly max_timeline_lines
     const lines_to_show = @min(total_entry_lines, max_timeline_lines);
     var start_idx: usize = 0;
 
@@ -344,10 +342,12 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
         var lines_to_skip = total_entry_lines - max_timeline_lines;
         var idx: usize = 0;
         while (idx < g_timeline_entries.items.len and lines_to_skip > 0) {
-            var lines_in_entry: usize = 1;
+            var lines_in_entry: usize = 0;
             for (g_timeline_entries.items[idx]) |c| {
                 if (c == '\n') lines_in_entry += 1;
             }
+            if (g_timeline_entries.items[idx].len > 0 and g_timeline_entries.items[idx][g_timeline_entries.items[idx].len - 1] != '\n') lines_in_entry += 1;
+
             if (lines_in_entry <= lines_to_skip) {
                 lines_to_skip -= lines_in_entry;
                 idx += 1;
@@ -358,42 +358,36 @@ pub fn clearScreenAndRedrawTimeline(stdout: anytype, current_prompt: []const u8)
         start_idx = idx;
     }
 
-    // Calculate how many blank lines to print before timeline to position it correctly
-    // We want: [blank lines] + [timeline] + [buffer] + [prompt] = term_height
-    const blank_lines = max_timeline_lines - lines_to_show;
-
-    // Print blank lines to push content down
-    for (0..blank_lines) |_| {
-        try stdout.writeAll("\n");
+    // Print blank lines to push content down if timeline is shorter than max
+    // This ensures the prompt is always at the bottom
+    const leading_blanks = max_timeline_lines - lines_to_show;
+    for (0..leading_blanks) |_| {
+        try stdout_file.writeAll("\n");
     }
 
-    // Draw timeline entries (ensure each ends with newline)
+    // Draw timeline entries
     var idx = start_idx;
     while (idx < g_timeline_entries.items.len) : (idx += 1) {
         const entry = g_timeline_entries.items[idx];
-        try stdout.print("{s}", .{entry});
-        // Always add newline after entry to prevent collision
-        try stdout.writeAll("\n");
+        if (entry.len == 0) continue;
+        try stdout_file.writeAll(entry);
+        if (entry[entry.len - 1] != '\n') try stdout_file.writeAll("\n");
     }
 
-    // Add blank line buffer (spinner line + prompt gap)
-    try stdout.writeAll("\n");
+    // Exactly one blank line before prompt (this is the spinner buffer line)
+    try stdout_file.writeAll("\n");
 
     // Draw prompt at bottom
-    try stdout.print("{s}", .{current_prompt});
+    try stdout_file.writeAll(current_prompt);
 
-    // Position cursor in the middle line of prompt box (input line)
-    // Prompt structure: ┌─...─┐\n│ >  ...│\n└─...─┘\n[system info]\n
-    // After printing prompt, cursor is on the line AFTER system info
-    // To get to input line (│ >  ...│), we need to go up 3 lines
-    try stdout.writeAll("\x1b[3A"); // Move up 3 lines
-    try stdout.writeAll("\x1b[5G"); // Move to column 5 (after "│ > ")
-
-    // Enable blinking block cursor (throbbing effect)
-    try stdout.writeAll("\x1b[1 q"); // Blinking block cursor
-
-    // Ensure cursor is visible and positioned before returning
-    try stdout.writeAll("\x1b[?25h"); // Show cursor
+    // Position cursor in input line (│ > ) if it's a TTY and spinner is NOT active
+    // Standard prompt is 4 lines. Input is 3rd from bottom.
+    const is_tty = std.posix.isatty(stdout_file.handle);
+    if (is_tty and !g_spinner_active.load(.acquire)) {
+        try stdout_file.writeAll("\x1b[3A\x1b[5G");
+        // Ensure cursor is visible and block style
+        try stdout_file.writeAll("\x1b[?25h\x1b[1 q");
+    }
 }
 
 pub fn getTerminalHeight() usize {

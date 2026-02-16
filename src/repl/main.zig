@@ -31,16 +31,26 @@ fn spinnerThread(stdout_file: std.fs.File) void {
     while (g_spinner_running.load(.acquire)) {
         const state_text = display.getSpinnerStateText(&state_buf);
         
+        // Print spinner above the prompt box using relative positioning
+        // We are currently at the input line (│ > ).
+        // Rows in prompt:
+        // 1: Top border
+        // 2: Input row (we are here)
+        // 3: Bottom border
+        // 4: System info
+        
+        // To get to the line ABOVE the top border, we need to move up 2 lines from the input row.
+        
         // Lock stdout for atomic update
         display.g_stdout_mutex.lock();
         defer display.g_stdout_mutex.unlock();
         
-        // Save cursor position, print spinner between timeline and prompt, restore cursor
-        _ = stdout_file.write("\x1b[s") catch {};
-        // Move up 2 lines to position between timeline and prompt
-        const spinner_str = std.fmt.bufPrint(&buf, "\x1b[2A\r  {s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
+        _ = stdout_file.write("\x1b[s") catch {}; // Save
+        _ = stdout_file.write("\x1b[2A\r") catch {}; // Move up 2 lines and to start
+        const spinner_str = std.fmt.bufPrint(&buf, "{s} {s}\x1b[K", .{ frames[frame_idx], state_text }) catch "? ";
         _ = stdout_file.write(spinner_str) catch {};
-        _ = stdout_file.write("\x1b[u") catch {};
+        _ = stdout_file.write("\x1b[u") catch {}; // Restore to input line
+        
         frame_idx = (frame_idx + 1) % frames.len;
         std.Thread.sleep(80 * std.time.ns_per_ms);
     }
@@ -53,8 +63,7 @@ fn resetCursorStyle(stdout_file: std.fs.File) void {
 
 fn startSpinner(stdout_file: std.fs.File) !void {
     display.setSpinnerState(.thinking);
-    // TODO: Disable spinner to debug timeline corruption
-    // display.setSpinnerActive(true);
+    display.setSpinnerActive(true);
     g_spinner_running.store(true, .release);
     g_spinner_thread = try std.Thread.spawn(.{}, spinnerThread, .{stdout_file});
 }
@@ -68,6 +77,10 @@ fn stopSpinner() void {
     display.setSpinnerActive(false);
     display.setSpinnerState(.thinking);
 }
+
+// Global state for callback redraw
+var g_callback_stdout_file: ?std.fs.File = null;
+var g_callback_prompt: ?[]const u8 = null;
 
 pub fn run(allocator: std.mem.Allocator) !void {
     // Arena for provider specs that live for the entire session
@@ -271,8 +284,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // Add user input to timeline (redraw later)
+        // Add user input to timeline and redraw immediately to clear input box
         display.addTimelineEntry("{s}>>{s} {s}\n", .{ display.C_CYAN, display.C_RESET, line });
+        // Redraw BEFORE startSpinner so it's not skipped by the active flag
+        try display.clearScreenAndRedrawTimeline(stdout_file, prompt);
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
@@ -283,12 +298,26 @@ pub fn run(allocator: std.mem.Allocator) !void {
         legacy.initToolOutputArena(allocator);
         defer legacy.deinitToolOutputArena();
         
+        g_callback_stdout_file = stdout_file;
+        g_callback_prompt = prompt;
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
                 display.addTimelineEntry("{s}", .{text});
+                if (g_callback_stdout_file) |f| {
+                    if (g_callback_prompt) |p| {
+                        // Temporarily disable spinner flag to force full redraw
+                        const was_active = display.g_spinner_active.swap(false, .acquire);
+                        display.clearScreenAndRedrawTimeline(f, p) catch {};
+                        if (was_active) display.g_spinner_active.store(true, .release);
+                    }
+                }
             }
         }.callback);
-        defer model_loop.setToolOutputCallback(null);
+        defer {
+            model_loop.setToolOutputCallback(null);
+            g_callback_stdout_file = null;
+            g_callback_prompt = null;
+        }
 
         // Arena for per-turn allocations (context prompt, model result, etc.)
         var turn_arena = std.heap.ArenaAllocator.init(allocator);
@@ -298,10 +327,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
 
         // Show spinner while model is processing
-        // TODO: Disable spinner temporarily to debug timeline corruption
-        // if (stdout_file.isTty()) {
-        //     try startSpinner(stdout_file);
-        // }
+        if (stdout_file.isTty()) {
+            try startSpinner(stdout_file);
+        }
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
             ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
@@ -314,10 +342,6 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
         stopSpinner();
         resetCursorStyle(stdout_file);
-
-        // Response is already added by toolOutput callback from model_loop
-        // Just need to redraw the timeline with the new entries
-        try display.clearScreenAndRedrawTimeline(stdout, prompt);
 
         try state.context_window.append(allocator, .assistant, result.response, .{
             .tool_calls = result.tool_calls,
@@ -333,7 +357,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
         try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
 
         // Redraw timeline with prompt at bottom
-        try display.clearScreenAndRedrawTimeline(stdout, prompt);
+        try display.clearScreenAndRedrawTimeline(stdout_file, prompt);
 
         // Drain inputs during run
         line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);

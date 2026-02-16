@@ -35,7 +35,7 @@ pub fn chat(
     const real_key = if (is_opencode_free) (if (api_key.len == 0) "public" else api_key) else api_key;
 
     if (std.mem.eql(u8, provider_id, "openai") and provider.isLikelyOAuthToken(real_key)) {
-        return chatCodex(allocator, real_key, model_id, messages_json, tool_defs);
+        return chatCodex(allocator, real_key, model_id, provider_id, "https://chatgpt.com/backend-api/codex/responses", messages_json, tool_defs);
     }
 
     if (std.mem.eql(u8, provider_id, "github-copilot")) {
@@ -182,25 +182,35 @@ fn chatCodex(
     allocator: std.mem.Allocator,
     api_key: []const u8,
     model_id: []const u8,
+    provider_id: []const u8,
+    endpoint: []const u8,
     messages_json: []const u8,
     tool_defs: ?[]const types.ToolRouteDef,
 ) !types.ChatResponse {
+    const config = provider.getProviderConfig(provider_id);
     const body = try codex.buildCodexBody(allocator, model_id, messages_json, tool_defs);
 
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
     defer allocator.free(auth_value);
 
-    const headers = std.http.Client.Request.Headers{
+    var headers = std.http.Client.Request.Headers{
         .authorization = .{ .override = auth_value },
         .content_type = .{ .override = "application/json" },
     };
+    if (config.user_agent) |ua| headers.user_agent = .{ .override = ua };
+
+    var extra_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    defer extra_headers.deinit(allocator);
+    if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
+    if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
+    try extra_headers.append(allocator, .{ .name = "originator", .value = "zagent" });
 
     const raw = try client.httpRequest(
         allocator,
         .POST,
-        "https://chatgpt.com/backend-api/codex/responses",
+        endpoint,
         headers,
-        &.{.{ .name = "originator", .value = "zagent" }},
+        extra_headers.items,
         body,
     );
     defer allocator.free(raw);
@@ -260,14 +270,14 @@ fn buildChatBody(
             try w.writeAll(",\"tools\":[");
             for (defs, 0..) |d, i| {
                 if (i > 0) try w.writeAll(",");
-                try w.print("{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{s},\"strict\":true}}}}", .{ d.name, d.description, d.parameters_json });
+                try w.print("{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"description\":\"{s}\",\"parameters\":{s}}}}}", .{ d.name, d.description, d.parameters_json });
             }
             try w.writeAll("]");
         }
     }
 
     if (reasoning_effort) |effort| {
-        try w.print(",\"reasoning_effort\":{f}", .{std.json.fmt(effort, .{})});
+        try w.print(",\"reasoning_effort\":{any}", .{std.json.fmt(effort, .{})});
     }
     try w.writeAll("}");
     return out.toOwnedSlice(allocator);

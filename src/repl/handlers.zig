@@ -2,6 +2,7 @@ const std = @import("std");
 const state_mod = @import("state.zig");
 const commands = @import("commands.zig");
 const ui = @import("ui.zig");
+const display = @import("../display.zig");
 const auth = @import("../auth.zig");
 const provider = @import("../provider.zig");
 const store = @import("../provider_store.zig");
@@ -64,11 +65,16 @@ pub fn handleCommand(
             const skill_list = try skills.discover(allocator, ".", state.config_dir); // Use CWD?
             defer skills.freeList(allocator, skill_list);
             if (skill_list.len == 0) {
-                try stdout.print("No skills found.\n", .{});
+                display.addTimelineEntry("No skills found.\n", .{});
             } else {
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                defer out.deinit(allocator);
+                const w = out.writer(allocator);
+                try w.writeAll("Skills:\n");
                 for (skill_list) |skill| {
-                    try stdout.print("- {s} ({s})\n", .{ skill.name, skill.path });
+                    try w.print("- {s} ({s})\n", .{ skill.name, skill.path });
                 }
+                display.addTimelineEntry("{s}", .{out.items});
             }
         },
         .load_skill => {
@@ -76,16 +82,21 @@ pub fn handleCommand(
             defer skills.freeList(allocator, skill_list);
             const skill = skills.findByName(skill_list, arg);
             if (skill) |s| {
-                try stdout.print("Loaded skill: {s}\n\n{s}\n", .{ s.name, s.body });
+                display.addTimelineEntry("Loaded skill: {s}\n\n{s}\n", .{ s.name, s.body });
             } else {
-                try stdout.print("Skill not found: {s}\n", .{arg});
+                display.addTimelineEntry("Skill not found: {s}\n", .{arg});
             }
         },
         .list_tools => {
             // tools.list() - implied to exist
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(allocator);
+            const w = out.writer(allocator);
+            try w.writeAll("Tools:\n");
             for (tools.definitions) |d| {
-                try stdout.print("- {s}: {s}\n", .{ d.name, d.description });
+                try w.print("- {s}: {s}\n", .{ d.name, d.description });
             }
+            display.addTimelineEntry("{s}", .{out.items});
         },
         .run_tool => {
             // tools.execute(allocator, arg) - simpler wrapper?
@@ -98,7 +109,7 @@ pub fn handleCommand(
         .list_providers => {
             const view = try formatProvidersOutput(allocator, state.providers, state.provider_states);
             defer allocator.free(view);
-            try stdout.print("{s}", .{view});
+            display.addTimelineEntry("{s}", .{view});
         },
         .connect_provider => {
             const chosen = if (arg.len > 0)

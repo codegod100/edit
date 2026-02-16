@@ -170,7 +170,7 @@ pub fn readPromptLine(
 
     // Initial draw of timeline + prompt
     const display = @import("display.zig");
-    try display.clearScreenAndRedrawTimeline(stdout, prompt);
+    try display.clearScreenAndRedrawTimeline(stdin_file, prompt);
     
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
