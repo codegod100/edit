@@ -437,19 +437,27 @@ pub fn getTerminalHeight() usize {
 
 pub fn setupScrollingRegion(stdout_file: std.fs.File) void {
     const height = getTerminalHeight();
+    const width = terminalColumns();
     if (height < 3) return; // Need at least 3 lines for status + space
     
-    // Clear screen and move to top-left
+    // 1. Clear screen and move to top-left
     _ = stdout_file.write("\x1b[2J\x1b[H") catch {};
 
-    // DECSTBM: Set Top and Bottom Margins
+    // 2. Print a horizontal line to mark the start of the session
+    const line_color = "\x1b[38;5;240m"; // Dark grey
+    std.debug.print("{s}", .{line_color});
+    var w: usize = 0;
+    while (w < width) : (w += 1) std.debug.print("\xe2\x94\x80", .{});
+    std.debug.print("{s}\n", .{C_RESET});
+
+    // 3. DECSTBM: Set Top and Bottom Margins
     // We reserve the LAST line for status.
     // Margins are 1-based.
     var buf: [32]u8 = undefined;
     const seq = std.fmt.bufPrint(&buf, "\x1b[1;{d}r", .{height - 1}) catch return;
     _ = stdout_file.write(seq) catch {};
-    // Ensure cursor is in region at col 1
-    _ = stdout_file.write("\x1b[H") catch {};
+    // Ensure cursor is in region at line 2 (below our separator)
+    _ = stdout_file.write("\x1b[2;1H") catch {};
 
     // Initial status bar draw so it's not empty
     renderStatusBar(stdout_file, " ", "Ready");
