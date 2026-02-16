@@ -166,8 +166,12 @@ pub fn readPromptLine(
 
     try stdout.print("{s}", .{prompt});
 
-    var line = try allocator.alloc(u8, 0);
-    // Note: line is reallocated during editing, so no defer free here
+    // Use arena for line editing to simplify memory management
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var line: []u8 = &.{};
     var cursor_pos: usize = 0;
     var buf: [1]u8 = undefined;
 
@@ -222,10 +226,10 @@ pub fn readPromptLine(
                         _ = stdin_file.read(&tilde_buf) catch {};
                         if (cursor_pos < line.len) {
                             const new_len = line.len - 1;
-                            const new_line = try allocator.alloc(u8, new_len);
+                            const new_line = try arena_alloc.alloc(u8, new_len);
                             @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
                             @memcpy(new_line[cursor_pos..], line[cursor_pos + 1 ..]);
-                            allocator.free(line);
+                            // arena freed on defer
                             line = new_line;
                             // Redraw from cursor to end
                             try stdout.writeAll(line[cursor_pos..]);
@@ -258,10 +262,10 @@ pub fn readPromptLine(
         if (ch == 127 or ch == 8) { // Backspace
             if (cursor_pos > 0) {
                 const new_len = line.len - 1;
-                const new_line = try allocator.alloc(u8, new_len);
+                const new_line = try arena_alloc.alloc(u8, new_len);
                 @memcpy(new_line[0 .. cursor_pos - 1], line[0 .. cursor_pos - 1]);
                 @memcpy(new_line[cursor_pos - 1 ..], line[cursor_pos..]);
-                allocator.free(line);
+                // arena freed on defer
                 line = new_line;
                 cursor_pos -= 1;
                 // Move cursor back, clear character, move back again
@@ -279,11 +283,11 @@ pub fn readPromptLine(
         }
 
         if (ch >= 32 and ch < 127) { // Printable character
-            const new_line = try allocator.alloc(u8, line.len + 1);
+            const new_line = try arena_alloc.alloc(u8, line.len + 1);
             @memcpy(new_line[0..cursor_pos], line[0..cursor_pos]);
             new_line[cursor_pos] = ch;
             @memcpy(new_line[cursor_pos + 1 ..], line[cursor_pos..]);
-            allocator.free(line);
+            // arena freed on defer
             line = new_line;
             // Insert character at cursor position
             try stdout.writeAll(line[cursor_pos..]);

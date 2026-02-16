@@ -5,6 +5,8 @@ const linux = std.os.linux;
 const sigset_t = linux.sigset_t;
 
 var g_cancel_requested: bool = false;
+var g_cancel_pending: bool = false; // First Ctrl+C pressed, waiting for second
+var g_should_exit: bool = false; // Second Ctrl+C pressed, should exit
 var g_original_termios: ?std.posix.termios = null;
 
 pub fn isCancelled() bool {
@@ -17,6 +19,33 @@ pub fn setCancelled() void {
 
 pub fn resetCancelled() void {
     @atomicStore(bool, &g_cancel_requested, false, .monotonic);
+    @atomicStore(bool, &g_cancel_pending, false, .monotonic);
+}
+
+/// Check if we should exit (second Ctrl+C)
+pub fn shouldExit() bool {
+    return @atomicLoad(bool, &g_should_exit, .monotonic);
+}
+
+/// Mark that we're about to start processing
+pub fn beginProcessing() void {
+    @atomicStore(bool, &g_cancel_pending, false, .monotonic);
+    @atomicStore(bool, &g_should_exit, false, .monotonic);
+}
+
+/// Handle Ctrl+C - returns true if should exit
+pub fn handleInterrupt() bool {
+    const was_pending = @atomicLoad(bool, &g_cancel_pending, .monotonic);
+    if (was_pending) {
+        // Second Ctrl+C - exit
+        @atomicStore(bool, &g_should_exit, true, .monotonic);
+        return true;
+    } else {
+        // First Ctrl+C - cancel current operation
+        @atomicStore(bool, &g_cancel_requested, true, .monotonic);
+        @atomicStore(bool, &g_cancel_pending, true, .monotonic);
+        return false;
+    }
 }
 
 var g_original_sigint: ?linux.Sigaction.handler_fn = null;
