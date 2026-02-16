@@ -33,4 +33,8 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const bench_cmd = b.addSystemCommand(&.{ "python3", "scripts/zbench.py" });
+    const bench_step = b.step("bench", "Run intelligence benchmarks");
+    bench_step.dependOn(&bench_cmd.step);
 }
