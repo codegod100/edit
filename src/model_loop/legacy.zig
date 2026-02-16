@@ -209,13 +209,14 @@ pub fn runModel(
                         try w.appendSlice(arena_alloc, "}");
                     }
                 } else {
-                    // No plan yet, running long
+                    // CRITICAL: Reached limit without ANY plan. This is a smell.
+                    // We extend to allow correction, but explicitly demand a plan.
                     extended = true;
-                    reason = "Running long without a plan. Extending.";
+                    reason = "Critical: No plan (todos) created yet.";
                     try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
                     try w.writer(arena_alloc).print(
                         "{f}",
-                        .{std.json.fmt("Step limit extended. You have been running for a while. Please create a plan using todo_add or finish the task.", .{})},
+                        .{std.json.fmt("Step limit reached, but you have not created a plan (via todo_add) yet. This is unexpected behavior. You MUST create a plan now to track your remaining work, or call respond_text if you are actually finished.", .{})},
                     );
                     try w.appendSlice(arena_alloc, "}");
                 }
