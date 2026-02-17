@@ -125,13 +125,13 @@ pub const TodoList = struct {
                 .done => C_GREEN ++ "✓" ++ C_RESET,
             };
             const desc_prefix = if (item.status == .done) C_GREY else if (item.status == .in_progress) C_BOLD else "";
-            const line = try std.fmt.allocPrint(allocator, "{s}  {s}{s}", .{ icon, desc_prefix, item.description });
+            const line = try std.fmt.allocPrint(allocator, "{s} {s} {s}{s}", .{ icon, item.id, desc_prefix, item.description });
             try lines.append(allocator, line);
         }
 
         var max_width: usize = "Plan & Progress".len + 10;
         for (self.items.items) |item| {
-            const line_len = item.description.len + 6; // icon + padding
+            const line_len = item.description.len + item.id.len + 7; // icon + id + space + padding
             if (line_len > max_width) max_width = line_len;
         }
         max_width = @min(max_width, 100);
