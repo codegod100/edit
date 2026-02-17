@@ -167,6 +167,125 @@ pub fn hashProjectPath(cwd: []const u8) u64 {
     return std.hash.Crc32.hash(cwd);
 }
 
+// Session info for listing available sessions
+pub const SessionInfo = struct {
+    id: []u8,
+    path: []u8,
+    modified_time: i128,
+    turn_count: usize,
+    file_size: usize,
+    size_str: []u8,
+
+    pub fn deinit(self: *SessionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.path);
+        allocator.free(self.size_str);
+    }
+};
+
+// List available context sessions
+pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) !std.ArrayListUnmanaged(SessionInfo) {
+    var sessions: std.ArrayListUnmanaged(SessionInfo) = .empty;
+    errdefer {
+        for (sessions.items) |*s| s.deinit(allocator);
+        sessions.deinit(allocator);
+    }
+
+    var dir = std.fs.openDirAbsolute(base_path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => return sessions,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        
+        // Match context-{hex}.json pattern
+        if (!std.mem.startsWith(u8, entry.name, "context-")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        
+        const hash_part = entry.name["context-".len .. entry.name.len - ".json".len];
+        
+        // Validate it's a hex string
+        var valid_hex = true;
+        for (hash_part) |c| {
+            if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) {
+                valid_hex = false;
+                break;
+            }
+        }
+        if (!valid_hex) continue;
+
+        // Get file stats
+        const stat = dir.statFile(entry.name) catch continue;
+
+        // Build full path for reading content
+        const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
+        errdefer allocator.free(full_path);
+
+        // Read the file to count turns
+        const file = std.fs.openFileAbsolute(full_path, .{}) catch continue;
+        defer file.close();
+        const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
+        defer allocator.free(content);
+        
+        // Parse turn count from JSON
+        const TurnJson = struct {
+            role: []const u8,
+            content: []const u8,
+            tool_calls: ?usize = null,
+            error_count: ?usize = null,
+            files_touched: ?[]const u8 = null,
+        };
+        const ContextJson = struct {
+            turns: ?[]const TurnJson = null,
+        };
+        const parsed = std.json.parseFromSliceLeaky(ContextJson, allocator, content, .{ .ignore_unknown_fields = true }) catch {
+            // Parse failed, use 0 turns
+            try sessions.append(allocator, .{
+                .id = try allocator.dupe(u8, hash_part),
+                .path = full_path,
+                .modified_time = stat.mtime,
+                .turn_count = 0,
+                .file_size = @intCast(stat.size),
+                .size_str = try formatSize(allocator, stat.size),
+            });
+            continue;
+        };
+
+        const turn_count = if (parsed.turns) |t| t.len else 0;
+        
+        try sessions.append(allocator, .{
+            .id = try allocator.dupe(u8, hash_part),
+            .path = full_path,
+            .modified_time = stat.mtime,
+            .turn_count = turn_count,
+            .file_size = @intCast(stat.size),
+            .size_str = try formatSize(allocator, stat.size),
+        });
+    }
+
+    // Sort by modified time (newest first)
+    std.mem.sort(SessionInfo, sessions.items, {}, struct {
+        fn lessThan(_: void, a: SessionInfo, b: SessionInfo) bool {
+            return a.modified_time > b.modified_time;
+        }
+    }.lessThan);
+
+    return sessions;
+}
+
+fn formatSize(allocator: std.mem.Allocator, size: usize) ![]u8 {
+    if (size < 1024) {
+        return std.fmt.allocPrint(allocator, "{d}B", .{size});
+    } else if (size < 1024 * 1024) {
+        return std.fmt.allocPrint(allocator, "{d:.1}KB", .{@as(f64, @floatFromInt(size)) / 1024});
+    } else {
+        return std.fmt.allocPrint(allocator, "{d:.1}MB", .{@as(f64, @floatFromInt(size)) / (1024 * 1024)});
+    }
+}
+
 pub fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
     const filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{project_hash});
     defer allocator.free(filename);
@@ -215,6 +334,22 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         });
     }
 }
+
+// Load context by hash ID string (hex)
+pub fn loadContextWindowById(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, hash_id: []const u8) !bool {
+    const hash = std.fmt.parseInt(u64, hash_id, 16) catch return false;
+    loadContextWindow(allocator, base_path, window, hash) catch return false;
+    return window.turns.items.len > 0;
+}
+
+// Load context by hash ID string and return the hash value
+pub fn loadContextWindowWithHash(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, hash_id: []const u8) !?u64 {
+    const hash = std.fmt.parseInt(u64, hash_id, 16) catch return null;
+    loadContextWindow(allocator, base_path, window, hash) catch return null;
+    if (window.turns.items.len == 0) return null;
+    return hash;
+}
+
 
 pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow, project_hash: u64) !void {
     const logger = @import("logger.zig");

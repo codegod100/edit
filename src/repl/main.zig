@@ -65,7 +65,7 @@ fn stopSpinner() void {
 var g_callback_stdout_file: ?std.fs.File = null;
 var g_callback_prompt: ?[]const u8 = null;
 
-pub fn run(allocator: std.mem.Allocator) !void {
+pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
     defer provider_arena.deinit();
@@ -175,8 +175,9 @@ pub fn run(allocator: std.mem.Allocator) !void {
         config_dir, logger.getSessionID() 
     });
 
-    // Load Context/History (only restore context if ZAGENT_RESTORE_CONTEXT is set)
-    const restore_context = std.posix.getenv("ZAGENT_RESTORE_CONTEXT") != null;
+    // Load Context/History (only restore context if ZAGENT_RESTORE_CONTEXT is set or --restore-context flag is passed)
+    const restore_context_env = std.posix.getenv("ZAGENT_RESTORE_CONTEXT") != null;
+    const restore_context = restore_context_arg orelse restore_context_env;
     if (restore_context) {
         context.loadContextWindow(allocator, config_dir, &state.context_window, state.project_hash) catch {};
     }

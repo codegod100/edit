@@ -2,12 +2,46 @@ const std = @import("std");
 const repl = @import("repl/main.zig");
 const logger = @import("logger.zig");
 const cancel = @import("cancel.zig");
+const context = @import("context.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
+
+    // Parse command-line arguments
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var resume_session_id: ?[]const u8 = null;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            const help_text =
+                \\Usage: zagent [OPTIONS]
+                \\
+                \\Options:
+                \\      --resume[=ID]          Resume from a session (show menu if no ID)
+                \\  -h, --help                 Show this help message
+                \\
+                \\Environment Variables:
+                \\  ZAGENT_RESTORE_CONTEXT=1   Also enables context restoration from current project
+                \\
+                \\Examples:
+                \\  zagent --resume             Show menu to select from recent sessions
+                \\  zagent --resume=56ffe754    Resume session with ID 56ffe754
+                \\
+            ;
+            _ = try std.posix.write(1, help_text);
+            return;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--resume=")) {
+            resume_session_id = arg["--resume=".len..];
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            resume_session_id = ""; // Empty means show menu
+        }
+    }
 
     // Initialize verbose logging
     const home = std.posix.getenv("HOME") orelse "/tmp";
@@ -22,9 +56,112 @@ pub fn main() !void {
 
     logger.info("zagent starting up", .{});
 
-    try repl.run(allocator);
+    // Handle resume if requested
+    var restore_context = false;
+    if (resume_session_id) |id| {
+        const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
+        defer allocator.free(config_dir);
+
+        if (id.len == 0) {
+            // Show menu to select session
+            const selected_id = try selectSessionMenu(allocator, config_dir);
+            if (selected_id) |sid| {
+                logger.info("Resuming session: {s}", .{sid});
+                // Try to restore context from the selected session
+                var window = context.ContextWindow.init(32000, 20);
+                defer window.deinit(allocator);
+                
+                const project_hash = std.fmt.parseInt(u64, sid, 16) catch {
+                    std.debug.print("Invalid session ID: {s}\n", .{sid});
+                    return;
+                };
+                
+                if (context.loadContextWindow(allocator, config_dir, &window, project_hash)) {
+                    if (window.turns.items.len > 0) {
+                        std.debug.print("Resumed session {s} with {d} turns\n", .{sid, window.turns.items.len});
+                        restore_context = true;
+                    }
+                } else |_| {
+                    std.debug.print("Failed to load session: {s}\n", .{sid});
+                }
+            }
+        } else {
+            // Use the provided session ID
+            // config_dir is already declared above
+            logger.info("Resuming session: {s}", .{id});
+            var window = context.ContextWindow.init(32000, 20);
+            defer window.deinit(allocator);
+            
+            const project_hash = std.fmt.parseInt(u64, id, 16) catch {
+                std.debug.print("Invalid session ID: {s}\n", .{id});
+                return;
+            };
+            
+            if (context.loadContextWindow(allocator, config_dir, &window, project_hash)) {
+                if (window.turns.items.len > 0) {
+                    std.debug.print("Resumed session {s} with {d} turns\n", .{id, window.turns.items.len});
+                    restore_context = true;
+                }
+            } else |_| {
+                std.debug.print("Failed to load session: {s}\n", .{id});
+            }
+        }
+    }
+
+    try repl.run(allocator, if (restore_context) true else null);
 
     logger.info("zagent shutting down", .{});
+}
+
+fn selectSessionMenu(allocator: std.mem.Allocator, config_dir: []const u8) !?[]const u8 {
+    var sessions = try context.listContextSessions(allocator, config_dir);
+    defer {
+        for (sessions.items) |*s| s.deinit(allocator);
+        sessions.deinit(allocator);
+    }
+
+    if (sessions.items.len == 0) {
+        std.debug.print("No recent sessions found.\n", .{});
+        return null;
+    }
+
+    // Display menu
+    std.debug.print("\nRecent sessions:\n", .{});
+    std.debug.print("  0. Start fresh session\n", .{});
+    
+    const display_count = @min(sessions.items.len, 10);
+    for (sessions.items[0..display_count], 1..) |s, i| {
+        const epoch_sec = @as(u64, @intCast(@divTrunc(s.modified_time, 1_000_000_000)));
+        // Calculate days ago (rough approximation: days since epoch divided by secs per day)
+        const days_ago = @divTrunc(epoch_sec, 86400);
+
+        std.debug.print("  {d}. {s} - {d} turns ({s}) - day {d}\n", .{
+            i, s.id, s.turn_count, s.size_str, days_ago,
+        });
+    }
+    std.debug.print("\nSelect session (0-{d}): ", .{display_count});
+
+    // Read selection from stdin
+    var buf: [64]u8 = undefined;
+    const stdin = if (@hasDecl(std.io, "getStdIn"))
+        std.io.getStdIn()
+    else if (@hasDecl(std.fs.File, "stdin"))
+        std.fs.File.stdin()
+    else
+        @compileError("No supported stdin API");
+    const input = try stdin.readAll(&buf);
+    const trimmed = std.mem.trim(u8, buf[0..input], " \t\r\n");
+
+    const selection = std.fmt.parseInt(usize, trimmed, 10) catch 0;
+    if (selection == 0) {
+        return null;
+    }
+    if (selection > display_count) {
+        std.debug.print("Invalid selection.\n", .{});
+        return null;
+    }
+
+    return try allocator.dupe(u8, sessions.items[selection - 1].id);
 }
 
 test {

@@ -14,6 +14,9 @@ pub const ReplState = struct {
     reasoning_effort: ?[]const u8,
     project_hash: u64,
     config_dir: []const u8,
+    
+    // Resume from a different session (set if --resume was used)
+    resumed_session_hash: ?u64 = null,
 
     pub fn deinit(self: *ReplState) void {
         self.context_window.deinit(self.allocator);
