@@ -168,8 +168,8 @@ fn selectSessionMenu(allocator: std.mem.Allocator, config_dir: []const u8) !?[]c
         std.fs.File.stdin()
     else
         @compileError("No supported stdin API");
-    const input = try stdin.readAll(&buf);
-    const trimmed = std.mem.trim(u8, buf[0..input], " \t\r\n");
+    const count = try stdin.read(&buf);
+    const trimmed = std.mem.trim(u8, buf[0..count], " \t\r\n");
 
     const selection = std.fmt.parseInt(usize, trimmed, 10) catch 0;
     if (selection == 0) {
