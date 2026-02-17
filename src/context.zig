@@ -229,7 +229,7 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
         errdefer allocator.free(full_path);
 
-        // Peek for title
+        // Peek for title or first prompt snippet
         var title: ?[]u8 = null;
         const file = std.fs.openFileAbsolute(full_path, .{}) catch null;
         if (file) |f| {
@@ -237,10 +237,33 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
             var peek_buf: [4096]u8 = undefined;
             const peek_len = f.readAll(&peek_buf) catch 0;
             const peek_data = peek_buf[0..peek_len];
+
+            // 1. Try explicit title
             if (std.mem.indexOf(u8, peek_data, "\"title\":\"")) |idx| {
                 const start = idx + 9;
                 if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
                     title = try allocator.dupe(u8, peek_data[start..end]);
+                }
+            }
+
+            // 2. Fallback to first user prompt snippet
+            if (title == null) {
+                if (std.mem.indexOf(u8, peek_data, "\"role\":\"user\",\"content\":\"")) |idx| {
+                    const start = idx + 25;
+                    if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
+                        const snippet = peek_data[start..end];
+                        const cap = @min(snippet.len, 60);
+                        var clean = try allocator.alloc(u8, cap);
+                        for (snippet[0..cap], 0..) |c, j| {
+                            clean[j] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
+                        }
+                        title = clean;
+                        if (snippet.len > 60) {
+                            const old = title.?;
+                            title = try std.fmt.allocPrint(allocator, "{s}...", .{old});
+                            allocator.free(old);
+                        }
+                    }
                 }
             }
         }
