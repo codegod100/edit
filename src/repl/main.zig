@@ -285,6 +285,26 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
+
+        // Generate title if needed (on first user turn)
+        if (state.context_window.title == null and state.context_window.turns.items.len == 1) {
+            const title_prompt = try std.fmt.allocPrint(allocator,
+                "[{{\"role\":\"system\",\"content\":\"Generate a very short, concise title (max 6 words) for this task based on the user prompt. Return ONLY the title text, no quotes or prefix.\"}},{{\"role\":\"user\",\"content\":{f}}}]",
+                .{std.json.fmt(line, .{})},
+            );
+            defer allocator.free(title_prompt);
+
+            const title_res = model_loop.callModelDirect(allocator, active.?.api_key orelse "", active.?.model_id, active.?.provider_id, title_prompt, null, null) catch null;
+            if (title_res) |tr| {
+                defer tr.deinit(allocator);
+                const clean_title = std.mem.trim(u8, tr.text, " \t\r\n\"");
+                if (clean_title.len > 0) {
+                    if (state.context_window.title) |old| allocator.free(old);
+                    state.context_window.title = try allocator.dupe(u8, clean_title);
+                }
+            }
+        }
+
         const save_hash = state.resumed_session_hash orelse state.project_hash;
         try context.saveContextWindow(allocator, config_dir, &state.context_window, save_hash);
 

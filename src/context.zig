@@ -44,6 +44,7 @@ pub const RunTurnResult = struct {
 pub const ContextWindow = struct {
     turns: std.ArrayListUnmanaged(ContextTurn),
     summary: ?[]u8,
+    title: ?[]u8,
     max_chars: usize,
     keep_recent_turns: usize,
 
@@ -51,6 +52,7 @@ pub const ContextWindow = struct {
         return .{
             .turns = .{},
             .summary = null,
+            .title = null,
             .max_chars = max_chars,
             .keep_recent_turns = keep_recent_turns,
         };
@@ -60,6 +62,7 @@ pub const ContextWindow = struct {
         for (self.turns.items) |*turn| turn.deinit(allocator);
         self.turns.deinit(allocator);
         if (self.summary) |s| allocator.free(s);
+        if (self.title) |t| allocator.free(t);
     }
 
     pub fn append(self: *ContextWindow, allocator: std.mem.Allocator, role: Role, content: []const u8, meta: TurnMeta) !void {
@@ -171,6 +174,7 @@ pub fn hashProjectPath(cwd: []const u8) u64 {
 pub const SessionInfo = struct {
     id: []u8,
     path: []u8,
+    title: ?[]u8,
     modified_time: i128,
     turn_count: usize,
     file_size: usize,
@@ -180,6 +184,7 @@ pub const SessionInfo = struct {
         allocator.free(self.id);
         allocator.free(self.path);
         allocator.free(self.size_str);
+        if (self.title) |t| allocator.free(t);
     }
 };
 
@@ -220,13 +225,30 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         // Get file stats
         const stat = dir.statFile(entry.name) catch continue;
 
-        // Build full path for reading content
+        // Build full path
         const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
         errdefer allocator.free(full_path);
+
+        // Peek for title
+        var title: ?[]u8 = null;
+        const file = std.fs.openFileAbsolute(full_path, .{}) catch null;
+        if (file) |f| {
+            defer f.close();
+            var peek_buf: [4096]u8 = undefined;
+            const peek_len = f.readAll(&peek_buf) catch 0;
+            const peek_data = peek_buf[0..peek_len];
+            if (std.mem.indexOf(u8, peek_data, "\"title\":\"")) |idx| {
+                const start = idx + 9;
+                if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
+                    title = try allocator.dupe(u8, peek_data[start..end]);
+                }
+            }
+        }
 
         try sessions.append(allocator, .{
             .id = try allocator.dupe(u8, hash_part),
             .path = full_path,
+            .title = title,
             .modified_time = stat.mtime,
             .turn_count = 0, // Disabled for performance
             .file_size = @intCast(stat.size),
@@ -282,6 +304,7 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     };
     const ContextJson = struct {
         summary: ?[]const u8 = null,
+        title: ?[]const u8 = null,
         turns: []const TurnJson = &.{},
     };
 
@@ -291,6 +314,11 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     if (parsed.value.summary) |s| {
         if (window.summary) |existing| allocator.free(existing);
         window.summary = try allocator.dupe(u8, s);
+    }
+
+    if (parsed.value.title) |t| {
+        if (window.title) |existing| allocator.free(existing);
+        window.title = try allocator.dupe(u8, t);
     }
 
     for (parsed.value.turns) |turn| {
@@ -340,6 +368,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     };
     const ContextJson = struct {
         summary: ?[]const u8,
+        title: ?[]const u8,
         turns: []TurnJson,
     };
 
@@ -355,7 +384,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         });
     }
 
-    const payload = ContextJson{ .summary = window.summary, .turns = turns.items };
+    const payload = ContextJson{ .summary = window.summary, .title = window.title, .turns = turns.items };
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
