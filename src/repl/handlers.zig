@@ -302,7 +302,9 @@ pub fn handleCommand(
             state.context_window.deinit(allocator);
             state.context_window = context.ContextWindow.init(32000, 20);
 
-            context.loadContextWindow(allocator, state.config_dir, &state.context_window, state.project_hash) catch |e| {
+            // Use resumed session hash if available, otherwise current project hash
+            const hash_to_load = state.resumed_session_hash orelse state.project_hash;
+            context.loadContextWindow(allocator, state.config_dir, &state.context_window, hash_to_load) catch |e| {
                 try stdout.print("Failed to restore context: {any}\n", .{e});
                 return true;
             };

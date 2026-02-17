@@ -99,6 +99,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     const session_path = try std.fmt.allocPrint(allocator, "{s}/transcript_{s}.txt", .{ config_dir, logger.getSessionID() });
     defer allocator.free(session_path);
 
+    const combined_path = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ cwd, session_path });
+    defer allocator.free(combined_path);
+
     // Load initial data
     const provider_specs = try provider.loadProviderSpecs(provider_alloc, config_dir);
     // Providers are static configuration, but we might want them in state.
@@ -161,9 +164,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Initialize Status Bar Info before setupScrollingRegion
     const active_init = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
     if (active_init) |a| {
-        display.setStatusBarInfo(a.provider_id, a.model_id, session_path);
+        display.setStatusBarInfo(a.provider_id, a.model_id, combined_path);
     } else {
-        display.setStatusBarInfo("none", "none", session_path);
+        display.setStatusBarInfo("none", "none", combined_path);
     }
 
     // Initialize scrolling region (reserves bottom line for status bar)
@@ -213,9 +216,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
         if (active) |a| {
-            display.setStatusBarInfo(a.provider_id, a.model_id, session_path);
+            display.setStatusBarInfo(a.provider_id, a.model_id, combined_path);
         } else {
-            display.setStatusBarInfo("none", "none", session_path);
+            display.setStatusBarInfo("none", "none", combined_path);
         }
         
         var state_buf: [128]u8 = undefined;

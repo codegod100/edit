@@ -15,13 +15,15 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var resume_session_id: ?[]const u8 = null;
-    for (args[1..]) |arg| {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help_text =
                 \\Usage: zagent [OPTIONS]
                 \\
                 \\Options:
-                \\      --resume[=ID]          Resume from a session (show menu if no ID)
+                \\      --resume [ID]          Resume from a session (show menu if no ID)
                 \\  -h, --help                 Show this help message
                 \\
                 \\Environment Variables:
@@ -29,17 +31,27 @@ pub fn main() !void {
                 \\
                 \\Examples:
                 \\  zagent --resume             Show menu to select from recent sessions
-                \\  zagent --resume=56ffe754    Resume session with ID 56ffe754
+                \\  zagent --resume 56ffe754    Resume session with ID 56ffe754
                 \\
             ;
             _ = try std.posix.write(1, help_text);
             return;
         }
 
-        if (std.mem.startsWith(u8, arg, "--resume=")) {
+        if (std.mem.eql(u8, arg, "--resume")) {
+            // Check if next argument exists and doesn't start with --
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
+                i += 1;
+                resume_session_id = args[i];
+            } else {
+                resume_session_id = ""; // Empty means show menu
+            }
+        } else if (std.mem.eql(u8, arg, "--resume=0")) {
+            // Handle legacy --resume=0 format
+            resume_session_id = "0";
+        } else if (std.mem.startsWith(u8, arg, "--resume=")) {
+            // Handle legacy --resume=ID format for backward compatibility
             resume_session_id = arg["--resume=".len..];
-        } else if (std.mem.eql(u8, arg, "--resume")) {
-            resume_session_id = ""; // Empty means show menu
         }
     }
 
