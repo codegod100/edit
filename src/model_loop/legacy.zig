@@ -286,7 +286,7 @@ pub fn runModel(
         // Response is arena-allocated, no need to deinit individual fields
         if (response.reasoning.len > 0) {
             try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{response.reasoning});
-            display.addTimelineEntry("{s}Reasoning:{s}\n{s}{s}{s}\n", .{ display.C_DIM, display.C_RESET, display.C_ITALIC, response.reasoning, display.C_RESET });
+            display.addTimelineEntry("{s}Reasoning:{s}\n{s}{s}{s}\n", .{ display.C_PURPLE, display.C_RESET, display.C_PURPLE, response.reasoning, display.C_RESET });
         }
 
         try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
