@@ -114,10 +114,13 @@ fn tryRequest(
         return error.BadRequest;
     }
 
-    if (out.items.len == 0) {
+    const body = allocating_writer.written();
+    if (body.len == 0) {
         return error.EmptyResponse;
     }
 
+    // Ensure the ArrayList reflects the data actually written by the Allocating writer
+    out.items.len = body.len;
     return out.toOwnedSlice(allocator);
 }
 

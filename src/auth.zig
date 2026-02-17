@@ -398,6 +398,8 @@ fn httpRequest(
         .response_writer = &allocating_writer.writer,
     });
 
+    const body = allocating_writer.written();
+    out.items.len = body.len;
     return out.toOwnedSlice(allocator);
 }
 

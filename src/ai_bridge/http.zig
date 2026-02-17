@@ -16,7 +16,7 @@ pub fn httpRequest(
 
     var allocating_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
 
-    var all_headers: std.ArrayList(std.http.Header) = .empty;
+    var all_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer all_headers.deinit(allocator);
     try all_headers.ensureTotalCapacity(allocator, extra_headers.len + 1);
 
@@ -38,5 +38,7 @@ pub fn httpRequest(
         .response_writer = &allocating_writer.writer,
     });
 
+    const body = allocating_writer.written();
+    out.items.len = body.len;
     return out.toOwnedSlice(allocator);
 }
