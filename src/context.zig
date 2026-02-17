@@ -191,7 +191,7 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         sessions.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(base_path, .{}) catch |err| switch (err) {
+    var dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied => return sessions,
         else => return err,
     };
