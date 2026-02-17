@@ -11,17 +11,20 @@ pub const Role = enum {
 pub const ContextTurn = struct {
     role: Role,
     content: []u8,
+    reasoning: ?[]u8,
     tool_calls: usize,
     error_count: usize,
     files_touched: ?[]u8,
 
     pub fn deinit(self: *ContextTurn, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
+        if (self.reasoning) |r| allocator.free(r);
         if (self.files_touched) |f| allocator.free(f);
     }
 };
 
 pub const TurnMeta = struct {
+    reasoning: ?[]const u8 = null,
     tool_calls: usize = 0,
     error_count: usize = 0,
     files_touched: ?[]const u8 = null,
@@ -71,6 +74,7 @@ pub const ContextWindow = struct {
         try self.turns.append(allocator, .{
             .role = role,
             .content = try allocator.dupe(u8, trimmed),
+            .reasoning = if (meta.reasoning) |r| try allocator.dupe(u8, r) else null,
             .tool_calls = meta.tool_calls,
             .error_count = meta.error_count,
             .files_touched = if (meta.files_touched) |f| try allocator.dupe(u8, f) else null,
@@ -321,6 +325,7 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     const TurnJson = struct {
         role: []const u8,
         content: []const u8,
+        reasoning: ?[]const u8 = null,
         tool_calls: ?usize = null,
         error_count: ?usize = null,
         files_touched: ?[]const u8 = null,
@@ -347,6 +352,7 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     for (parsed.value.turns) |turn| {
         const role: Role = if (std.mem.eql(u8, turn.role, "assistant")) .assistant else .user;
         try window.append(allocator, role, turn.content, .{
+            .reasoning = turn.reasoning,
             .tool_calls = turn.tool_calls orelse 0,
             .error_count = turn.error_count orelse 0,
             .files_touched = turn.files_touched,
@@ -385,6 +391,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     const TurnJson = struct {
         role: []const u8,
         content: []const u8,
+        reasoning: ?[]const u8,
         tool_calls: usize,
         error_count: usize,
         files_touched: ?[]const u8,
@@ -401,6 +408,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         try turns.append(allocator, .{
             .role = if (turn.role == .assistant) "assistant" else "user",
             .content = turn.content,
+            .reasoning = turn.reasoning,
             .tool_calls = turn.tool_calls,
             .error_count = turn.error_count,
             .files_touched = turn.files_touched,

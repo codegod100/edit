@@ -96,11 +96,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     defer allocator.free(config_dir);
     try std.fs.cwd().makePath(config_dir);
 
-    const session_path = try std.fmt.allocPrint(allocator, "{s}/transcript_{s}.txt", .{ config_dir, logger.getSessionID() });
-    defer allocator.free(session_path);
 
-    const combined_path = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ cwd, session_path });
-    defer allocator.free(combined_path);
+
+
 
     // Load initial data
     const provider_specs = try provider.loadProviderSpecs(provider_alloc, config_dir);
@@ -164,9 +162,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Initialize Status Bar Info before setupScrollingRegion
     const active_init = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
     if (active_init) |a| {
-        display.setStatusBarInfo(a.provider_id, a.model_id, combined_path);
+        display.setStatusBarInfo(a.provider_id, a.model_id, cwd);
     } else {
-        display.setStatusBarInfo("none", "none", combined_path);
+        display.setStatusBarInfo("none", "none", cwd);
     }
 
     // Initialize scrolling region (reserves bottom line for status bar)
@@ -199,6 +197,11 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
                     defer allocator.free(box);
                     display.addTimelineEntry("{s}", .{box});
                 } else {
+                    if (turn.reasoning) |r| {
+                        if (r.len > 0) {
+                            display.addTimelineEntry("{s}Reasoning:{s}\n{s}{s}{s}\n", .{ display.C_PURPLE, display.C_RESET, display.C_PURPLE, r, display.C_RESET });
+                        }
+                    }
                     if (turn.content.len > 0) {
                         display.addTimelineEntry("{s}⛬{s} {s}\n", .{ display.C_CYAN, display.C_RESET, turn.content });
                     }
@@ -237,9 +240,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
         
         if (active) |a| {
-            display.setStatusBarInfo(a.provider_id, a.model_id, combined_path);
+            display.setStatusBarInfo(a.provider_id, a.model_id, cwd);
         } else {
-            display.setStatusBarInfo("none", "none", combined_path);
+            display.setStatusBarInfo("none", "none", cwd);
         }
         
         var state_buf: [128]u8 = undefined;
@@ -307,11 +310,19 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
 
-        // Generate title if needed (on first user turn)
-        if (state.context_window.title == null and state.context_window.turns.items.len == 1) {
+        // Generate title if needed (triggers if title is missing, using the first user prompt found in history)
+        if (state.context_window.title == null and state.context_window.turns.items.len > 0) {
+            var first_user_prompt: []const u8 = line;
+            for (state.context_window.turns.items) |t| {
+                if (t.role == .user) {
+                    first_user_prompt = t.content;
+                    break;
+                }
+            }
+
             const title_prompt = try std.fmt.allocPrint(allocator,
                 "[{{\"role\":\"system\",\"content\":\"Generate a very short, concise title (max 6 words) for this task based on the user prompt. Return ONLY the title text, no quotes or prefix.\"}},{{\"role\":\"user\",\"content\":{f}}}]",
-                .{std.json.fmt(line, .{})},
+                .{std.json.fmt(first_user_prompt, .{})},
             );
             defer allocator.free(title_prompt);
 
@@ -384,6 +395,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         // The new runModel adds everything to timeline via addTimelineEntry.
 
         try state.context_window.append(allocator, .assistant, result.response, .{
+            .reasoning = result.reasoning,
             .tool_calls = result.tool_calls,
             .error_count = result.error_count,
             .files_touched = result.files_touched,
