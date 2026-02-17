@@ -142,13 +142,23 @@ fn selectSessionMenu(allocator: std.mem.Allocator, config_dir: []const u8) !?[]c
     
     const display_count = @min(sessions.items.len, 10);
     for (sessions.items[0..display_count], 1..) |s, i| {
-        const epoch_sec = @as(u64, @intCast(@divTrunc(s.modified_time, 1_000_000_000)));
-        // Calculate days ago (rough approximation: days since epoch divided by secs per day)
-        const days_ago = @divTrunc(epoch_sec, 86400);
+        const now = std.time.nanoTimestamp();
+        const diff_ns = if (now > s.modified_time) now - s.modified_time else 0;
+        const days_ago = @as(u64, @intCast(@divTrunc(diff_ns, 86400 * 1_000_000_000)));
 
-        std.debug.print("  {d}. {s} - {d} turns ({s}) - day {d}\n", .{
-            i, s.id, s.turn_count, s.size_str, days_ago,
-        });
+        if (days_ago == 0) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - today\n", .{
+                i, s.id, s.turn_count, s.size_str,
+            });
+        } else if (days_ago == 1) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - yesterday\n", .{
+                i, s.id, s.turn_count, s.size_str,
+            });
+        } else {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - {d} days ago\n", .{
+                i, s.id, s.turn_count, s.size_str, days_ago,
+            });
+        }
     }
     std.debug.print("\nSelect session (0-{d}): ", .{display_count});
 
