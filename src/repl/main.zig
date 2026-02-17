@@ -397,6 +397,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
             ctx_messages, stdout_file.isTty(), &state.todo_list, null, drainInput // system prompt override
         ) catch |err| {
             stopSpinner();
+            cancel.disableRawMode(); // Disable raw mode before printing error
             logger.err("runModel failed with error: {any}", .{err});
             display.addTimelineEntry("{s}Error:{s} {s}\n", .{ display.C_RED, display.C_RESET, @errorName(err) });
             // Error already in timeline, continue loop to redraw at end
@@ -405,6 +406,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         logger.info("runModel completed successfully", .{});
 
         stopSpinner();
+        cancel.disableRawMode();
         resetCursorStyle(stdout_file);
 
         // Assistant response is already printed via respond_text tool call usually,
