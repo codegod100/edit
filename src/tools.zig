@@ -137,6 +137,11 @@ pub const definitions = [_]ToolDef{
         .description = "Retrieves a structural outline of a source file (functions, structs, etc.) to understand its architecture without reading the full implementation.",
         .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"The path to the file to outline\"}},\"required\":[\"path\"],\"additionalProperties\":false}",
     },
+    .{
+        .name = "web_fetch",
+        .description = "Fetch the text content of a URL.",
+        .parameters_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"],\"additionalProperties\":false}",
+    },
 };
 
 pub fn list() []const []const u8 {
@@ -154,6 +159,13 @@ pub fn list() []const []const u8 {
     return names[0..];
 }
 
+pub fn isKnownToolName(name: []const u8) bool {
+    for (definitions) |def| {
+        if (std.mem.eql(u8, def.name, name)) return true;
+    }
+    return false;
+}
+
 pub fn isReadToolName(name: []const u8) bool {
     return std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read");
 }
@@ -161,6 +173,13 @@ pub fn isReadToolName(name: []const u8) bool {
 pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, spec, " \t\r\n");
     if (trimmed.len == 0) return ToolError.InvalidToolCommand;
+
+    if (std.mem.startsWith(u8, trimmed, "web_fetch ")) {
+        const url = std.mem.trim(u8, trimmed[10..], " \t");
+        if (url.len == 0) return ToolError.InvalidToolCommand;
+
+        return fetchAndStripUrl(allocator, url);
+    }
 
     if (std.mem.startsWith(u8, trimmed, "read ")) {
         const path = std.mem.trim(u8, trimmed[5..], " \t");
@@ -191,6 +210,15 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
         defer p.deinit();
         return runBash(allocator, p.value.command orelse return NamedToolError.InvalidArguments);
+    }
+
+    if (std.mem.eql(u8, name, "web_fetch")) {
+        const A = struct { url: ?[]const u8 = null };
+        var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
+        defer p.deinit();
+        const url = p.value.url orelse return NamedToolError.InvalidArguments;
+
+        return fetchAndStripUrl(allocator, url);
     }
 
     if (std.mem.eql(u8, name, "respond_text")) {
@@ -1125,5 +1153,135 @@ fn getFileOutline(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn fetchAndStripUrl(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
+    const cmd = try std.fmt.allocPrint(allocator, "curl -sL \"{s}\"", .{url});
+    defer allocator.free(cmd);
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "sh", "-c", cmd },
+        .max_output_bytes = 10 * 1024 * 1024,
+    });
+    defer allocator.free(result.stderr);
+
+    // If curl failed (exit code != 0)
+    if (result.term == .Exited and result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return std.fmt.allocPrint(allocator, "Error fetching URL (exit code {d}): {s}", .{result.term.Exited, result.stderr});
+    }
+
+    if (result.stdout.len == 0 and result.stderr.len > 0) {
+        allocator.free(result.stdout);
+        return std.fmt.allocPrint(allocator, "Error fetching URL: {s}", .{result.stderr});
+    }
+
+    const stripped = try stripHtml(allocator, result.stdout);
+    allocator.free(result.stdout);
+    return stripped;
+}
+
+fn stripHtml(allocator: std.mem.Allocator, html: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < html.len) {
+        if (html[i] == '<') {
+            if (isTagStart(html, i, "script")) {
+                i = findTagEnd(html, i, "script");
+            } else if (isTagStart(html, i, "style")) {
+                i = findTagEnd(html, i, "style");
+            } else {
+                // Skip generic tag
+                while (i < html.len and html[i] != '>') : (i += 1) {}
+                if (i < html.len) i += 1;
+            }
+        } else {
+            try out.append(allocator, html[i]);
+            i += 1;
+        }
+    }
+
+    return collapseWhitespace(allocator, out.items);
+}
+
+fn isTagStart(html: []const u8, index: usize, tag: []const u8) bool {
+    if (index + 1 + tag.len >= html.len) return false;
+    // Case insensitive check
+    for (tag, 0..) |c, j| {
+        if (std.ascii.toLower(html[index + 1 + j]) != c) return false;
+    }
+    // Check if next char is space, slash or >
+    const next = html[index + 1 + tag.len];
+    return next == ' ' or next == '/' or next == '>' or next == '\t' or next == '\n' or next == '\r';
+}
+
+fn findTagEnd(html: []const u8, start: usize, tag: []const u8) usize {
+    var i = start + 1;
+    while (i < html.len) {
+        if (html[i] == '<' and i + 1 < html.len and html[i+1] == '/') {
+             // Check for </tag>
+             var match = true;
+             if (i + 2 + tag.len > html.len) { match = false; }
+             else {
+                 for (tag, 0..) |c, j| {
+                     if (std.ascii.toLower(html[i + 2 + j]) != c) { match = false; break; }
+                 }
+             }
+             if (match) {
+                 // Find closure of this tag
+                 while (i < html.len and html[i] != '>') : (i += 1) {}
+                 if (i < html.len) i += 1;
+                 return i;
+             }
+        }
+        i += 1;
+    }
+    return html.len;
+}
+
+fn collapseWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var space = false;
+    for (text) |c| {
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            if (!space) {
+                try out.append(allocator, ' ');
+                space = true;
+            }
+        } else {
+            try out.append(allocator, c);
+            space = false;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "stripHtml removes tags and scripts" {
+    const allocator = std.testing.allocator;
+    const input =
+        "<html>\n" ++
+        "<head><title>Test</title><script>var x = 1;</script></head>\n" ++
+        "<body>\n" ++
+        "  <h1>Hello   World</h1>\n" ++
+        "  <p>Text</p>\n" ++
+        "  <style>body { color: red; }</style>\n" ++
+        "</body>\n" ++
+        "</html>";
+
+    const stripped = try stripHtml(allocator, input);
+    defer allocator.free(stripped);
+
+    // Check if it contains key text and no tags
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "Test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "Hello World") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "Text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "<script") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "var x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stripped, "color: red") == null);
 }
 

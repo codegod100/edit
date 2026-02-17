@@ -189,16 +189,6 @@ pub fn runModelTurnWithTools(
                     context_prompt = next_prompt;
                     continue;
                 }
-            } else if (step < soft_limit) {
-                legacy.toolOutput("{s}...continuing{s}", .{ display.C_DIM, display.C_RESET });
-                const next_prompt = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
-                    .{ context_prompt, final },
-                );
-                allocator.free(final);
-                context_prompt = next_prompt;
-                continue;
             }
 
             allocator.free(context_prompt);
@@ -214,6 +204,18 @@ pub fn runModelTurnWithTools(
         defer {
             var r = routed.?;
             r.deinit();
+        }
+
+        if (std.mem.eql(u8, routed.?.tool, "respond_text")) {
+            const parsed_text = tools.parseRespondTextFromArgs(routed.?.arguments_json) orelse "";
+            allocator.free(context_prompt);
+            return .{
+                .response = try allocator.dupe(u8, parsed_text),
+                .reasoning = try allocator.dupe(u8, ""),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try utils.joinPaths(allocator, paths.items),
+            };
         }
 
         if (!tools.isKnownToolName(routed.?.tool)) {
@@ -233,16 +235,6 @@ pub fn runModelTurnWithTools(
                         .files_touched = try utils.joinPaths(allocator, paths.items),
                     };
                 }
-            } else if (step < soft_limit) {
-                legacy.toolOutput("{s}...continuing{s}", .{ display.C_DIM, display.C_RESET });
-                const next_prompt = try std.fmt.allocPrint(
-                    allocator,
-                    "{s}\n\nAssistant response:\n{s}\n\nContinue with your task. Use tools if needed.",
-                    .{ context_prompt, final },
-                );
-                allocator.free(final);
-                context_prompt = next_prompt;
-                continue;
             }
 
             allocator.free(context_prompt);
@@ -335,7 +327,7 @@ pub fn runModelTurnWithTools(
         // Reset spinner to thinking state for next iteration
         display.setSpinnerState(.thinking);
 
-        const capped = if (clean_out.len > 4000) clean_out[0..4000] else clean_out;
+        const capped = if (clean_out.len > 65536) clean_out[0..65536] else clean_out;
         const next_prompt = try std.fmt.allocPrint(
             allocator,
             "{s}\n\nTool events:\n- event=tool-input-start step={d} call_id={s} tool={s}\n- event=tool-call step={d} call_id={s} tool={s}\n- {s}\nArguments JSON: {s}\nTool output:\n{s}\n\nYou may call another tool if needed. Otherwise return the final user-facing answer.",
