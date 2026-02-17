@@ -144,20 +144,18 @@ fn selectSessionMenu(allocator: std.mem.Allocator, config_dir: []const u8) !?[]c
     for (sessions.items[0..display_count], 1..) |s, i| {
         const now = std.time.nanoTimestamp();
         const diff_ns = if (now > s.modified_time) now - s.modified_time else 0;
-        const days_ago = @as(u64, @intCast(@divTrunc(diff_ns, 86400 * 1_000_000_000)));
+        const diff_sec = @as(u64, @intCast(@divTrunc(diff_ns, 1_000_000_000)));
 
-        if (days_ago == 0) {
-            std.debug.print("  {d}. {s} - {d} turns ({s}) - today\n", .{
-                i, s.id, s.turn_count, s.size_str,
-            });
-        } else if (days_ago == 1) {
-            std.debug.print("  {d}. {s} - {d} turns ({s}) - yesterday\n", .{
-                i, s.id, s.turn_count, s.size_str,
-            });
+        if (diff_sec < 60) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - just now\n", .{ i, s.id, s.turn_count, s.size_str });
+        } else if (diff_sec < 3600) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - {d}m ago\n", .{ i, s.id, s.turn_count, s.size_str, diff_sec / 60 });
+        } else if (diff_sec < 86400) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - {d}h ago\n", .{ i, s.id, s.turn_count, s.size_str, diff_sec / 3600 });
+        } else if (diff_sec < 86400 * 2) {
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - yesterday\n", .{ i, s.id, s.turn_count, s.size_str });
         } else {
-            std.debug.print("  {d}. {s} - {d} turns ({s}) - {d} days ago\n", .{
-                i, s.id, s.turn_count, s.size_str, days_ago,
-            });
+            std.debug.print("  {d}. {s} - {d} turns ({s}) - {d}d ago\n", .{ i, s.id, s.turn_count, s.size_str, diff_sec / 86400 });
         }
     }
     std.debug.print("\nSelect session (0-{d}): ", .{display_count});
