@@ -224,43 +224,11 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
         errdefer allocator.free(full_path);
 
-        // Read the file to count turns
-        const file = std.fs.openFileAbsolute(full_path, .{}) catch continue;
-        defer file.close();
-        const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
-        defer allocator.free(content);
-        
-        // Parse turn count from JSON
-        const TurnJson = struct {
-            role: []const u8,
-            content: []const u8,
-            tool_calls: ?usize = null,
-            error_count: ?usize = null,
-            files_touched: ?[]const u8 = null,
-        };
-        const ContextJson = struct {
-            turns: ?[]const TurnJson = null,
-        };
-        const parsed = std.json.parseFromSliceLeaky(ContextJson, allocator, content, .{ .ignore_unknown_fields = true }) catch {
-            // Parse failed, use 0 turns
-            try sessions.append(allocator, .{
-                .id = try allocator.dupe(u8, hash_part),
-                .path = full_path,
-                .modified_time = stat.mtime,
-                .turn_count = 0,
-                .file_size = @intCast(stat.size),
-                .size_str = try formatSize(allocator, stat.size),
-            });
-            continue;
-        };
-
-        const turn_count = if (parsed.turns) |t| t.len else 0;
-        
         try sessions.append(allocator, .{
             .id = try allocator.dupe(u8, hash_part),
             .path = full_path,
             .modified_time = stat.mtime,
-            .turn_count = turn_count,
+            .turn_count = 0, // Disabled for performance
             .file_size = @intCast(stat.size),
             .size_str = try formatSize(allocator, stat.size),
         });
