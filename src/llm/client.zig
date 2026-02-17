@@ -115,7 +115,6 @@ fn tryRequest(
     }
 
     if (out.items.len == 0) {
-        out.deinit(allocator);
         return error.EmptyResponse;
     }
 
