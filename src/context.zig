@@ -583,3 +583,52 @@ pub fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWi
     try w.print("\nCurrent user request:\n{s}", .{user_input});
     return out.toOwnedSlice(allocator);
 }
+
+pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const ContextWindow, user_input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    try w.writeAll("[");
+
+    // 1. System Prompt (as a system message)
+    try w.writeAll("{\"role\":\"system\",\"content\":\"You are continuing an existing coding conversation. Use prior context when relevant, but prioritize correctness and current repository state.");
+    if (window.summary) |s| {
+        try w.writeAll("\\n\\nConversation summary:\\n");
+        try utils.writeJsonString(w, s);
+    }
+    try w.writeAll("\"},");
+
+    // 2. Relevant Turns
+    const indices = try buildRelevantTurnIndices(allocator, window, user_input, 10);
+    defer allocator.free(indices);
+
+    for (indices) |idx| {
+        const turn = window.turns.items[idx];
+        try w.writeAll("{\"role\":");
+        try w.print("{f}", .{std.json.fmt(if (turn.role == .user) "user" else "assistant", .{})});
+        try w.writeAll(",\"content\":");
+        
+        var content_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer content_buf.deinit(allocator);
+        const cw = content_buf.writer(allocator);
+        
+        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
+            try cw.print("{s} [tools={d} errors={d}", .{ turn.content, turn.tool_calls, turn.error_count });
+            if (turn.files_touched) |f| try cw.print(" files={s}", .{f});
+            try cw.print("]", .{});
+        } else {
+            try cw.writeAll(turn.content);
+        }
+        
+        try w.print("{f}", .{std.json.fmt(content_buf.items, .{})});
+        try w.writeAll("},");
+    }
+
+    // 3. Current request
+    try w.writeAll("{\"role\":\"user\",\"content\":");
+    try w.print("{f}", .{std.json.fmt(user_input, .{})});
+    try w.writeAll("}]");
+
+    return out.toOwnedSlice(allocator);
+}

@@ -2,6 +2,7 @@ const std = @import("std");
 const client = @import("client.zig");
 const provider = @import("../provider.zig");
 const codex = @import("codex.zig");
+const anthropic = @import("anthropic.zig");
 const types = @import("types.zig");
 const utils = @import("utils.zig");
 
@@ -36,6 +37,10 @@ pub fn chat(
 
     if (std.mem.eql(u8, provider_id, "openai") and provider.isLikelyOAuthToken(real_key)) {
         return chatCodex(allocator, real_key, model_id, provider_id, "https://chatgpt.com/backend-api/codex/responses", messages_json, tool_defs);
+    }
+
+    if (std.mem.eql(u8, provider_id, "anthropic")) {
+        return anthropic.chat(allocator, real_key, model_id, messages_json, tool_defs);
     }
 
     if (std.mem.eql(u8, provider_id, "github-copilot")) {

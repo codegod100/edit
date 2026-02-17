@@ -192,10 +192,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
             display.addTimelineEntry("{s}--- Resumed Session History ---{s}\n", .{ display.C_DIM, display.C_RESET });
             for (state.context_window.turns.items) |turn| {
                 if (turn.role == .user) {
-                    const wrapped_lines = [_][]const u8{ turn.content };
-                    const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
-                    defer allocator.free(box);
-                    display.addTimelineEntry("{s}", .{box});
+                    display.addTimelineEntry("{s}{s}{s}\n", .{ display.C_CYAN, turn.content, display.C_RESET });
                 } else {
                     if (turn.reasoning) |r| {
                         if (r.len > 0) {
@@ -254,10 +251,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         
         try logger.transcriptWrite("[Terminal] {d}x{d}\n", .{ term_width, term_height });
 
-        // Print the prompt prefix to stderr (so it doesn't pollute redirected stdout)
-        if (queued_lines.items.len == 0) {
-            std.debug.print("{s}> {s}", .{ display.C_CYAN, display.C_RESET });
-        }
+        // Prompt prefix now removed - input will be colorized directly
 
         // Read Line
         var line_opt: ?[]u8 = null;
@@ -281,12 +275,8 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
             continue;
         }
 
-        // Box the input in the timeline (for both manual and scripted runs)
-        const wrapped_lines = [_][]const u8{ line };
-        const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
-        defer allocator.free(box);
-        
-        display.addTimelineEntry("{s}", .{box});
+        // Colorize input text in the timeline (no box)
+        display.addTimelineEntry("{s}{s}{s}\n", .{ display.C_CYAN, line, display.C_RESET });
 
         // History
         try history.append(allocator, line);
@@ -362,7 +352,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
 
-        const ctx_prompt = try context.buildContextPrompt(turn_alloc, &state.context_window, line);
+        const ctx_messages = try context.buildContextMessagesJson(turn_alloc, &state.context_window, line);
 
         display.setSpinnerState(.thinking);
 
@@ -377,7 +367,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         defer cancel.disableRawMode();
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            ctx_prompt, stdout_file.isTty(), &state.todo_list, null // system prompt override
+            ctx_messages, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {
             stopSpinner();
             logger.err("runModel failed with error: {any}", .{err});

@@ -148,18 +148,24 @@ pub fn runModel(
         "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
         "5. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
 
-    // Build messages array (without system field - that goes in separate system param for most APIs)
-    try w.appendSlice(arena_alloc, "[");
+    // Build messages array
+    if (std.mem.startsWith(u8, user_input, "[") and std.mem.endsWith(u8, user_input, "]")) {
+        // user_input is already a JSON array of messages (likely from context.buildContextMessagesJson)
+        // We take it but remove the trailing ']' because the loop expects to append more turns
+        try w.appendSlice(arena_alloc, user_input[0 .. user_input.len - 1]);
+    } else {
+        try w.appendSlice(arena_alloc, "[");
 
-    try w.writer(arena_alloc).print(
-        "{{\"role\":\"system\",\"content\":{f}}},",
-        .{std.json.fmt(system_prompt, .{})},
-    );
+        try w.writer(arena_alloc).print(
+            "{{\"role\":\"system\",\"content\":{f}}},",
+            .{std.json.fmt(system_prompt, .{})},
+        );
 
-    try w.writer(arena_alloc).print(
-        "{{\"role\":\"user\",\"content\":{f}}}",
-        .{std.json.fmt(user_input, .{})},
-    );
+        try w.writer(arena_alloc).print(
+            "{{\"role\":\"user\",\"content\":{f}}}",
+            .{std.json.fmt(user_input, .{})},
+        );
+    }
 
     var tool_calls: usize = 0;
     var no_tool_retries: usize = 0;
@@ -193,7 +199,7 @@ pub fn runModel(
         if (iter == max_iterations - 1) {
             const completed = todo_list.completedCount();
             const total_todos = todo_list.totalCount();
-            
+
             var extended = false;
             var reason: []const u8 = "";
 
@@ -272,7 +278,7 @@ pub fn runModel(
             turn.toolDefsToLlm(tools.definitions[0..]),
             active.reasoning_effort,
         );
-        
+
         if (turn.isCancelled()) {
             return .{
                 .response = try allocator.dupe(u8, "Operation cancelled by user."),
@@ -286,7 +292,7 @@ pub fn runModel(
         // Response is arena-allocated, no need to deinit individual fields
         if (response.reasoning.len > 0) {
             try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{response.reasoning});
-            display.addTimelineEntry("{s}Reasoning:{s}\n{s}{s}{s}\n", .{ display.C_PURPLE, display.C_RESET, display.C_PURPLE, response.reasoning, display.C_RESET });
+            display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}\n{s}{s}\n", .{ display.C_CYAN, display.C_RESET, display.C_REASONING_BG, display.C_BOLD, response.reasoning, display.C_RESET, display.C_RESET });
         }
 
         try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
