@@ -188,6 +188,27 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     };
     if (hash_to_load) |hash| {
         context.loadContextWindow(allocator, config_dir, &state.context_window, hash) catch {};
+
+        // Replay history to timeline
+        if (state.context_window.turns.items.len > 0) {
+            display.addTimelineEntry("{s}--- Resumed Session History ---{s}\n", .{ display.C_DIM, display.C_RESET });
+            for (state.context_window.turns.items) |turn| {
+                if (turn.role == .user) {
+                    const wrapped_lines = [_][]const u8{ turn.content };
+                    const box = try display.renderBox(allocator, "", &wrapped_lines, 80);
+                    defer allocator.free(box);
+                    display.addTimelineEntry("{s}", .{box});
+                } else {
+                    if (turn.content.len > 0) {
+                        display.addTimelineEntry("{s}⛬{s} {s}\n", .{ display.C_CYAN, display.C_RESET, turn.content });
+                    }
+                    if (turn.tool_calls > 0) {
+                        display.addTimelineEntry("{s}• {d} tool calls{s}\n", .{ display.C_DIM, turn.tool_calls, display.C_RESET });
+                    }
+                }
+            }
+            display.addTimelineEntry("{s}-------------------------------{s}\n", .{ display.C_DIM, display.C_RESET });
+        }
     }
     var history = context.CommandHistory.init();
     defer history.deinit(allocator);
