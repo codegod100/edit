@@ -114,12 +114,12 @@ fn tryRequest(
         return error.BadRequest;
     }
 
-    const body = allocating_writer.written();
-    if (body.len == 0) {
+    if (out.items.len == 0) {
+        out.deinit(allocator);
         return error.EmptyResponse;
     }
 
-    return allocator.dupe(u8, body);
+    return out.toOwnedSlice(allocator);
 }
 
 fn mapError(err: anyerror) anyerror {

@@ -27,7 +27,6 @@ var g_spinner_thread: ?std.Thread = null;
 fn spinnerThread(stdout_file: std.fs.File) void {
     var state_buf: [192]u8 = undefined;
     while (g_spinner_running.load(.acquire)) {
-        cancel.pollForEscape();
         drainInput();
         const state_text = display.getSpinnerStateText(&state_buf);
         const frame = display.getSpinnerFrame();
@@ -276,7 +275,8 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
         } else {
-            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "> ", &history);
+            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "> ", &history, queued_partial.items);
+            queued_partial.clearRetainingCapacity();
         }
 
         if (line_opt == null) {
@@ -394,7 +394,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         defer g_input_drain_state = null;
 
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            ctx_messages, stdout_file.isTty(), &state.todo_list, null, drainInput // system prompt override
+            ctx_messages, stdout_file.isTty(), &state.todo_list, null // system prompt override
         ) catch |err| {
             stopSpinner();
             cancel.disableRawMode(); // Disable raw mode before printing error
