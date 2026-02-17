@@ -65,7 +65,7 @@ fn stopSpinner() void {
 var g_callback_stdout_file: ?std.fs.File = null;
 var g_callback_prompt: ?[]const u8 = null;
 
-pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
+pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
     defer provider_arena.deinit();
@@ -151,6 +151,7 @@ pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
         .reasoning_effort = null,
         .project_hash = context.hashProjectPath(cwd),
         .config_dir = config_dir,
+        .resumed_session_hash = resumed_session_hash_arg,
     };
     defer state.deinit();
 
@@ -175,11 +176,15 @@ pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
         config_dir, logger.getSessionID() 
     });
 
-    // Load Context/History (only restore context if ZAGENT_RESTORE_CONTEXT is set or --restore-context flag is passed)
+    // Load Context/History
+    // If a session was resumed, load its context. Otherwise, check ZAGENT_RESTORE_CONTEXT env var
     const restore_context_env = std.posix.getenv("ZAGENT_RESTORE_CONTEXT") != null;
-    const restore_context = restore_context_arg orelse restore_context_env;
-    if (restore_context) {
-        context.loadContextWindow(allocator, config_dir, &state.context_window, state.project_hash) catch {};
+    const hash_to_load = resumed_session_hash_arg orelse blk: {
+        if (restore_context_env) break :blk state.project_hash;
+        break :blk null;
+    };
+    if (hash_to_load) |hash| {
+        context.loadContextWindow(allocator, config_dir, &state.context_window, hash) catch {};
     }
     var history = context.CommandHistory.init();
     defer history.deinit(allocator);
@@ -277,7 +282,8 @@ pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
-        try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
+        const save_hash = state.resumed_session_hash orelse state.project_hash;
+        try context.saveContextWindow(allocator, config_dir, &state.context_window, save_hash);
 
         // Initialize tool output arena for persistent strings
         const legacy = @import("../model_loop/legacy.zig");
@@ -344,7 +350,8 @@ pub fn run(allocator: std.mem.Allocator, restore_context_arg: ?bool) !void {
         mut_res.deinit(allocator);
 
         try context.compactContextWindow(allocator, &state.context_window, active.?);
-        try context.saveContextWindow(allocator, config_dir, &state.context_window, state.project_hash);
+        const save_hash2 = state.resumed_session_hash orelse state.project_hash;
+        try context.saveContextWindow(allocator, config_dir, &state.context_window, save_hash2);
 
         // Add a newline after turn completion
         try stdout.writeAll("\n");

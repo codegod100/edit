@@ -57,7 +57,7 @@ pub fn main() !void {
     logger.info("zagent starting up", .{});
 
     // Handle resume if requested
-    var restore_context = false;
+    var resumed_session_hash: ?u64 = null;
     if (resume_session_id) |id| {
         const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
         defer allocator.free(config_dir);
@@ -79,7 +79,7 @@ pub fn main() !void {
                 if (context.loadContextWindow(allocator, config_dir, &window, project_hash)) {
                     if (window.turns.items.len > 0) {
                         std.debug.print("Resumed session {s} with {d} turns\n", .{sid, window.turns.items.len});
-                        restore_context = true;
+                        resumed_session_hash = project_hash;
                     }
                 } else |_| {
                     std.debug.print("Failed to load session: {s}\n", .{sid});
@@ -87,7 +87,6 @@ pub fn main() !void {
             }
         } else {
             // Use the provided session ID
-            // config_dir is already declared above
             logger.info("Resuming session: {s}", .{id});
             var window = context.ContextWindow.init(32000, 20);
             defer window.deinit(allocator);
@@ -100,7 +99,7 @@ pub fn main() !void {
             if (context.loadContextWindow(allocator, config_dir, &window, project_hash)) {
                 if (window.turns.items.len > 0) {
                     std.debug.print("Resumed session {s} with {d} turns\n", .{id, window.turns.items.len});
-                    restore_context = true;
+                    resumed_session_hash = project_hash;
                 }
             } else |_| {
                 std.debug.print("Failed to load session: {s}\n", .{id});
@@ -108,7 +107,7 @@ pub fn main() !void {
         }
     }
 
-    try repl.run(allocator, if (restore_context) true else null);
+    try repl.run(allocator, resumed_session_hash);
 
     logger.info("zagent shutting down", .{});
 }
