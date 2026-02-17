@@ -662,7 +662,7 @@ pub fn renderStatusBar(stdout_file: std.fs.File, spinner_frame: []const u8, stat
     // Construct the full line with explicit padding
     // We use a new buffer for the final escape sequence
     var final_buf: [2048]u8 = undefined;
-    const status = std.fmt.bufPrint(&final_buf, "\x1b[s\x1b[{d};1H{s}{s} {s: <25} {s} {s: <30} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
+    const status = std.fmt.bufPrint(&final_buf, "\x1b[s\x1b[{d};1H{s}{s} {s: <18} {s} {s: <22} {s} {s}\x1b[K\x1b[0m\x1b[u", .{
         term_height,
         bg_color,
         fg_color,
