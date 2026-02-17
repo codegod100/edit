@@ -65,6 +65,13 @@ fn stopSpinner() void {
 var g_callback_stdout_file: ?std.fs.File = null;
 var g_callback_prompt: ?[]const u8 = null;
 
+const InputDrainCallback = *const fn () void;
+var g_input_drain_callback: ?InputDrainCallback = null;
+
+fn drainInput() void {
+    if (g_input_drain_callback) |cb| cb();
+}
+
 pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
@@ -258,7 +265,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
         } else {
-            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "", &history);
+            line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "> ", &history);
         }
 
         if (line_opt == null) {
@@ -366,8 +373,40 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         cancel.enableRawMode();
         defer cancel.disableRawMode();
 
+        const Context = struct {
+            alloc: std.mem.Allocator,
+            sin: std.fs.File,
+            part: *std.ArrayListUnmanaged(u8),
+            q: *std.ArrayListUnmanaged([]u8),
+
+            fn cb() void {
+                // This is a bit tricky since we can't easily capture state in a function pointer.
+                // However, we can use a thread-local or another global if we're careful.
+                // For now, let's use a simpler approach: define the callback logic here.
+            }
+        };
+        _ = Context; // Unused for now
+
+        // Set up the global callback to point to a local function that captures state
+        const S = struct {
+            var alloc: std.mem.Allocator = undefined;
+            var sin: std.fs.File = undefined;
+            var part: *std.ArrayListUnmanaged(u8) = undefined;
+            var q: *std.ArrayListUnmanaged([]u8) = undefined;
+
+            fn callback() void {
+                @import("../line_editor.zig").drainQueuedLinesFromStdin(alloc, sin, part, q);
+            }
+        };
+        S.alloc = allocator;
+        S.sin = stdin_file;
+        S.part = &queued_partial;
+        S.q = &queued_lines;
+        g_input_drain_callback = S.callback;
+        defer g_input_drain_callback = null;
+
         const result = model_loop.runModel(allocator, stdout, active.?, line, // raw request
-            ctx_messages, stdout_file.isTty(), &state.todo_list, null // system prompt override
+            ctx_messages, stdout_file.isTty(), &state.todo_list, null, drainInput // system prompt override
         ) catch |err| {
             stopSpinner();
             logger.err("runModel failed with error: {any}", .{err});
