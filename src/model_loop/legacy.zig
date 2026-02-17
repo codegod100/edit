@@ -295,8 +295,11 @@ pub fn runModel(
 
         // Response is arena-allocated, no need to deinit individual fields
         if (response.reasoning.len > 0) {
-            try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{response.reasoning});
-            display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}\n{s}{s}\n", .{ display.C_CYAN, display.C_RESET, display.C_REASONING_BG, display.C_BOLD, response.reasoning, display.C_RESET, display.C_RESET });
+            const trimmed_reasoning = std.mem.trim(u8, response.reasoning, " \t\r\n");
+            if (trimmed_reasoning.len > 0) {
+                try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{trimmed_reasoning});
+                display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}\n{s}", .{ display.C_CYAN, display.C_RESET, display.C_PURPLE, trimmed_reasoning, display.C_RESET, display.C_RESET });
+            }
         }
 
         try w.replaceRange(arena_alloc, w.items.len - 1, 1, "");
