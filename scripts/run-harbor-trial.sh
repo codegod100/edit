@@ -165,7 +165,7 @@ CMD=(
   --agent-kwarg "zagent_binary_path=$ABS_ZAGENT_BIN"
   --agent-kwarg "provider_id=$PROVIDER_ID"
   --agent-kwarg "zagent_model_id=$MODEL_ID"
-  --agent-kwarg "instruction_prefix=Work from the task workspace only. Start by checking pwd and local files. If /app/task_file exists, use it as task root. Never run global filesystem scans like find /."
+  --agent-kwarg "instruction_prefix=Work from the task workspace only. Start by checking pwd and local files. If /app/task_file exists, use it as task root. Never run global filesystem scans like find /. If only numeric threshold tests fail (cost/latency/%), prioritize objective optimization and rerun failing checks before finishing."
 )
 
 if [[ -f "$TASK_SETUP_SCRIPT" ]]; then

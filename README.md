@@ -8,8 +8,10 @@
 -   **Plan & Progress**: Built-in `todo` system allows the agent to create plans, track progress, and auto-correct if it drifts off course.
 -   **Robust Terminal UI**:
     -   Pinned status bar for context (model, provider, spinner).
-    -   Scrollable timeline history with boxed inputs and outputs.
-    -   Artifact-free rendering with ANSI-aware text wrapping.
+    -   Scrollable timeline history with ANSI-aware text wrapping.
+    -   Hardened line editor and history navigation (clean Up/Down recall, prompt-prefix normalization).
+    -   Improved Ctrl+C/EOF terminal cleanup (reduced shell handoff artifacts).
+    -   Spinner starts immediately for model turns (title generation removed from hot path).
 -   **Modular Architecture**:
     -   `ai_bridge`: Unified interface for LLM providers.
     -   `model_loop`: Sophisticated agent loop with tool execution, error handling, and adaptive step limits.
@@ -49,14 +51,34 @@ Or using the build system:
 zig build run
 ```
 
+Resume a previous session:
+
+```bash
+./zig-out/bin/zagent --resume
+./zig-out/bin/zagent --resume <session-id>
+```
+
+Optional context restore behavior:
+
+```bash
+ZAGENT_RESTORE_CONTEXT=1 ./zig-out/bin/zagent
+```
+
 ### Commands
 
 Inside the REPL, you can interact with the agent using natural language or special commands:
 
--   `/help`: Show available commands.
--   `/model [name]`: Switch the active model/provider.
--   `/connect [provider]`: Setup a new provider connection.
--   `/quit` or `Ctrl+D`: Exit the session.
+-   `/providers`: List provider connection status.
+-   `/connect [provider]`: Configure/connect a provider.
+-   `/provider [id]`: Switch active provider.
+-   `/model [provider/model]`: Switch active model.
+-   `/models [filter]`: List available models.
+-   `/usage`: Show quota + token/tool usage.
+-   `/stats`: Show session stats.
+-   `/skills`, `/skill <name>`, `/tools`: Introspection helpers.
+-   `/clear`: Clear timeline.
+-   `/restore`: Restore prior context for current project.
+-   `/quit` or `Ctrl+D`: Exit session.
 
 ### Scripting
 
@@ -66,12 +88,31 @@ You can pipe commands to `zagent` for automated workflows:
 echo "Analyze the src/ directory and summarize the architecture" | ./zig-out/bin/zagent
 ```
 
+### Benchmarking and Trials
+
+This repo now uses Harbor-imported Terminal-Bench tasks (formalized task source):
+
+```bash
+# Import dataset and build flat task index
+scripts/import-terminal-bench.sh
+
+# Run the first 3 imported tasks
+scripts/import-terminal-bench.sh --run 3
+
+# Run a specific imported task path
+scripts/run-harbor-trial.sh --task third_party/terminal-bench-2/flat/<task-name>
+```
+
+See `docs/harbor-zagent-quickstart.md` for the full Harbor setup flow.
+
 ## Configuration
 
 Configuration files are stored in `~/.config/zagent/`. This includes:
--   `providers.json`: API keys and endpoints.
+-   `settings.json`: Provider/model catalog and provider config.
+-   `provider.env`: Provider API keys.
 -   `selected_model.json`: Persistent user preferences.
--   `sessions/`: History and context for previous runs.
+-   `history`: Command history used for Up/Down navigation.
+-   `context-<hash>.json`: Per-project conversation context used by restore/resume flows.
 
 ## Architecture
 

@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
-    const bench_cmd = b.addSystemCommand(&.{ "python3", "scripts/zbench.py" });
-    const bench_step = b.step("bench", "Run intelligence benchmarks");
+    const bench_cmd = b.addSystemCommand(&.{ "/usr/bin/env", "bash", "scripts/import-terminal-bench.sh", "--sample", "--run", "1" });
+    const bench_step = b.step("bench", "Import Terminal-Bench tasks and run a sample Harbor trial");
     bench_step.dependOn(&bench_cmd.step);
 }
