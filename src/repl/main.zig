@@ -344,6 +344,15 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
             }
         }
 
+        // Defensive normalization: strip any accidental prompt prefixes
+        // before rendering, command parsing, or history persistence.
+        const normalized_line = context.normalizeHistoryLine(line);
+        if (!std.mem.eql(u8, normalized_line, line)) {
+            const old_line = line;
+            line = try allocator.dupe(u8, normalized_line);
+            allocator.free(old_line);
+        }
+
         // Ensure we are at the start of a clean line before drawing the box
         std.debug.print("\r\x1b[K", .{});
 
@@ -471,33 +480,6 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
 
         // Add user turn to context
         try state.context_window.append(allocator, .user, line, .{});
-
-        // Generate title if needed (triggers if title is missing, using the first user prompt found in history)
-        if (state.context_window.title == null and state.context_window.turns.items.len > 0) {
-            var first_user_prompt: []const u8 = line;
-            for (state.context_window.turns.items) |t| {
-                if (t.role == .user) {
-                    first_user_prompt = t.content;
-                    break;
-                }
-            }
-
-            const title_prompt = try std.fmt.allocPrint(allocator,
-                "[{{\"role\":\"system\",\"content\":\"Generate a very short, concise title (max 6 words) for this task based on the user prompt. Return ONLY the title text, no quotes or prefix.\"}},{{\"role\":\"user\",\"content\":{f}}}]",
-                .{std.json.fmt(first_user_prompt, .{})},
-            );
-            defer allocator.free(title_prompt);
-
-            const title_res = model_loop.callModelDirect(allocator, active.?.api_key orelse "", active.?.model_id, active.?.provider_id, title_prompt, null, null) catch null;
-            if (title_res) |tr| {
-                defer tr.deinit(allocator);
-                const clean_title = std.mem.trim(u8, tr.text, " \t\r\n\"");
-                if (clean_title.len > 0) {
-                    if (state.context_window.title) |old| allocator.free(old);
-                    state.context_window.title = try allocator.dupe(u8, clean_title);
-                }
-            }
-        }
 
         const save_hash = state.resumed_session_hash orelse state.project_hash;
         try context.saveContextWindow(allocator, config_dir, &state.context_window, save_hash);

@@ -15,6 +15,7 @@ pub const CommandTag = enum {
     list_models,
     set_effort,
     stats,
+    usage,
     ping,
     clear,
     restore, // Restore previous session context
@@ -40,6 +41,7 @@ pub fn parseCommand(input: []const u8) CommandTag {
     if (std.mem.eql(u8, cmd, "/models")) return .list_models;
     if (std.mem.eql(u8, cmd, "/effort")) return .set_effort;
     if (std.mem.eql(u8, cmd, "/stats")) return .stats;
+    if (std.mem.eql(u8, cmd, "/usage")) return .usage;
     if (std.mem.eql(u8, cmd, "/ping")) return .ping;
     if (std.mem.eql(u8, cmd, "/clear")) return .clear;
     if (std.mem.eql(u8, cmd, "/restore")) return .restore;

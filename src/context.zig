@@ -95,12 +95,48 @@ pub const CommandHistory = struct {
     }
 
     pub fn append(self: *CommandHistory, allocator: std.mem.Allocator, line: []const u8) !void {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) return;
-        if (self.items.items.len > 0 and std.mem.eql(u8, self.items.items[self.items.items.len - 1], trimmed)) return;
-        try self.items.append(allocator, try allocator.dupe(u8, trimmed));
+        const normalized = normalizeHistoryLine(line);
+        if (normalized.len == 0) return;
+        if (self.items.items.len > 0 and std.mem.eql(u8, self.items.items[self.items.items.len - 1], normalized)) return;
+        try self.items.append(allocator, try allocator.dupe(u8, normalized));
     }
 };
+
+pub fn normalizeHistoryLine(line: []const u8) []const u8 {
+    var trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+
+    while (true) {
+        // Strip leading ANSI escape sequences (e.g. "\x1b[38;5;111m").
+        while (trimmed.len > 2 and trimmed[0] == 0x1b and trimmed[1] == '[') {
+            var i: usize = 2;
+            while (i < trimmed.len) : (i += 1) {
+                const c = trimmed[i];
+                if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
+                    i += 1;
+                    break;
+                }
+            }
+            if (i <= 2 or i > trimmed.len) break;
+            trimmed = std.mem.trimLeft(u8, trimmed[i..], " \t");
+        }
+
+        if (std.mem.startsWith(u8, trimmed, ">")) {
+            trimmed = std.mem.trimLeft(u8, trimmed[1..], " \t");
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "›")) {
+            trimmed = std.mem.trimLeft(u8, trimmed["›".len..], " \t");
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "❯")) {
+            trimmed = std.mem.trimLeft(u8, trimmed["❯".len..], " \t");
+            continue;
+        }
+        break;
+    }
+    return trimmed;
+}
 
 pub const ActiveModel = struct {
     provider_id: []const u8,
@@ -145,8 +181,8 @@ pub fn loadHistory(allocator: std.mem.Allocator, base_path: []const u8, history:
 }
 
 pub fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, line: []const u8) !void {
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    if (trimmed.len == 0) return;
+    const normalized = normalizeHistoryLine(line);
+    if (normalized.len == 0) return;
 
     const path = try historyPathAlloc(allocator, base_path);
     defer allocator.free(path);
@@ -164,8 +200,23 @@ pub fn appendHistoryLine(allocator: std.mem.Allocator, base_path: []const u8, li
     defer file.close();
 
     try file.seekFromEnd(0);
-    try file.writeAll(trimmed);
+    try file.writeAll(normalized);
     try file.writeAll("\n");
+}
+
+test "normalizeHistoryLine strips repeated prompt markers" {
+    try std.testing.expectEqualStrings("hello", normalizeHistoryLine("> > hello"));
+    try std.testing.expectEqualStrings("hello", normalizeHistoryLine("> >hello"));
+    try std.testing.expectEqualStrings("hello", normalizeHistoryLine(">hello"));
+    try std.testing.expectEqualStrings("run tests", normalizeHistoryLine("› ❯ run tests"));
+}
+
+test "normalizeHistoryLine strips ansi then prompt marker" {
+    try std.testing.expectEqualStrings("/usage", normalizeHistoryLine("\x1b[38;5;111m> /usage\x1b[0m"));
+}
+
+test "normalizeHistoryLine keeps normal input" {
+    try std.testing.expectEqualStrings("/model openai/gpt-5", normalizeHistoryLine("/model openai/gpt-5"));
 }
 
 // --- Context window persistence ---

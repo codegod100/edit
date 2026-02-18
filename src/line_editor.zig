@@ -45,9 +45,47 @@ pub fn readPromptLine(
     history: *context.CommandHistory,
     partial_input: ?[]const u8,
 ) !?[]u8 {
+    const sanitizeFallback = struct {
+        fn run(alloc: std.mem.Allocator, raw: ?[]u8) !?[]u8 {
+            if (raw == null) return null;
+            const line = raw.?;
+            defer alloc.free(line);
+
+            var t = std.mem.trim(u8, line, " \t\r\n");
+            if (t.len == 0) return try alloc.dupe(u8, "");
+
+            // Remove accidental ANSI escape sequences and orphaned CSI tails
+            // (e.g. "[A" from Up arrow) that can leak during Ctrl+C transitions.
+            while (true) {
+                if (t.len >= 2 and t[0] == 0x1b and t[1] == '[') {
+                    var i: usize = 2;
+                    while (i < t.len) : (i += 1) {
+                        const c = t[i];
+                        if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    if (i > 2 and i <= t.len) {
+                        t = std.mem.trimLeft(u8, t[i..], " \t");
+                        continue;
+                    }
+                }
+
+                if (t.len >= 2 and t[0] == '[' and ((t[1] >= 'A' and t[1] <= 'Z') or (t[1] >= 'a' and t[1] <= 'z'))) {
+                    t = std.mem.trimLeft(u8, t[2..], " \t");
+                    continue;
+                }
+                break;
+            }
+
+            return try alloc.dupe(u8, t);
+        }
+    }.run;
+
     const original = std.posix.tcgetattr(stdin_file.handle) catch {
-        const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) orelse return null;
-        return line;
+        const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
+        return sanitizeFallback(allocator, line);
     };
 
     var raw = original;
@@ -62,8 +100,11 @@ pub fn readPromptLine(
         raw.cc[17] = 0;
     }
     std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
-        std.log.debug("Failed to set raw mode: {any}", .{err});
-        return stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
+        if (err != error.ProcessOrphaned) {
+            std.log.debug("Failed to set raw mode: {any}", .{err});
+        }
+        const line = stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
+        return sanitizeFallback(allocator, line);
     };
     defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
 
@@ -157,7 +198,8 @@ pub fn readPromptLine(
                         }
                         if (history_index.? > 0) {
                             history_index.? -= 1;
-                            const entry = history.items.items[history_index.?];
+                            const entry_raw = history.items.items[history_index.?];
+                            const entry = context.normalizeHistoryLine(entry_raw);
                             while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
                             for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
                             try stdout.writeAll(prompt);
@@ -170,7 +212,8 @@ pub fn readPromptLine(
                         if (history_index == null) continue;
                         if (history_index.? < history.items.items.len - 1) {
                             history_index.? += 1;
-                            const entry = history.items.items[history_index.?];
+                            const entry_raw = history.items.items[history_index.?];
+                            const entry = context.normalizeHistoryLine(entry_raw);
                             while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
                             for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
                             try stdout.writeAll(prompt);
@@ -212,8 +255,17 @@ pub fn readPromptLine(
         if (ch == 3) return null; // Ctrl+C
 
         if (ch == 13 or ch == 10) { // Enter
-            // Return to start of line and clear the prompt line completely
+            // Return to start of line and clear the prompt input completely.
+            // Multiline pastes may have echoed multiple physical lines due '\n'.
             try stdout.writeAll("\r\x1b[K");
+            var nl_count: usize = 0;
+            for (line) |c| {
+                if (c == '\n') nl_count += 1;
+            }
+            var i: usize = 0;
+            while (i < nl_count) : (i += 1) {
+                try stdout.writeAll("\x1b[1A\r\x1b[K");
+            }
             return try allocator.dupe(u8, line);
         }
 

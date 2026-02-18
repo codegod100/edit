@@ -13,6 +13,7 @@ const llm = @import("../llm.zig");
 const model_select = @import("../model_select.zig");
 const utils = @import("../utils.zig");
 const context = @import("../context.zig");
+const usage = @import("../usage.zig");
 
 // Helper to format providers output
 fn formatProvidersOutput(allocator: std.mem.Allocator, provider_specs: []const provider.ProviderSpec, states: []const provider.ProviderState) ![]u8 {
@@ -291,6 +292,30 @@ pub fn handleCommand(
             }
         },
         .stats => {}, // TODO
+        .usage => {
+            const active = model_select.chooseActiveModel(state.providers, state.provider_states, state.selected_model, state.reasoning_effort);
+            if (active == null) {
+                try stdout.print("No active provider/model.\n", .{});
+                return true;
+            }
+
+            const result = usage.queryCurrentProviderUsage(allocator, active.?.provider_id, active.?.api_key) catch |err| {
+                switch (err) {
+                    error.UnsupportedProvider => {
+                        try stdout.print("Usage query not implemented for provider: {s}\n", .{active.?.provider_id});
+                    },
+                    error.MissingApiKey => {
+                        try stdout.print("Missing API key for provider: {s}\n", .{active.?.provider_id});
+                    },
+                    else => {
+                        try stdout.print("Usage query failed: {s}\n", .{@errorName(err)});
+                    },
+                }
+                return true;
+            };
+            defer allocator.free(result);
+            display.addTimelineEntry("{s}\n", .{result});
+        },
         .ping => {
             try stdout.print("pong\n", .{});
         },
