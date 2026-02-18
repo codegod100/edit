@@ -139,6 +139,8 @@ pub fn runModel(
     var perf_threshold_active = false;
     var perf_fix_edit_made = false;
     var perf_fix_rechecked = false;
+    var perf_close_miss_active = false;
+    var perf_close_miss_gap_percent: f64 = 0.0;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -463,6 +465,12 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (perf_close_miss_active and perf_threshold_active and perf_fix_rechecked) {
+                    toolOutput("{s}Note:{s} still within close-miss range ({d:.2}%). Do one more focused optimization + recheck before finishing.", .{ display.C_YELLOW, display.C_RESET, perf_close_miss_gap_percent });
+                    const msg = try std.fmt.allocPrint(arena_alloc, "Single numeric threshold miss remains ({d:.2}% over target). Perform one more minimal targeted optimization and re-run the failing check before finishing.", .{perf_close_miss_gap_percent});
+                    try turn_results.append(arena_alloc, msg);
+                    continue;
+                }
                 const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                     toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
@@ -542,18 +550,34 @@ pub fn runModel(
                         }
                         if (isLikelyVerificationCommand(cmd)) {
                             ran_verification_since_mutation = true;
-                            if (looksLikeThresholdFailure(clean_result)) {
+                            const threshold = analyzeThresholdFailure(clean_result);
+                            if (threshold.detected) {
                                 perf_threshold_active = true;
                                 perf_fix_edit_made = false;
                                 perf_fix_rechecked = false;
-                                const msg = "Threshold/performance failure detected. Prioritize objective optimization, then rerun only failing checks.";
-                                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                                perf_close_miss_active = false;
+                                perf_close_miss_gap_percent = 0.0;
+                                if (threshold.single_numeric and threshold.gap_percent != null and threshold.gap_percent.? <= 5.0) {
+                                    perf_close_miss_active = true;
+                                    perf_close_miss_gap_percent = threshold.gap_percent.?;
+                                    const msg = try std.fmt.allocPrint(
+                                        arena_alloc,
+                                        "Single numeric threshold miss detected ({d:.2}% over target). Make one focused optimization edit, then rerun only the failing check.",
+                                        .{perf_close_miss_gap_percent},
+                                    );
+                                    try turn_results.append(arena_alloc, msg);
+                                } else {
+                                    const msg = "Threshold/performance failure detected. Prioritize objective optimization, then rerun only failing checks.";
+                                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                                }
                             } else if (perf_threshold_active) {
                                 perf_fix_rechecked = true;
                                 if (!looksLikeAnyFailure(clean_result)) {
                                     perf_threshold_active = false;
                                     perf_fix_edit_made = false;
                                     perf_fix_rechecked = false;
+                                    perf_close_miss_active = false;
+                                    perf_close_miss_gap_percent = 0.0;
                                 }
                             }
                         }
@@ -633,6 +657,17 @@ pub fn runModel(
             );
             try w.appendSlice(arena_alloc, "}");
         }
+        if (iter == max_iterations - 1 and adaptive_extensions_used < max_adaptive_extensions and perf_close_miss_active) {
+            adaptive_extensions_used += 1;
+            max_iterations += 10;
+            toolOutput("{s}Note:{s} close threshold miss ({d:.2}%) near step limit; extending budget to {d} steps.", .{ display.C_YELLOW, display.C_RESET, perf_close_miss_gap_percent, max_iterations });
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("You are very close to passing numeric thresholds. Apply one small targeted optimization and rerun the failing check before finishing.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
     }
 
     toolOutput("{s}Stop:{s} Step limit reached ({d}).", .{ display.C_RED, display.C_RESET, max_iterations });
@@ -707,4 +742,59 @@ fn looksLikeAnyFailure(out: []const u8) bool {
     return utils.containsIgnoreCase(out, "failed") or
         utils.containsIgnoreCase(out, "error") or
         utils.containsIgnoreCase(out, "assertionerror");
+}
+
+const ThresholdAnalysis = struct {
+    detected: bool,
+    single_numeric: bool,
+    gap_percent: ?f64,
+};
+
+fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
+    var has_numeric_assert = false;
+    var numeric_assert_count: usize = 0;
+    var assertion_count: usize = 0;
+    var gap_percent: ?f64 = null;
+
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "AssertionError")) |_| {
+            assertion_count += 1;
+            if (std.mem.indexOf(u8, line, " > ")) |gt_idx| {
+                const lhs = parseLastNumber(line[0..gt_idx]);
+                const rhs = parseFirstNumber(line[gt_idx + 3 ..]);
+                if (lhs != null and rhs != null and rhs.? > 0.0 and lhs.? > rhs.?) {
+                    has_numeric_assert = true;
+                    numeric_assert_count += 1;
+                    gap_percent = ((lhs.? - rhs.?) / rhs.?) * 100.0;
+                }
+            }
+        }
+    }
+
+    const detected = has_numeric_assert or looksLikeThresholdFailure(out);
+    return .{
+        .detected = detected,
+        .single_numeric = detected and assertion_count == 1 and numeric_assert_count == 1,
+        .gap_percent = gap_percent,
+    };
+}
+
+fn parseFirstNumber(s: []const u8) ?f64 {
+    var tok = std.mem.tokenizeAny(u8, s, " \t,:;()[]{}<>=\"'");
+    while (tok.next()) |t| {
+        const n = std.fmt.parseFloat(f64, t) catch continue;
+        return n;
+    }
+    return null;
+}
+
+fn parseLastNumber(s: []const u8) ?f64 {
+    var tok = std.mem.tokenizeAny(u8, s, " \t,:;()[]{}<>=\"'");
+    var out: ?f64 = null;
+    while (tok.next()) |t| {
+        const n = std.fmt.parseFloat(f64, t) catch continue;
+        out = n;
+    }
+    return out;
 }
