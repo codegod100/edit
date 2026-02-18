@@ -605,6 +605,12 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
 
     for (indices) |idx| {
         const turn = window.turns.items[idx];
+        // Avoid duplicating the current user request in relevant turns.
+        // The current request is appended explicitly below, so any matching
+        // user turn here is redundant and can cause duplicated prompts.
+        if (turn.role == .user and std.mem.eql(u8, turn.content, user_input)) {
+            continue;
+        }
         try w.writeAll("{\"role\":");
         try w.print("{f}", .{std.json.fmt(if (turn.role == .user) "user" else "assistant", .{})});
         try w.writeAll(",\"content\":");

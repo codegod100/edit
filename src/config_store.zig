@@ -103,10 +103,10 @@ test "save and load selected model" {
     try saveSelectedModel(allocator, root, .{ .provider_id = "openai", .model_id = "gpt-5.3-codex" });
     const loaded = try loadSelectedModel(allocator, root);
     try std.testing.expect(loaded != null);
+    try std.testing.expectEqualStrings("openai", loaded.?.provider_id);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.?.model_id);
     if (loaded) |persisted| {
         var p = persisted;
         defer p.deinit(allocator);
     }
-    try std.testing.expectEqualStrings("openai", loaded.?.provider_id);
-    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.?.model_id);
 }

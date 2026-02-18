@@ -294,7 +294,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         }
 
         // Colorize input text in the timeline (no box)
-        display.addTimelineEntry("{s}> {s}{s}\n", .{ display.C_CYAN, line, display.C_RESET });
+        display.addTimelineEntry("{s}> {s}{s}\n", .{ display.C_PROMPT, line, display.C_RESET });
 
         // History
         try history.append(allocator, line);

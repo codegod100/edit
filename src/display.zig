@@ -16,6 +16,12 @@ pub const C_RED = "\x1b[31m";
 pub const C_CYAN = "\x1b[36m";
 pub const C_BRIGHT_WHITE = "\x1b[97m";
 pub const C_GREY = "\x1b[90m";
+pub const C_PROMPT = "\x1b[38;5;111m"; // User prompt lines
+pub const C_THINKING = "\x1b[38;5;179m"; // Thinking headers
+
+// Background colors
+pub const C_REASONING_BG = "\x1b[48;5;234m"; // Very dark gray background for reasoning text
+pub const C_REASONING_FG = "\x1b[38;5;252m"; // High-contrast light gray text for reasoning on dark terminals
 
 // Braille spinner frames for working/thinking indicator
 const SPINNER_FRAMES = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
@@ -131,6 +137,58 @@ pub fn visibleLenAnsi(text: []const u8) usize {
             continue;
         }
         n += 1;
+    }
+    return n;
+}
+
+fn runeDisplayWidth(cp: u21) usize {
+    // Zero-width joiners/variation selectors/combining marks.
+    if (cp == 0x200D or (cp >= 0xFE00 and cp <= 0xFE0F) or
+        (cp >= 0x0300 and cp <= 0x036F) or
+        (cp >= 0x1AB0 and cp <= 0x1AFF) or
+        (cp >= 0x1DC0 and cp <= 0x1DFF) or
+        (cp >= 0x20D0 and cp <= 0x20FF) or
+        (cp >= 0xFE20 and cp <= 0xFE2F))
+    {
+        return 0;
+    }
+
+    // Common full-width / emoji ranges that occupy two cells in terminals.
+    if ((cp >= 0x1100 and cp <= 0x115F) or
+        (cp >= 0x2329 and cp <= 0x232A) or
+        (cp >= 0x2E80 and cp <= 0xA4CF) or
+        (cp >= 0xAC00 and cp <= 0xD7A3) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0xFE10 and cp <= 0xFE19) or
+        (cp >= 0xFE30 and cp <= 0xFE6F) or
+        (cp >= 0xFF00 and cp <= 0xFF60) or
+        (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x1F300 and cp <= 0x1FAFF))
+    {
+        return 2;
+    }
+    return 1;
+}
+
+fn displayWidthAnsi(text: []const u8) usize {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            i += 2;
+            while (i < text.len and ((text[i] >= '0' and text[i] <= '9') or text[i] == ';')) : (i += 1) {}
+            if (i < text.len) i += 1;
+            continue;
+        }
+
+        const cp = std.unicode.utf8Decode(text[i..]) catch {
+            n += 1;
+            i += 1;
+            continue;
+        };
+        const len = std.unicode.utf8CodepointSequenceLength(cp) catch 1;
+        n += runeDisplayWidth(cp);
+        i += len;
     }
     return n;
 }
@@ -617,6 +675,191 @@ pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
     var buf: [32]u8 = undefined;
     const seq = std.fmt.bufPrint(&buf, "\x1b[{d};1H", .{height}) catch return;
     _ = stdout_file.write(seq) catch {};
+}
+
+fn trimCellMarkdown(cell: []const u8) []const u8 {
+    const t = std.mem.trim(u8, cell, " \t");
+    if (t.len >= 4 and std.mem.startsWith(u8, t, "**") and std.mem.endsWith(u8, t, "**")) {
+        return t[2 .. t.len - 2];
+    }
+    if (t.len >= 2 and std.mem.startsWith(u8, t, "`") and std.mem.endsWith(u8, t, "`")) {
+        return t[1 .. t.len - 1];
+    }
+    return t;
+}
+
+fn splitPipeRow(allocator: std.mem.Allocator, line: []const u8) ![][]const u8 {
+    var t = std.mem.trim(u8, line, " \t");
+    if (t.len > 0 and t[0] == '|') t = t[1..];
+    if (t.len > 0 and t[t.len - 1] == '|') t = t[0 .. t.len - 1];
+
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= t.len) : (i += 1) {
+        if (i == t.len or t[i] == '|') {
+            try out.append(allocator, std.mem.trim(u8, t[start..i], " \t"));
+            start = i + 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn isPipeTableSeparator(line: []const u8) bool {
+    var t = std.mem.trim(u8, line, " \t");
+    if (t.len > 0 and t[0] == '|') t = t[1..];
+    if (t.len > 0 and t[t.len - 1] == '|') t = t[0 .. t.len - 1];
+    if (t.len == 0) return false;
+
+    var has_dash = false;
+    for (t) |c| {
+        switch (c) {
+            '-' => has_dash = true,
+            ':', ' ', '\t', '|' => {},
+            else => return false,
+        }
+    }
+    return has_dash;
+}
+
+fn isPipeTableRow(line: []const u8) bool {
+    const t = std.mem.trim(u8, line, " \t");
+    return std.mem.indexOfScalar(u8, t, '|') != null and !std.mem.startsWith(u8, t, "```");
+}
+
+fn writeRepeated(writer: anytype, s: []const u8, n: usize) !void {
+    var i: usize = 0;
+    while (i < n) : (i += 1) try writer.writeAll(s);
+}
+
+fn renderAnsiPipeTable(allocator: std.mem.Allocator, header_line: []const u8, body_lines: []const []const u8) ![]u8 {
+    const header_cells = try splitPipeRow(allocator, header_line);
+    defer allocator.free(header_cells);
+    if (header_cells.len < 2) return allocator.dupe(u8, header_line);
+
+    const cols = header_cells.len;
+    var widths = try allocator.alloc(usize, cols);
+    defer allocator.free(widths);
+    @memset(widths, 0);
+
+    for (header_cells, 0..) |c, idx| widths[idx] = displayWidthAnsi(trimCellMarkdown(c));
+
+    for (body_lines) |line| {
+        const cells = try splitPipeRow(allocator, line);
+        defer allocator.free(cells);
+        var i: usize = 0;
+        while (i < cols) : (i += 1) {
+            const cell = if (i < cells.len) trimCellMarkdown(cells[i]) else "";
+            const n = displayWidthAnsi(cell);
+            if (n > widths[i]) widths[i] = n;
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    // Top border
+    try w.writeAll(C_DIM ++ "┌");
+    for (widths, 0..) |wd, i| {
+        try writeRepeated(w, "─", wd + 2);
+        try w.writeAll(if (i + 1 < cols) "┬" else "┐");
+    }
+    try w.writeAll(C_RESET ++ "\n");
+
+    // Header row
+    try w.writeAll(C_DIM ++ "│" ++ C_RESET);
+    for (header_cells, 0..) |c, i| {
+        const cell = trimCellMarkdown(c);
+        try w.writeAll(" ");
+        try w.writeAll(C_BOLD ++ C_BRIGHT_WHITE);
+        try w.writeAll(cell);
+        try w.writeAll(C_RESET);
+        const pad = widths[i] - displayWidthAnsi(cell);
+        try writeRepeated(w, " ", pad + 1);
+        try w.writeAll(C_DIM ++ "│" ++ C_RESET);
+    }
+    try w.writeAll("\n");
+
+    // Header separator
+    try w.writeAll(C_DIM ++ "├");
+    for (widths, 0..) |wd, i| {
+        try writeRepeated(w, "─", wd + 2);
+        try w.writeAll(if (i + 1 < cols) "┼" else "┤");
+    }
+    try w.writeAll(C_RESET ++ "\n");
+
+    // Body rows
+    for (body_lines) |line| {
+        const cells = try splitPipeRow(allocator, line);
+        defer allocator.free(cells);
+        try w.writeAll(C_DIM ++ "│" ++ C_RESET);
+        var i: usize = 0;
+        while (i < cols) : (i += 1) {
+            const cell = if (i < cells.len) trimCellMarkdown(cells[i]) else "";
+            try w.writeAll(" ");
+            try w.writeAll(cell);
+            const pad = widths[i] - displayWidthAnsi(cell);
+            try writeRepeated(w, " ", pad + 1);
+            try w.writeAll(C_DIM ++ "│" ++ C_RESET);
+        }
+        try w.writeAll("\n");
+    }
+
+    // Bottom border
+    try w.writeAll(C_DIM ++ "└");
+    for (widths, 0..) |wd, i| {
+        try writeRepeated(w, "─", wd + 2);
+        try w.writeAll(if (i + 1 < cols) "┴" else "┘");
+    }
+    try w.writeAll(C_RESET ++ "\n");
+
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= text.len) : (i += 1) {
+        if (i == text.len or text[i] == '\n') {
+            try lines.append(allocator, std.mem.trimRight(u8, text[start..i], "\r"));
+            start = i + 1;
+        }
+    }
+
+    var is_first_output = true;
+    var idx: usize = 0;
+    while (idx < lines.items.len) {
+        if (idx + 1 < lines.items.len and isPipeTableRow(lines.items[idx]) and isPipeTableSeparator(lines.items[idx + 1])) {
+            const table_start = idx;
+            idx += 2; // skip header + separator
+            while (idx < lines.items.len and isPipeTableRow(lines.items[idx])) : (idx += 1) {}
+
+            const rendered = try renderAnsiPipeTable(allocator, lines.items[table_start], lines.items[table_start + 2 .. idx]);
+            defer allocator.free(rendered);
+
+            if (is_first_output) {
+                addTimelineEntry("{s}⛬{s}\n", .{ C_CYAN, C_RESET });
+                is_first_output = false;
+            }
+            addTimelineEntry("{s}", .{rendered});
+            continue;
+        }
+
+        const line = lines.items[idx];
+        if (is_first_output) {
+            addTimelineEntry("{s}⛬{s} {s}\n", .{ C_CYAN, C_RESET, line });
+            is_first_output = false;
+        } else {
+            addTimelineEntry("{s}\n", .{line});
+        }
+        idx += 1;
+    }
 }
 
 // Track if spinner is active to reserve space for it

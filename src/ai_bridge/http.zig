@@ -11,10 +11,8 @@ pub fn httpRequest(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var allocating_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
+    var allocating_writer = std.Io.Writer.Allocating.init(allocator);
+    defer allocating_writer.deinit();
 
     var all_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer all_headers.deinit(allocator);
@@ -38,7 +36,5 @@ pub fn httpRequest(
         .response_writer = &allocating_writer.writer,
     });
 
-    const body = allocating_writer.written();
-    out.items.len = body.len;
-    return out.toOwnedSlice(allocator);
+    return try allocating_writer.toOwnedSlice();
 }

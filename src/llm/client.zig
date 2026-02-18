@@ -77,10 +77,8 @@ fn tryRequest(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-
-    var allocating_writer = std.Io.Writer.Allocating.fromArrayList(allocator, &out);
+    var allocating_writer = std.Io.Writer.Allocating.init(allocator);
+    defer allocating_writer.deinit();
 
     var all_headers: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer all_headers.deinit(allocator);
@@ -108,20 +106,17 @@ fn tryRequest(
     };
 
     if (result.status != .ok) {
+        std.log.err("HTTP error: status={d} url={s}", .{ @intFromEnum(result.status), url });
         if (result.status == .unauthorized) return error.AuthenticationError;
         if (result.status == .too_many_requests) return error.RateLimited;
         if (@intFromEnum(result.status) >= 500) return error.ServerError;
         return error.BadRequest;
     }
 
-    const body = allocating_writer.written();
-    if (body.len == 0) {
+    if (allocating_writer.written().len == 0) {
         return error.EmptyResponse;
     }
-
-    // Ensure the ArrayList reflects the data actually written by the Allocating writer
-    out.items.len = body.len;
-    return out.toOwnedSlice(allocator);
+    return try allocating_writer.toOwnedSlice();
 }
 
 fn mapError(err: anyerror) anyerror {

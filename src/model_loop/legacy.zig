@@ -15,7 +15,6 @@ const turn = @import("turn.zig");
 // Tool output callback type for timeline integration
 // Takes a pre-formatted string and adds it to timeline
 pub const ToolOutputCallback = *const fn ([]const u8) void;
-pub const InputDrainCallback = *const fn () void;
 
 var g_tool_output_callback: ?ToolOutputCallback = null;
 
@@ -122,7 +121,6 @@ pub fn runModel(
     stdout_is_tty: bool,
     todo_list: *todo.TodoList,
     custom_system_prompt: ?[]const u8,
-    input_drain_cb: ?InputDrainCallback,
 ) !active_module.RunTurnResult {
     _ = stdout_is_tty;
 
@@ -186,8 +184,6 @@ pub fn runModel(
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
-        if (input_drain_cb) |cb| cb();
-
         // EARLY PLAN CHECK: If we are at step 5 and still have no plan, nudge the agent
         if (iter == 5 and todo_list.totalCount() == 0) {
             toolOutput("{s}Note:{s} No plan detected after 5 steps. Prompting creation.", .{ display.C_YELLOW, display.C_RESET });
@@ -298,7 +294,7 @@ pub fn runModel(
             const trimmed_reasoning = std.mem.trim(u8, response.reasoning, " \t\r\n");
             if (trimmed_reasoning.len > 0) {
                 try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{trimmed_reasoning});
-                display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}\n{s}", .{ display.C_CYAN, display.C_RESET, display.C_PURPLE, trimmed_reasoning, display.C_RESET, display.C_RESET });
+                display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}{s}\n{s}", .{ display.C_THINKING, display.C_RESET, display.C_REASONING_BG, display.C_REASONING_FG, trimmed_reasoning, display.C_RESET, display.C_RESET });
             }
         }
 
@@ -321,7 +317,7 @@ pub fn runModel(
             const trimmed_text = std.mem.trim(u8, response.text, " \t\r\n");
             if (trimmed_text.len > 0) {
                 try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{response.text});
-                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, response.text });
+                try display.addAssistantMessage(allocator, response.text);
                 return .{
                     .response = try allocator.dupe(u8, response.text),
                     .reasoning = try allocator.dupe(u8, response.reasoning),
