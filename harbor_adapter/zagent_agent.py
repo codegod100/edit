@@ -29,6 +29,8 @@ class ZagentHarborAgent(BaseAgent):
         provider_id: str = "zai",
         zagent_model_id: str = "glm-4.7",
         task_setup_script_path: str | None = None,
+        instruction_prefix: str | None = None,
+        instruction_suffix: str | None = None,
         extra_env: dict[str, str] | None = None,
         *args,
         **kwargs,
@@ -42,6 +44,8 @@ class ZagentHarborAgent(BaseAgent):
             if task_setup_script_path
             else None
         )
+        self._instruction_prefix = instruction_prefix or ""
+        self._instruction_suffix = instruction_suffix or ""
         self._extra_env = dict(extra_env or {})
 
     @staticmethod
@@ -58,16 +62,15 @@ class ZagentHarborAgent(BaseAgent):
                 target_path="/usr/local/bin/zagent",
             )
             await environment.exec("chmod +x /usr/local/bin/zagent")
-            return
-
-        # Fallback mode for environments where file upload is unsupported
-        # (for example podman-backed docker-compose without `compose cp`).
-        result = await environment.exec("test -x /usr/local/bin/zagent")
-        if result.return_code != 0:
-            raise FileNotFoundError(
-                f"zagent binary not found on host ({self._zagent_binary_path}) "
-                "or in container (/usr/local/bin/zagent)"
-            )
+        else:
+            # Fallback mode for environments where file upload is unsupported
+            # (for example podman-backed docker-compose without `compose cp`).
+            result = await environment.exec("test -x /usr/local/bin/zagent")
+            if result.return_code != 0:
+                raise FileNotFoundError(
+                    f"zagent binary not found on host ({self._zagent_binary_path}) "
+                    "or in container (/usr/local/bin/zagent)"
+                )
 
         if self._task_setup_script_path is not None:
             if not self._task_setup_script_path.exists():
@@ -98,7 +101,9 @@ class ZagentHarborAgent(BaseAgent):
                 }
             ]
         }
-        instruction_q = shlex.quote(instruction)
+        merged_instruction = f"{self._instruction_prefix}\n{instruction}\n{self._instruction_suffix}".strip()
+        compact_instruction = " ".join(line.strip() for line in merged_instruction.splitlines() if line.strip())
+        instruction_q = shlex.quote(compact_instruction)
         settings_q = shlex.quote(json.dumps(settings))
         api_key_q = shlex.quote(os.environ.get("ZAI_API_KEY", ""))
 
@@ -114,6 +119,7 @@ class ZagentHarborAgent(BaseAgent):
         await environment.exec(prep_cmd, env=self._extra_env)
 
         run_cmd = (
+            "if [ -d /app/task_file ]; then cd /app/task_file; else cd /app; fi; "
             "{ printf '/model %s/%s\\n' "
             + shlex.quote(self._provider_id)
             + " "

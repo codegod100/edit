@@ -67,3 +67,16 @@ harbor jobs start \
 - The adapter runs one prompt then sends `/quit`.
 - Raw output is saved to `/logs/agent/zagent.txt` in the trial logs.
 - Token/cost metrics are not parsed yet; only metadata is recorded.
+
+## 7) Import Terminal-Bench 2 and run tasks
+
+```bash
+# Download + flatten task paths
+scripts/import-terminal-bench.sh
+
+# Download + run first 3 tasks sequentially
+scripts/import-terminal-bench.sh --run 3
+
+# Show run commands only (no execution)
+scripts/import-terminal-bench.sh --run 3 --dry-run
+```

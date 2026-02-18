@@ -28,3 +28,4 @@ __pycache__/
 
 # Harbor local outputs
 trials/
+third_party/

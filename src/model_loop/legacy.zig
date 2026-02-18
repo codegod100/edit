@@ -144,11 +144,12 @@ pub fn runModel(
 
     const system_prompt = custom_system_prompt orelse "You are a highly capable software engineering assistant. Your goal is to help the user with their task efficiently and accurately.\n\n" ++
         "1. **Analyze First**: Before making changes, use `grep` and `read_file` to understand the existing codebase, architectural patterns, and naming conventions. Mimic the style and structure of the project.\n" ++
-        "2. **Plan & Update**: For multi-step tasks, you MUST use `todo_add` to create a detailed plan. CRITICAL: You must call `todo_update(id, 'done')` immediately after completing each step. Do not leave tasks as 'pending' or 'in_progress' once the work is finished. Always check `todo_list` before finishing.\n" ++
+        "2. **Plan & Update**: Use `todo_*` tools only when the user asks for explicit planning or the task is genuinely complex. Avoid plan spam; focus on doing the work.\n" ++
         "3. **Be Precise**: When editing files, provide exact matches for `find` or `oldString`. Avoid introducing redundant or messy code. If you notice a pattern (like provider IDs), follow it strictly.\n" ++
-        "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
+        "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. Never scan the entire filesystem (`find /`, recursive `/` searches). Stay in the project/task workspace. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
         "5. **Skill Requests**: If user asks to create a skill, you must create a `SKILL.md` file under `.zagent/skills/<skill-name>/SKILL.md` (project-local) or `skills/<skill-name>/SKILL.md` in config. Do not create language/source files instead of `SKILL.md`.\n" ++
-        "6. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
+        "6. **Start in Task Root**: First inspect the current working directory and likely task roots (for example `/app/task_file` when present) before broad discovery.\n" ++
+        "7. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
 
     // Build messages array
     if (std.mem.startsWith(u8, user_input, "[") and std.mem.endsWith(u8, user_input, "]")) {
@@ -182,7 +183,7 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    var max_iterations: usize = 25;
+    const max_iterations: usize = 25;
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
@@ -195,77 +196,7 @@ pub fn runModel(
             try w.appendSlice(arena_alloc, "}");
         }
 
-        // EARLY PLAN CHECK: If we are at step 5 and still have no plan, nudge the agent
-        if (iter == 5 and todo_list.totalCount() == 0) {
-            toolOutput("{s}Note:{s} No plan detected after 5 steps. Prompting creation.", .{ display.C_YELLOW, display.C_RESET });
-            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-            try w.writer(arena_alloc).print(
-                "{f}",
-                .{std.json.fmt("You have executed 5 steps but have not created a plan (via todo_add) yet. For complex tasks, please create a todo list now to track your progress.", .{})},
-            );
-            try w.appendSlice(arena_alloc, "}");
-        }
-
-        // ADAPTIVE STEP LIMIT: If we are near the end, check if we should extend
-        if (iter == max_iterations - 1) {
-            const completed = todo_list.completedCount();
-            const total_todos = todo_list.totalCount();
-
-            var extended = false;
-            var reason: []const u8 = "";
-
-            if (max_iterations < 50) {
-                if (total_todos > 0) {
-                    if (completed < total_todos) {
-                        extended = true;
-                        const remaining = total_todos - completed;
-                        if (remaining == 1) {
-                            reason = "Almost done (1 item left). Extending for final push.";
-                            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                            try w.writer(arena_alloc).print(
-                                "{f}",
-                                .{std.json.fmt("Step limit extended. You are on the last item of your plan! Finish strong.", .{})},
-                            );
-                            try w.appendSlice(arena_alloc, "}");
-                        } else {
-                            reason = "Task incomplete. Auto-extending to allow completion.";
-                            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                            try w.writer(arena_alloc).print(
-                                "{f}",
-                                .{std.json.fmt("Step limit extended. You have pending todos. Please proceed with the next task.", .{})},
-                            );
-                            try w.appendSlice(arena_alloc, "}");
-                        }
-                    } else {
-                        // All done but no respond_text yet
-                        extended = true;
-                        reason = "All todos completed but no finish. Extending to allow wrap-up.";
-                        try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                        try w.writer(arena_alloc).print(
-                            "{f}",
-                            .{std.json.fmt("Step limit extended. You have marked all todos as done. Please provide your final summary via respond_text.", .{})},
-                        );
-                        try w.appendSlice(arena_alloc, "}");
-                    }
-                } else {
-                    // CRITICAL: Reached limit without ANY plan. This is a smell.
-                    // We extend to allow correction, but explicitly demand a plan.
-                    extended = true;
-                    reason = "Critical: No plan (todos) created yet.";
-                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
-                    try w.writer(arena_alloc).print(
-                        "{f}",
-                        .{std.json.fmt("Step limit reached, but you have not created a plan (via todo_add) yet. This is unexpected behavior. You MUST create a plan now to track your remaining work, or call respond_text if you are actually finished.", .{})},
-                    );
-                    try w.appendSlice(arena_alloc, "}");
-                }
-            }
-
-            if (extended) {
-                max_iterations += 10;
-                toolOutput("{s}Note:{s} {s} (Limit: {d})", .{ display.C_YELLOW, display.C_RESET, reason, max_iterations });
-            }
-        }
+        // Keep loop behavior simple; avoid enforcing plan tooling.
 
         if (turn.isCancelled()) {
             return .{
