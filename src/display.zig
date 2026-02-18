@@ -181,12 +181,21 @@ fn displayWidthAnsi(text: []const u8) usize {
             continue;
         }
 
-        const cp = std.unicode.utf8Decode(text[i..]) catch {
+        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch {
             n += 1;
             i += 1;
             continue;
         };
-        const len = std.unicode.utf8CodepointSequenceLength(cp) catch 1;
+        if (i + len > text.len) {
+            n += 1;
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            n += 1;
+            i += 1;
+            continue;
+        };
         n += runeDisplayWidth(cp);
         i += len;
     }
@@ -474,6 +483,91 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     if (g_timeline_allocator) |allocator| {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;
         g_timeline_entries.append(allocator, entry) catch allocator.free(entry);
+    }
+}
+
+pub fn addWrappedTimelineEntry(prefix: []const u8, text: []const u8, suffix: []const u8) void {
+    const term_width = terminalColumns();
+    const reserved_width = visibleLenAnsi(prefix) + visibleLenAnsi(suffix);
+    const content_width = if (term_width > reserved_width) term_width - reserved_width else 1;
+
+    var line_start: usize = 0;
+    while (line_start <= text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, line_start, '\n');
+        const line_end = nl orelse text.len;
+        const line = text[line_start..line_end];
+
+        if (line.len == 0) {
+            addTimelineEntry("{s}{s}{s}\n", .{ prefix, "", suffix });
+        } else {
+            var start: usize = 0;
+            while (start < line.len) {
+                // Avoid carrying spaces at the start of wrapped lines.
+                while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+                if (start >= line.len) break;
+
+                var j: usize = start;
+                var visible_count: usize = 0;
+                var last_space_idx: ?usize = null;
+
+                while (j < line.len) {
+                    if (line[j] == 0x1b and j + 1 < line.len and line[j + 1] == '[') {
+                        j += 2;
+                        while (j < line.len and !((line[j] >= 'A' and line[j] <= 'Z') or line[j] == 'm')) : (j += 1) {}
+                        if (j < line.len) j += 1;
+                        continue;
+                    }
+
+                    if (line[j] == ' ' or line[j] == '\t') {
+                        last_space_idx = j;
+                    }
+
+                    const char_len = std.unicode.utf8ByteSequenceLength(line[j]) catch {
+                        if (visible_count + 1 > content_width) break;
+                        visible_count += 1;
+                        j += 1;
+                        continue;
+                    };
+                    if (j + char_len > line.len) {
+                        if (visible_count + 1 > content_width) break;
+                        visible_count += 1;
+                        j += 1;
+                        continue;
+                    }
+                    const cp = std.unicode.utf8Decode(line[j .. j + char_len]) catch {
+                        if (visible_count + 1 > content_width) break;
+                        visible_count += 1;
+                        j += 1;
+                        continue;
+                    };
+                    const char_width = runeDisplayWidth(cp);
+                    if (visible_count + char_width > content_width) break;
+                    visible_count += char_width;
+                    j += char_len;
+                }
+
+                var end = j;
+                if (j < line.len) {
+                    if (last_space_idx) |space_idx| {
+                        if (space_idx > start) end = space_idx;
+                    }
+                }
+
+                // Hard-wrap if a single token is longer than line width.
+                if (end == start) {
+                    const char_len = std.unicode.utf8ByteSequenceLength(line[start]) catch 1;
+                    end = start + char_len;
+                    if (end > line.len) end = start + 1;
+                }
+
+                const chunk = std.mem.trimRight(u8, line[start..end], " \t");
+                addTimelineEntry("{s}{s}{s}\n", .{ prefix, chunk, suffix });
+                start = end;
+            }
+        }
+
+        if (nl == null) break;
+        line_start = line_end + 1;
     }
 }
 
@@ -819,6 +913,110 @@ fn renderAnsiPipeTable(allocator: std.mem.Allocator, header_line: []const u8, bo
     return out.toOwnedSlice(allocator);
 }
 
+fn orderedListMarkerLen(line: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {}
+    if (i == 0 or i + 1 >= line.len) return null;
+    if (line[i] == '.' and line[i + 1] == ' ') return i + 2;
+    return null;
+}
+
+fn renderMarkdownInline(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    var i: usize = 0;
+    var in_code = false;
+    var in_bold = false;
+    while (i < text.len) {
+        if (!in_code and i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
+            if (in_bold) {
+                try w.writeAll(C_RESET);
+            } else {
+                try w.writeAll(C_BOLD);
+            }
+            in_bold = !in_bold;
+            i += 2;
+            continue;
+        }
+        if (text[i] == '`') {
+            if (in_code) {
+                try w.writeAll(C_RESET);
+                if (in_bold) try w.writeAll(C_BOLD);
+            } else {
+                try w.writeAll(C_ORANGE);
+            }
+            in_code = !in_code;
+            i += 1;
+            continue;
+        }
+        try w.writeByte(text[i]);
+        i += 1;
+    }
+
+    if (in_code or in_bold) try w.writeAll(C_RESET);
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderMarkdownLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
+    const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+    const indent_len = line.len - trimmed_left.len;
+    const indent = line[0..indent_len];
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    if (std.mem.startsWith(u8, trimmed_left, "### ")) {
+        try w.writeAll(indent);
+        try w.writeAll(C_BOLD ++ C_CYAN);
+        try w.writeAll(trimmed_left[4..]);
+        try w.writeAll(C_RESET);
+        return out.toOwnedSlice(allocator);
+    }
+    if (std.mem.startsWith(u8, trimmed_left, "## ")) {
+        try w.writeAll(indent);
+        try w.writeAll(C_BOLD ++ C_CYAN);
+        try w.writeAll(trimmed_left[3..]);
+        try w.writeAll(C_RESET);
+        return out.toOwnedSlice(allocator);
+    }
+    if (std.mem.startsWith(u8, trimmed_left, "# ")) {
+        try w.writeAll(indent);
+        try w.writeAll(C_BOLD ++ C_CYAN);
+        try w.writeAll(trimmed_left[2..]);
+        try w.writeAll(C_RESET);
+        return out.toOwnedSlice(allocator);
+    }
+
+    if (orderedListMarkerLen(trimmed_left)) |marker_len| {
+        try w.writeAll(indent);
+        try w.writeAll(C_CYAN);
+        try w.writeAll(trimmed_left[0..marker_len]);
+        try w.writeAll(C_RESET);
+        const rest = try renderMarkdownInline(allocator, trimmed_left[marker_len..]);
+        defer allocator.free(rest);
+        try w.writeAll(rest);
+        return out.toOwnedSlice(allocator);
+    }
+    if (trimmed_left.len >= 2 and ((trimmed_left[0] == '-' or trimmed_left[0] == '*') and trimmed_left[1] == ' ')) {
+        try w.writeAll(indent);
+        try w.writeAll(C_CYAN);
+        try w.writeAll(trimmed_left[0..2]);
+        try w.writeAll(C_RESET);
+        const rest = try renderMarkdownInline(allocator, trimmed_left[2..]);
+        defer allocator.free(rest);
+        try w.writeAll(rest);
+        return out.toOwnedSlice(allocator);
+    }
+
+    const inline_rendered = try renderMarkdownInline(allocator, line);
+    defer allocator.free(inline_rendered);
+    try w.writeAll(inline_rendered);
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void {
     var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lines.deinit(allocator);
@@ -833,8 +1031,18 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
     }
 
     var is_first_output = true;
+    var in_code_fence = false;
     var idx: usize = 0;
     while (idx < lines.items.len) {
+        const line = lines.items[idx];
+        const trimmed_line = std.mem.trim(u8, line, " \t");
+
+        if (std.mem.startsWith(u8, trimmed_line, "```")) {
+            in_code_fence = !in_code_fence;
+            idx += 1;
+            continue;
+        }
+
         if (idx + 1 < lines.items.len and isPipeTableRow(lines.items[idx]) and isPipeTableSeparator(lines.items[idx + 1])) {
             const table_start = idx;
             idx += 2; // skip header + separator
@@ -851,12 +1059,17 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
             continue;
         }
 
-        const line = lines.items[idx];
+        const rendered_line = if (in_code_fence)
+            try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ C_ORANGE, line, C_RESET })
+        else
+            try renderMarkdownLine(allocator, line);
+        defer allocator.free(rendered_line);
+
         if (is_first_output) {
-            addTimelineEntry("{s}⛬{s} {s}\n", .{ C_CYAN, C_RESET, line });
+            addTimelineEntry("{s}⛬{s} {s}\n", .{ C_CYAN, C_RESET, rendered_line });
             is_first_output = false;
         } else {
-            addTimelineEntry("{s}\n", .{line});
+            addTimelineEntry("{s}\n", .{rendered_line});
         }
         idx += 1;
     }

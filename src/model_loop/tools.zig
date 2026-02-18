@@ -2,6 +2,7 @@ const std = @import("std");
 const tools = @import("../tools.zig");
 const display = @import("../display.zig");
 const todo = @import("../todo.zig");
+const utils = @import("../utils.zig");
 const legacy = @import("legacy.zig");
 
 pub fn executeInlineToolCalls(
@@ -99,7 +100,9 @@ pub fn executeInlineToolCalls(
             try display.printTruncatedCommandOutput(stdout, tool_out);
         }
 
-        const clean_out = try display.stripAnsi(allocator, tool_out);
+        const no_ansi = try display.stripAnsi(allocator, tool_out);
+        defer allocator.free(no_ansi);
+        const clean_out = try utils.sanitizeTextForModel(allocator, no_ansi, 128 * 1024);
         defer allocator.free(clean_out);
 
         try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, clean_out });

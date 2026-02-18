@@ -132,6 +132,7 @@ pub fn runModel(
     try logger.transcriptWrite("\n>>> User: {s}\n", .{user_input});
 
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
+    const skill_request = isSkillCreationRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
@@ -146,7 +147,8 @@ pub fn runModel(
         "2. **Plan & Update**: For multi-step tasks, you MUST use `todo_add` to create a detailed plan. CRITICAL: You must call `todo_update(id, 'done')` immediately after completing each step. Do not leave tasks as 'pending' or 'in_progress' once the work is finished. Always check `todo_list` before finishing.\n" ++
         "3. **Be Precise**: When editing files, provide exact matches for `find` or `oldString`. Avoid introducing redundant or messy code. If you notice a pattern (like provider IDs), follow it strictly.\n" ++
         "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
-        "5. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
+        "5. **Skill Requests**: If user asks to create a skill, you must create a `SKILL.md` file under `.zagent/skills/<skill-name>/SKILL.md` (project-local) or `skills/<skill-name>/SKILL.md` in config. Do not create language/source files instead of `SKILL.md`.\n" ++
+        "6. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
 
     // Build messages array
     if (std.mem.startsWith(u8, user_input, "[") and std.mem.endsWith(u8, user_input, "]")) {
@@ -184,6 +186,15 @@ pub fn runModel(
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
+        if (iter == 0 and skill_request) {
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("This is a skill-creation task. Create a `SKILL.md` file under `.zagent/skills/<skill-name>/SKILL.md` (project-local) or `skills/<skill-name>/SKILL.md` in config. Do not create a language demo/source file as a substitute.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+
         // EARLY PLAN CHECK: If we are at step 5 and still have no plan, nudge the agent
         if (iter == 5 and todo_list.totalCount() == 0) {
             toolOutput("{s}Note:{s} No plan detected after 5 steps. Prompting creation.", .{ display.C_YELLOW, display.C_RESET });
@@ -294,7 +305,9 @@ pub fn runModel(
             const trimmed_reasoning = std.mem.trim(u8, response.reasoning, " \t\r\n");
             if (trimmed_reasoning.len > 0) {
                 try logger.transcriptWrite("\n[Reasoning]\n{s}\n", .{trimmed_reasoning});
-                display.addTimelineEntry("{s}--- Thinking ---{s}\n{s}{s}{s}{s}\n{s}", .{ display.C_THINKING, display.C_RESET, display.C_REASONING_BG, display.C_REASONING_FG, trimmed_reasoning, display.C_RESET, display.C_RESET });
+                display.addTimelineEntry("{s}--- Thinking ---{s}\n", .{ display.C_THINKING, display.C_RESET });
+                display.addWrappedTimelineEntry(display.C_REASONING_BG ++ display.C_REASONING_FG, trimmed_reasoning, display.C_RESET);
+                display.addTimelineEntry("{s}\n", .{display.C_RESET});
             }
         }
 
@@ -464,16 +477,19 @@ pub fn runModel(
                 }
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 display.setSpinnerState(.thinking);
-                const text = tools.parseRespondTextFromArgs(tc.args) orelse "(empty)";
-                var unescape_buf: [4096]u8 = undefined;
-                const unescaped = unescapeJsonString(&unescape_buf, text);
-                toolOutput("{s}⛬{s} {s}", .{ display.C_CYAN, display.C_RESET, unescaped });
+                toolOutput("• respond_text", .{});
             } else {
                 display.setSpinnerState(.tool);
                 toolOutput("• {s}", .{tc.tool});
             }
 
             if (std.mem.eql(u8, tc.tool, "respond_text")) {
+                if (skill_request and !pathsContainSkillFile(paths.items)) {
+                    toolOutput("{s}Note:{s} skill request not satisfied yet; missing SKILL.md output.", .{ display.C_YELLOW, display.C_RESET });
+                    const msg = "You are handling a skill-creation request. Before finishing, create a `SKILL.md` file under `.zagent/skills/<skill-name>/SKILL.md` (or config `skills/<skill-name>/SKILL.md`). Do not return a source-code demo file in place of a skill.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 if (mutation_request and mutating_tools_executed == 0) {
                     toolOutput("{s}Note:{s} request seems to require a file change, but no mutating tools were run.", .{ display.C_YELLOW, display.C_RESET });
                     const msg = "Your plan mentioned a file change, but you haven't executed any mutating tools (like write_file, edit, etc.) yet. Please execute the necessary tools to apply the changes before calling respond_text. If no change is actually needed, please explain why.";
@@ -490,6 +506,7 @@ pub fn runModel(
                         .files_touched = try utils.joinPaths(allocator, paths.items),
                     };
                 };
+                try display.addAssistantMessage(arena_alloc, final_text);
                 return .{
                     .response = try allocator.dupe(u8, final_text),
                     .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -511,7 +528,9 @@ pub fn runModel(
                 try display.printTruncatedCommandOutput(stdout, result);
             }
 
-            const clean_result = try display.stripAnsi(arena_alloc, result);
+            const no_ansi = try display.stripAnsi(arena_alloc, result);
+            defer arena_alloc.free(no_ansi);
+            const clean_result = try utils.sanitizeTextForModel(arena_alloc, no_ansi, 128 * 1024);
             try logger.transcriptWrite("[Result]\n{s}\n", .{clean_result});
             try turn_results.append(arena_alloc, clean_result);
             arena_alloc.free(result);
@@ -580,4 +599,25 @@ pub fn runModel(
         .error_count = 0,
         .files_touched = try utils.joinPaths(allocator, paths.items),
     };
+}
+
+fn pathsContainSkillFile(paths: []const []u8) bool {
+    for (paths) |p| {
+        if (std.mem.endsWith(u8, p, "/SKILL.md")) return true;
+        if (std.mem.eql(u8, p, "SKILL.md")) return true;
+        if (std.mem.indexOf(u8, p, ".zagent/skills/") != null and std.mem.endsWith(u8, p, "SKILL.md")) return true;
+        if (std.mem.indexOf(u8, p, "/skills/") != null and std.mem.endsWith(u8, p, "SKILL.md")) return true;
+    }
+    return false;
+}
+
+fn isSkillCreationRequest(raw_user_request: []const u8) bool {
+    const has_skill = utils.containsIgnoreCase(raw_user_request, "skill");
+    const has_create_verb = utils.containsIgnoreCase(raw_user_request, "create") or
+        utils.containsIgnoreCase(raw_user_request, "make") or
+        utils.containsIgnoreCase(raw_user_request, "build") or
+        utils.containsIgnoreCase(raw_user_request, "write");
+    const has_explicit_path = utils.containsIgnoreCase(raw_user_request, "SKILL.md") or
+        utils.containsIgnoreCase(raw_user_request, "/skills/");
+    return (has_skill and has_create_verb) or has_explicit_path;
 }

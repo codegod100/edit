@@ -78,6 +78,80 @@ pub fn sanitizeLineInput(allocator: std.mem.Allocator, raw: ?[]u8) !?[]u8 {
     return @as(?[]u8, value);
 }
 
+/// Convert arbitrary bytes into model-safe text:
+/// - preserves valid UTF-8 and common whitespace
+/// - replaces invalid/control bytes with \xNN escapes
+/// - truncates to max_len bytes in output (with a note)
+pub fn sanitizeTextForModel(allocator: std.mem.Allocator, input: []const u8, max_len: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    var replaced: usize = 0;
+    while (i < input.len) {
+        if (out.items.len >= max_len) break;
+
+        const b = input[i];
+        if (b == '\n' or b == '\r' or b == '\t') {
+            try out.append(allocator, b);
+            i += 1;
+            continue;
+        }
+
+        if (b >= 32 and b <= 126) {
+            try out.append(allocator, b);
+            i += 1;
+            continue;
+        }
+
+        const char_len = std.unicode.utf8ByteSequenceLength(b) catch {
+            const esc = try std.fmt.allocPrint(allocator, "\\x{x:0>2}", .{b});
+            defer allocator.free(esc);
+            if (out.items.len + esc.len > max_len) break;
+            try out.appendSlice(allocator, esc);
+            replaced += 1;
+            i += 1;
+            continue;
+        };
+
+        if (i + char_len <= input.len) {
+            if (std.unicode.utf8Decode(input[i .. i + char_len])) |_| {
+                if (out.items.len + char_len > max_len) break;
+                try out.appendSlice(allocator, input[i .. i + char_len]);
+                i += char_len;
+                continue;
+            } else |_| {}
+        }
+
+        const esc = try std.fmt.allocPrint(allocator, "\\x{x:0>2}", .{b});
+        defer allocator.free(esc);
+        if (out.items.len + esc.len > max_len) break;
+        try out.appendSlice(allocator, esc);
+        replaced += 1;
+        i += 1;
+        continue;
+    }
+
+    const truncated = i < input.len;
+    if (replaced > 0 or truncated) {
+        var meta: std.ArrayList(u8) = .empty;
+        defer meta.deinit(allocator);
+        if (replaced > 0) {
+            try meta.writer(allocator).print("[sanitized {d} non-text byte(s)]", .{replaced});
+        }
+        if (truncated) {
+            if (meta.items.len > 0) try meta.appendSlice(allocator, " ");
+            try meta.writer(allocator).print("[truncated: {d} bytes omitted]", .{input.len - i});
+        }
+        if (meta.items.len > 0) {
+            try out.appendSlice(allocator, "\n");
+            try out.appendSlice(allocator, meta.items);
+        }
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn isCodexModelId(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "codex") != null;
 }

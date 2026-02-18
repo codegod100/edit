@@ -82,6 +82,33 @@ fn drainInput() void {
     }
 }
 
+fn containsSkillPtr(items: []const *skills.Skill, candidate: *skills.Skill) bool {
+    for (items) |s| {
+        if (s == candidate) return true;
+    }
+    return false;
+}
+
+fn lastFilesTouched(window: *const context.ContextWindow) ?[]const u8 {
+    var i: usize = window.turns.items.len;
+    while (i > 0) {
+        i -= 1;
+        const turn = window.turns.items[i];
+        if (turn.role == .assistant and turn.files_touched != null) return turn.files_touched.?;
+    }
+    return null;
+}
+
+fn hasExtHint(line: []const u8, recent_files: ?[]const u8, ext: []const u8) bool {
+    var needle_buf: [16]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, ".{s}", .{ext}) catch return false;
+    if (std.mem.indexOf(u8, line, needle) != null) return true;
+    if (recent_files) |rf| {
+        if (std.mem.indexOf(u8, rf, needle) != null) return true;
+    }
+    return false;
+}
+
 pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
@@ -213,7 +240,8 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
                 } else {
                     if (turn.reasoning) |r| {
                         if (r.len > 0) {
-                            display.addTimelineEntry("{s}Reasoning:{s}\n{s}{s}{s}\n", .{ display.C_PURPLE, display.C_RESET, display.C_PURPLE, r, display.C_RESET });
+                            display.addTimelineEntry("{s}Reasoning:{s}\n", .{ display.C_PURPLE, display.C_RESET });
+                            display.addWrappedTimelineEntry(display.C_PURPLE, r, display.C_RESET);
                         }
                     }
                     if (turn.content.len > 0) {
@@ -272,8 +300,10 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
 
         // Read Line
         var line_opt: ?[]u8 = null;
+        var line_from_queue = false;
         if (queued_lines.items.len > 0) {
             line_opt = queued_lines.orderedRemove(0);
+            line_from_queue = true;
         } else {
             line_opt = try line_editor.readPromptLine(allocator, stdin_file, stdin, &stdout, "> ", &history, queued_partial.items);
             queued_partial.clearRetainingCapacity();
@@ -283,8 +313,36 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
             try stdout.print("\nEOF.\n", .{});
             break;
         }
-        const line = line_opt.?;
+        var line = line_opt.?;
         defer allocator.free(line);
+
+        // If a multiline paste submitted on first newline, remaining lines can still
+        // be waiting in stdin. Drain and merge them so the model sees one prompt body.
+        if (!line_from_queue) {
+            line_editor.drainQueuedLinesFromStdin(allocator, stdin_file, &queued_partial, &queued_lines);
+            if (queued_lines.items.len > 0 or queued_partial.items.len > 0) {
+                var merged: std.ArrayListUnmanaged(u8) = .empty;
+                defer merged.deinit(allocator);
+                try merged.appendSlice(allocator, line);
+
+                for (queued_lines.items) |extra| {
+                    try merged.append(allocator, '\n');
+                    try merged.appendSlice(allocator, extra);
+                    allocator.free(extra);
+                }
+                queued_lines.clearRetainingCapacity();
+
+                if (queued_partial.items.len > 0) {
+                    try merged.append(allocator, '\n');
+                    try merged.appendSlice(allocator, queued_partial.items);
+                    queued_partial.clearRetainingCapacity();
+                }
+
+                const old_line = line;
+                line = try merged.toOwnedSlice(allocator);
+                allocator.free(old_line);
+            }
+        }
 
         // Ensure we are at the start of a clean line before drawing the box
         std.debug.print("\r\x1b[K", .{});
@@ -313,6 +371,102 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         if (active == null) {
             try stdout.print("No active model/provider. Use /connect or /model.\n", .{});
             continue;
+        }
+
+        var model_user_input: []const u8 = line;
+        var injected_skill_input: ?[]u8 = null;
+        defer if (injected_skill_input) |s| allocator.free(s);
+
+        var discovered_skills: []skills.Skill = &.{};
+        var have_discovered_skills = false;
+        if (skills.discover(allocator, ".", config_dir)) |list| {
+            discovered_skills = list;
+            have_discovered_skills = true;
+        } else |err| {
+            logger.warn("Skill discovery failed: {any}", .{err});
+        }
+        defer if (have_discovered_skills) skills.freeList(allocator, discovered_skills);
+
+        var matched: std.ArrayListUnmanaged(*skills.Skill) = .empty;
+        defer matched.deinit(allocator);
+        if (have_discovered_skills) {
+            for (discovered_skills) |*skill| {
+                if (skills.isTriggeredByInput(skill.name, line)) {
+                    try matched.append(allocator, skill);
+                }
+            }
+        }
+
+        // Natural language hints like "use roc skill" should also resolve skill names.
+        if (matched.items.len == 0 and have_discovered_skills) {
+            for (discovered_skills) |*skill| {
+                if (skills.isHintedByInput(skill.name, line)) {
+                    try matched.append(allocator, skill);
+                }
+            }
+        }
+
+        // Auto-load skill based on file types in the prompt or recently edited files.
+        if (matched.items.len == 0 and have_discovered_skills) {
+            const recent = lastFilesTouched(&state.context_window);
+            const LangHint = struct { ext: []const u8, key: []const u8 };
+            const hints = [_]LangHint{
+                .{ .ext = "roc", .key = "roc" },
+                .{ .ext = "zig", .key = "zig" },
+                .{ .ext = "py", .key = "python" },
+                .{ .ext = "rs", .key = "rust" },
+                .{ .ext = "go", .key = "go" },
+                .{ .ext = "ts", .key = "typescript" },
+                .{ .ext = "tsx", .key = "typescript" },
+                .{ .ext = "js", .key = "javascript" },
+                .{ .ext = "jsx", .key = "javascript" },
+            };
+
+            for (hints) |h| {
+                if (!hasExtHint(line, recent, h.ext)) continue;
+                for (discovered_skills) |*skill| {
+                    if (containsSkillPtr(matched.items, skill)) continue;
+                    if (skills.nameContainsIgnoreCase(skill.name, h.key)) {
+                        try matched.append(allocator, skill);
+                    }
+                }
+            }
+        }
+
+        if (matched.items.len > 0) {
+            const MAX_SKILLS: usize = 3;
+            const MAX_SKILL_BODY_BYTES: usize = 20 * 1024;
+
+            var names: std.ArrayListUnmanaged(u8) = .empty;
+            defer names.deinit(allocator);
+            for (matched.items, 0..) |s, i| {
+                if (i > 0) try names.appendSlice(allocator, ", ");
+                try names.appendSlice(allocator, s.name);
+            }
+            display.addTimelineEntry("{s}↳ Auto-loaded skills:{s} {s}\n", .{ display.C_DIM, display.C_RESET, names.items });
+
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w_skill = buf.writer(allocator);
+            try w_skill.writeAll(line);
+            try w_skill.writeAll("\n\n[Auto-loaded skill instructions for this turn]\n");
+
+            var used: usize = 0;
+            for (matched.items) |s| {
+                if (used >= MAX_SKILLS) break;
+                const body_cap = @min(s.body.len, MAX_SKILL_BODY_BYTES);
+                try w_skill.print("\n[Skill: {s}]\n{s}\n", .{ s.name, s.body[0..body_cap] });
+                if (s.body.len > body_cap) {
+                    try w_skill.print("[Skill body truncated to {d} bytes]\n", .{MAX_SKILL_BODY_BYTES});
+                }
+                used += 1;
+            }
+            if (matched.items.len > MAX_SKILLS) {
+                try w_skill.print("\n[Note: {d} additional matched skills omitted]\n", .{matched.items.len - MAX_SKILLS});
+            }
+
+            injected_skill_input = try buf.toOwnedSlice(allocator);
+            model_user_input = injected_skill_input.?;
         }
 
         // Add user turn to context
@@ -370,7 +524,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
 
-        const ctx_messages = try context.buildContextMessagesJson(turn_alloc, &state.context_window, line);
+        const ctx_messages = try context.buildContextMessagesJson(turn_alloc, &state.context_window, model_user_input);
 
         display.setSpinnerState(.thinking);
 

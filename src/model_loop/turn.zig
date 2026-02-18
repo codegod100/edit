@@ -207,7 +207,8 @@ pub fn runModelTurnWithTools(
         }
 
         if (std.mem.eql(u8, routed.?.tool, "respond_text")) {
-            const parsed_text = tools.parseRespondTextFromArgs(routed.?.arguments_json) orelse "";
+            const parsed_text = tools.executeNamed(allocator, "respond_text", routed.?.arguments_json, todo_list) catch try allocator.dupe(u8, "");
+            defer allocator.free(parsed_text);
             allocator.free(context_prompt);
             return .{
                 .response = try allocator.dupe(u8, parsed_text),
@@ -320,7 +321,9 @@ pub fn runModelTurnWithTools(
             try display.printTruncatedCommandOutput(stdout, tool_out);
         }
 
-        const clean_out = try display.stripAnsi(allocator, tool_out);
+        const no_ansi = try display.stripAnsi(allocator, tool_out);
+        defer allocator.free(no_ansi);
+        const clean_out = try utils.sanitizeTextForModel(allocator, no_ansi, 128 * 1024);
         defer allocator.free(clean_out);
         try logger.transcriptWrite("[Result]\n{s}\n", .{clean_out});
 

@@ -599,12 +599,8 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
     }
     try w.writeAll("\"},");
 
-    // 2. Relevant Turns
-    const indices = try buildRelevantTurnIndices(allocator, window, user_input, 10);
-    defer allocator.free(indices);
-
-    for (indices) |idx| {
-        const turn = window.turns.items[idx];
+    // 2. Prior turns (full loaded context window, chronological)
+    for (window.turns.items) |turn| {
         // Avoid duplicating the current user request in relevant turns.
         // The current request is appended explicitly below, so any matching
         // user turn here is redundant and can cause duplicated prompts.

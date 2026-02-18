@@ -222,8 +222,21 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
     }
 
     if (std.mem.eql(u8, name, "respond_text")) {
-        const msg = parseRespondTextFromArgs(arguments_json) orelse "";
-        return allocator.dupe(u8, msg);
+        const A = struct {
+            text: ?[]const u8 = null,
+            message: ?[]const u8 = null,
+            summary: ?[]const u8 = null,
+            content: ?[]const u8 = null,
+        };
+        if (std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true })) |p| {
+            defer p.deinit();
+            const msg = p.value.text orelse p.value.message orelse p.value.summary orelse p.value.content orelse "";
+            return allocator.dupe(u8, msg);
+        } else |_| {
+            // Fallback for non-strict payloads: best-effort extraction.
+            const msg = parseRespondTextFromArgs(arguments_json) orelse "";
+            return allocator.dupe(u8, msg);
+        }
     }
 
     if (std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "read")) {
@@ -1284,4 +1297,3 @@ test "stripHtml removes tags and scripts" {
     try std.testing.expect(std.mem.indexOf(u8, stripped, "var x") == null);
     try std.testing.expect(std.mem.indexOf(u8, stripped, "color: red") == null);
 }
-
