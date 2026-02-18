@@ -154,6 +154,10 @@ pub fn runModel(
     var best_single_gap_percent: ?f64 = null;
     var perf_metric_regressed = false;
     var perf_metric_regression_percent: f64 = 0.0;
+    var single_numeric_threshold_active = false;
+    var last_single_gap_percent: ?f64 = null;
+    var single_metric_no_improve_cycles: usize = 0;
+    var single_metric_extra_extension_used = false;
     var objective_drift_notice_sent = false;
     var golden_verify_seen = false;
     var objective_needs_golden_verify = false;
@@ -537,6 +541,11 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, msg);
                     continue;
                 }
+                if (objective_request and single_numeric_threshold_active and last_single_gap_percent != null) {
+                    const msg = try std.fmt.allocPrint(arena_alloc, "Single metric still failing. Include explicit best-known gap ({d:.2}% over target) and the next strategy in your update; do not finish yet.", .{last_single_gap_percent.?});
+                    try turn_results.append(arena_alloc, msg);
+                    continue;
+                }
                 if (objective_request and correctness_regressed) {
                     const msg = "Correctness regressed after a previously clean check. Revert/repair the recent change and rerun structural invariant checks before finishing.";
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
@@ -572,6 +581,11 @@ pub fn runModel(
                         defer arena_alloc.free(pp);
                         const is_script = std.mem.indexOf(u8, pp, "/scripts/") != null or std.mem.startsWith(u8, pp, "scripts/");
                         if (is_script) {
+                            if (single_numeric_threshold_active) {
+                                const msg = "Single-metric optimization mode is active. Do not edit analysis scripts; edit the primary solution file directly and rerun verification.";
+                                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                                continue;
+                            }
                             objective_script_write_count += 1;
                             if (objective_script_write_count > 2) {
                                 const msg = "Too many script-file edits for an objective task. Stop adding analysis scripts and switch to direct solution-file edit -> definitive verify loops.";
@@ -694,6 +708,7 @@ pub fn runModel(
                                 perf_fix_rechecked = false;
                                 perf_close_miss_active = false;
                                 perf_close_miss_gap_percent = 0.0;
+                                single_numeric_threshold_active = threshold.single_numeric;
                                 if (threshold.single_numeric and threshold.gap_percent != null and threshold.gap_percent.? <= 5.0) {
                                     perf_close_miss_active = true;
                                     perf_close_miss_gap_percent = threshold.gap_percent.?;
@@ -720,6 +735,23 @@ pub fn runModel(
                                     const msg = "Threshold/performance failure detected. Prioritize objective optimization, then rerun only failing checks.";
                                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                                 }
+                                if (threshold.single_numeric and threshold.gap_percent != null) {
+                                    const current_gap = threshold.gap_percent.?;
+                                    if (last_single_gap_percent == null or current_gap + 0.05 < last_single_gap_percent.?) {
+                                        single_metric_no_improve_cycles = 0;
+                                    } else {
+                                        single_metric_no_improve_cycles += 1;
+                                    }
+                                    last_single_gap_percent = current_gap;
+                                    if (single_metric_no_improve_cycles >= 2) {
+                                        const msg = try std.fmt.allocPrint(
+                                            arena_alloc,
+                                            "Single-metric gap is not improving (current {d:.2}% over target). Change strategy now (different batching/shape tradeoff), then rerun the same failing check.",
+                                            .{current_gap},
+                                        );
+                                        try turn_results.append(arena_alloc, msg);
+                                    }
+                                }
                             } else if (perf_threshold_active) {
                                 perf_fix_rechecked = true;
                                 if (!looksLikeAnyFailure(clean_result)) {
@@ -730,6 +762,9 @@ pub fn runModel(
                                     perf_close_miss_gap_percent = 0.0;
                                     perf_metric_regressed = false;
                                     perf_metric_regression_percent = 0.0;
+                                    single_numeric_threshold_active = false;
+                                    last_single_gap_percent = null;
+                                    single_metric_no_improve_cycles = 0;
                                 }
                             }
                         }
@@ -841,6 +876,17 @@ pub fn runModel(
             try w.writer(arena_alloc).print(
                 "{f}",
                 .{std.json.fmt("Continue with focused edits/checks and finish only after verification is complete.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+        if (iter == max_iterations - 1 and objective_request and single_numeric_threshold_active and !single_metric_extra_extension_used) {
+            single_metric_extra_extension_used = true;
+            max_iterations += 20;
+            toolOutput("{s}Note:{s} single-metric threshold mode active; granting one-time extension to {d} steps.", .{ display.C_YELLOW, display.C_RESET, max_iterations });
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("One metric remains. Stay in direct solution-file optimization mode and rerun the same failing check until the gap closes.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
