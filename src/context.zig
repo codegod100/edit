@@ -48,6 +48,7 @@ pub const ContextWindow = struct {
     turns: std.ArrayListUnmanaged(ContextTurn),
     summary: ?[]u8,
     title: ?[]u8,
+    project_path: ?[]u8,
     max_chars: usize,
     keep_recent_turns: usize,
 
@@ -56,6 +57,7 @@ pub const ContextWindow = struct {
             .turns = .{},
             .summary = null,
             .title = null,
+            .project_path = null,
             .max_chars = max_chars,
             .keep_recent_turns = keep_recent_turns,
         };
@@ -66,6 +68,7 @@ pub const ContextWindow = struct {
         self.turns.deinit(allocator);
         if (self.summary) |s| allocator.free(s);
         if (self.title) |t| allocator.free(t);
+        if (self.project_path) |p| allocator.free(p);
     }
 
     pub fn append(self: *ContextWindow, allocator: std.mem.Allocator, role: Role, content: []const u8, meta: TurnMeta) !void {
@@ -384,6 +387,7 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     const ContextJson = struct {
         summary: ?[]const u8 = null,
         title: ?[]const u8 = null,
+        project_path: ?[]const u8 = null,
         turns: []const TurnJson = &.{},
     };
 
@@ -398,6 +402,10 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     if (parsed.value.title) |t| {
         if (window.title) |existing| allocator.free(existing);
         window.title = try allocator.dupe(u8, t);
+    }
+    if (parsed.value.project_path) |p| {
+        if (window.project_path) |existing| allocator.free(existing);
+        window.project_path = try allocator.dupe(u8, p);
     }
 
     for (parsed.value.turns) |turn| {
@@ -450,6 +458,7 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
     const ContextJson = struct {
         summary: ?[]const u8,
         title: ?[]const u8,
+        project_path: ?[]const u8,
         turns: []TurnJson,
     };
 
@@ -466,7 +475,12 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         });
     }
 
-    const payload = ContextJson{ .summary = window.summary, .title = window.title, .turns = turns.items };
+    const payload = ContextJson{
+        .summary = window.summary,
+        .title = window.title,
+        .project_path = window.project_path,
+        .turns = turns.items,
+    };
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
     try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});

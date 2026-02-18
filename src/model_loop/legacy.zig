@@ -128,6 +128,10 @@ pub fn runModel(
     custom_system_prompt: ?[]const u8,
 ) !active_module.RunTurnResult {
     _ = stdout_is_tty;
+    // Web and other entry points can inherit a stale global cancel flag.
+    // Always start each model turn from a clean cancellation state.
+    cancel.resetCancelled();
+    cancel.beginProcessing();
 
     // Use an arena for the entire turn to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);

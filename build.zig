@@ -37,4 +37,22 @@ pub fn build(b: *std.Build) void {
     const bench_cmd = b.addSystemCommand(&.{ "/usr/bin/env", "bash", "scripts/import-terminal-bench.sh", "--sample", "--run", "1" });
     const bench_step = b.step("bench", "Import Terminal-Bench tasks and run a sample Harbor trial");
     bench_step.dependOn(&bench_cmd.step);
+
+    // Web server executable
+    const web_exe = b.addExecutable(.{
+        .name = "zagent-web",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/web_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    b.installArtifact(web_exe);
+
+    const web_run_cmd = b.addRunArtifact(web_exe);
+    web_run_cmd.step.dependOn(b.getInstallStep());
+
+    const web_step = b.step("web", "Run zagent web server");
+    web_step.dependOn(&web_run_cmd.step);
 }

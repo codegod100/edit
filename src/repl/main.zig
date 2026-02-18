@@ -67,6 +67,7 @@ var g_callback_prompt: ?[]const u8 = null;
 
 const InputDrainCallback = *const fn () void;
 var g_input_drain_callback: ?InputDrainCallback = null;
+var g_input_drain_mutex: std.Thread.Mutex = .{};
 
 const InputDrainState = struct {
     allocator: std.mem.Allocator,
@@ -77,6 +78,9 @@ const InputDrainState = struct {
 var g_input_drain_state: ?InputDrainState = null;
 
 fn drainInput() void {
+    g_input_drain_mutex.lock();
+    defer g_input_drain_mutex.unlock();
+
     if (g_input_drain_state) |ids| {
         @import("../line_editor.zig").drainQueuedLinesFromStdin(ids.allocator, ids.stdin_file, ids.queued_partial, ids.queued_lines);
     }
@@ -199,6 +203,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         .resumed_session_hash = resumed_session_hash_arg,
     };
     defer state.deinit();
+    state.context_window.project_path = try allocator.dupe(u8, cwd);
 
     // Load selected model config into state
     state.selected_model = config_store.loadSelectedModel(allocator, config_dir) catch null;
@@ -230,6 +235,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     };
     if (hash_to_load) |hash| {
         context.loadContextWindow(allocator, config_dir, &state.context_window, hash) catch {};
+        if (state.context_window.project_path == null) {
+            state.context_window.project_path = try allocator.dupe(u8, cwd);
+        }
 
         // Replay history to timeline
         if (state.context_window.turns.items.len > 0) {
@@ -495,7 +503,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         g_callback_stdout_file = stdout_file;
         model_loop.setToolOutputCallback(struct {
             fn callback(text: []const u8) void {
-                cancel.pollForEscape();
+                // Drain input through a single path to avoid split-reading
+                // escape sequences (e.g. ESC consumed here, tail echoed elsewhere).
+                drainInput();
                 display.addTimelineEntry("{s}", .{text});
             }
         }.callback);

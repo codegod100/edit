@@ -348,9 +348,17 @@ pub fn drainQueuedLinesFromStdin(
         const n = std.posix.read(stdin_file.handle, &buf) catch 0;
         if (n == 0) break;
 
-        for (buf[0..n]) |ch| {
+        var i: usize = 0;
+        while (i < n) {
+            const ch = buf[i];
             if (ch == 27) { // ESC
                 cancel.setCancelled();
+                const consumed_local = consumeEscapeTailInBuffer(buf[i + 1 .. n]);
+                if (consumed_local == (n - (i + 1)) and consumed_local > 0) {
+                    // Sequence may continue in unread bytes; finish from fd.
+                    consumeEscapeTail(stdin_file.handle);
+                }
+                i += 1 + consumed_local;
                 continue;
             }
 
@@ -364,6 +372,7 @@ pub fn drainQueuedLinesFromStdin(
                     partial.clearRetainingCapacity();
                     _ = std.posix.write(stdout_fd, "\n") catch 0;
                 }
+                i += 1;
                 continue;
             }
 
@@ -372,6 +381,7 @@ pub fn drainQueuedLinesFromStdin(
                     _ = partial.pop();
                     _ = std.posix.write(stdout_fd, "\x08 \x08") catch 0;
                 }
+                i += 1;
                 continue;
             }
 
@@ -380,6 +390,7 @@ pub fn drainQueuedLinesFromStdin(
                     _ = partial.pop();
                     _ = std.posix.write(stdout_fd, "\x08 \x08") catch 0;
                 }
+                i += 1;
                 continue;
             }
 
@@ -391,7 +402,65 @@ pub fn drainQueuedLinesFromStdin(
                 var echo_buf = [1]u8{ch};
                 _ = std.posix.write(stdout_fd, &echo_buf) catch 0;
             }
+            i += 1;
         }
+    }
+}
+
+/// Consume ESC tail bytes from a buffer slice that starts immediately after ESC.
+/// Returns how many bytes were consumed from `tail`.
+fn consumeEscapeTailInBuffer(tail: []const u8) usize {
+    if (tail.len == 0) return 0;
+
+    // Common prefixes: CSI '[' and SS3 'O'
+    if (tail[0] == '[' or tail[0] == 'O') {
+        var j: usize = 1;
+        while (j < tail.len) : (j += 1) {
+            const b = tail[j];
+            if (b >= 0x40 and b <= 0x7E) {
+                return j + 1;
+            }
+        }
+        // No final byte in this buffer yet; consumed what we have.
+        return tail.len;
+    }
+
+    // Alt-modified single-byte keys often come as ESC + <byte>.
+    return 1;
+}
+
+/// After reading ESC (0x1B), best-effort consume trailing bytes of the same
+/// terminal escape sequence so fragments like "[A" or "[O" do not leak into
+/// the queued input and prompt echo.
+fn consumeEscapeTail(stdin_fd: std.posix.fd_t) void {
+    var retries: usize = 0;
+    var buf: [1]u8 = undefined;
+    var started = false;
+
+    while (retries < 4) {
+        const n = std.posix.read(stdin_fd, &buf) catch 0;
+        if (n == 0) {
+            retries += 1;
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+            continue;
+        }
+
+        retries = 0;
+        const b = buf[0];
+
+        // CSI and SS3 prefixes are common for arrows/function/home/end keys.
+        if (!started and (b == '[' or b == 'O')) {
+            started = true;
+            continue;
+        }
+
+        if (!started) {
+            // Single-byte Alt-modified key or other short sequence.
+            break;
+        }
+
+        // Final byte for CSI/SS3 is typically in 0x40..0x7E.
+        if (b >= 0x40 and b <= 0x7E) break;
     }
 }
 

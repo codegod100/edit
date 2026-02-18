@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>zagent - AI Coding Assistant</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h1>zagent</h1>
+                <span class="status-indicator" id="connectionStatus">
+                    <span class="dot"></span>
+                    <span class="text">Connecting...</span>
+                </span>
+            </div>
+            
+            <!-- Project Selector -->
+            <div class="project-section">
+                <h2>Project</h2>
+                <div class="project-path" id="currentProject">
+                    <input type="text" placeholder="Select project folder..." id="projectPathInput">
+                    <button id="selectFolderBtn" title="Open folder">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                        </svg>
+                    </button>
+                </div>
+                <div class="folder-browser hidden" id="folderBrowser">
+                    <div class="folder-browser-header">
+                        <span id="folderBrowserPath">/</span>
+                        <button id="folderBrowserClose" title="Close">x</button>
+                    </div>
+                    <div class="folder-browser-actions">
+                        <button id="folderUpBtn">Up</button>
+                        <button id="folderChooseBtn">Use This Folder</button>
+                    </div>
+                    <div class="folder-browser-list" id="folderBrowserList">
+                        <p class="empty-state">Loading directories...</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sessions-section">
+                <div class="sessions-header">
+                    <h2>Recent Sessions</h2>
+                    <button id="refreshSessionsBtn" title="Refresh sessions">Refresh</button>
+                </div>
+                <div class="sessions-list" id="sessionsList">
+                    <p class="empty-state">No sessions loaded</p>
+                </div>
+            </div>
+            
+            <!-- File Tree -->
+            <div class="file-tree" id="fileTree">
+                <h2>Files</h2>
+                <div class="tree-content" id="treeContent">
+                    <p class="empty-state">Select a project to see files</p>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Tabs -->
+            <div class="tabs" id="tabs">
+                <div class="tab active" data-tab="chat">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    Chat
+                </div>
+                <div class="tab" data-tab="editor">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                        <polyline points="10 9 9 9 8 9"></polyline>
+                    </svg>
+                    Editor
+                </div>
+            </div>
+            
+            <!-- Tab Content -->
+            <div class="tab-content" id="tabContent">
+                <!-- Chat Panel -->
+                <div class="tab-pane active" id="chatPane">
+                    <div class="chat-container">
+                        <div class="messages" id="messages">
+                            <div class="welcome-message">
+                                <h2>Welcome to zagent</h2>
+                                <p>Select a project folder to start editing with AI assistance.</p>
+                            </div>
+                        </div>
+                        <div class="input-area">
+                            <div class="input-wrapper">
+                                <textarea 
+                                    id="userInput" 
+                                    placeholder="Ask zagent to help with your project..." 
+                                    rows="1"
+                                ></textarea>
+                                <button id="sendBtn" disabled>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <line x1="22" y1="2" x2="11" y2="13"></line>
+                                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                                    </svg>
+                                </button>
+                            </div>
+                            <div class="input-actions">
+                                <span class="hint">Press Enter to send, Shift+Enter for new line</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Editor Panel -->
+                <div class="tab-pane" id="editorPane">
+                    <div class="editor-container">
+                        <div class="editor-header">
+                            <span id="currentFile">No file selected</span>
+                            <button id="saveFileBtn" disabled>Save</button>
+                        </div>
+                        <textarea 
+                            id="fileEditor" 
+                            class="file-editor"
+                            placeholder="Select a file to edit..."
+                            spellcheck="false"
+                        ></textarea>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
