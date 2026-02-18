@@ -780,6 +780,16 @@ pub fn runModel(
         prev_correctness_fix_rechecked = correctness_fix_rechecked;
 
         if (iter >= 10 and stagnant_iterations >= 8) {
+            if (objective_request and !correctness_failure_active and (perf_threshold_active or latest_verification_had_failure)) {
+                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                try w.writer(arena_alloc).print(
+                    "{f}",
+                    .{std.json.fmt("Continue optimization despite slow progress. Apply one focused cost/latency improvement and rerun the failing threshold check.", .{})},
+                );
+                try w.appendSlice(arena_alloc, "}");
+                stagnant_iterations = 0;
+                continue;
+            }
             if (objective_request and mutating_tools_executed > 0 and !objective_drift_notice_sent) {
                 objective_drift_notice_sent = true;
                 try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
