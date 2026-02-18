@@ -134,8 +134,9 @@ pub fn runModel(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const skill_request = isSkillCreationRequest(raw_user_request);
     const objective_request = isObjectiveMetricsRequest(raw_user_request);
-    const requires_plan_b1 = utils.containsIgnoreCase(raw_user_request, "plan_b1.jsonl");
-    const requires_plan_b2 = utils.containsIgnoreCase(raw_user_request, "plan_b2.jsonl");
+    var required_output_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer required_output_paths.deinit(arena_alloc);
+    try collectRequiredOutputPaths(arena_alloc, raw_user_request, &required_output_paths);
     var mutating_tools_executed: usize = 0;
     var ran_verification_since_mutation = false;
     var saw_tool_error = false;
@@ -521,8 +522,8 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
-                if (objective_request and !requiredArtifactsExist(requires_plan_b1, requires_plan_b2)) {
-                    const msg = "Required output artifacts are missing (e.g., plan_b1/plan_b2). Create/update them before finishing.";
+                if (objective_request and required_output_paths.items.len > 0 and !requiredArtifactsExistPaths(required_output_paths.items)) {
+                    const msg = "Required output artifacts mentioned in the prompt are missing. Create/update them before finishing.";
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
@@ -861,12 +862,12 @@ pub fn runModel(
             );
             try w.appendSlice(arena_alloc, "}");
         }
-        if (objective_request and !artifact_prompt_sent and !requiredArtifactsExist(requires_plan_b1, requires_plan_b2)) {
+        if (objective_request and !artifact_prompt_sent and required_output_paths.items.len > 0 and !requiredArtifactsExistPaths(required_output_paths.items)) {
             artifact_prompt_sent = true;
             try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
             try w.writer(arena_alloc).print(
                 "{f}",
-                .{std.json.fmt("Required outputs are missing. Create/update /app/task_file/output_data/plan_b1.jsonl and /app/task_file/output_data/plan_b2.jsonl now, then run definitive verification.", .{})},
+                .{std.json.fmt("Required outputs mentioned in the prompt are missing. Create/update those output files now, then run definitive verification.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
@@ -1073,15 +1074,51 @@ fn buildFailureSnapshot(allocator: std.mem.Allocator, out: []const u8) ![]const 
     return buf.toOwnedSlice(allocator);
 }
 
-fn requiredArtifactsExist(require_b1: bool, require_b2: bool) bool {
-    if (require_b1 and !fileExists("/app/task_file/output_data/plan_b1.jsonl")) return false;
-    if (require_b2 and !fileExists("/app/task_file/output_data/plan_b2.jsonl")) return false;
+fn requiredArtifactsExistPaths(paths: []const []const u8) bool {
+    for (paths) |p| {
+        if (!fileExists(p)) return false;
+    }
     return true;
 }
 
 fn fileExists(path: []const u8) bool {
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
+}
+
+fn collectRequiredOutputPaths(
+    allocator: std.mem.Allocator,
+    raw_user_request: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var tok = std.mem.tokenizeAny(u8, raw_user_request, " \t\r\n`'\"()[]{}<>,;");
+    while (tok.next()) |t_raw| {
+        const t = std.mem.trim(u8, t_raw, " \t\r\n:.");
+        if (t.len == 0) continue;
+        if (std.mem.startsWith(u8, t, "http://") or std.mem.startsWith(u8, t, "https://")) continue;
+        if (!isLikelyOutputArtifactToken(t)) continue;
+        if (std.mem.indexOf(u8, t, "/input") != null or std.mem.indexOf(u8, t, "input_data/") != null) continue;
+        if (containsPathStr(out.items, t)) continue;
+        try out.append(allocator, try allocator.dupe(u8, t));
+    }
+}
+
+fn isLikelyOutputArtifactToken(t: []const u8) bool {
+    const has_ext = std.mem.lastIndexOfScalar(u8, t, '.') != null;
+    if (!has_ext) return false;
+    const output_hint = utils.containsIgnoreCase(t, "output") or
+        utils.containsIgnoreCase(t, "result") or
+        utils.containsIgnoreCase(t, "submission") or
+        utils.containsIgnoreCase(t, "answer") or
+        utils.containsIgnoreCase(t, "plan");
+    return output_hint;
+}
+
+fn containsPathStr(paths: []const []const u8, p: []const u8) bool {
+    for (paths) |x| {
+        if (std.mem.eql(u8, x, p)) return true;
+    }
+    return false;
 }
 
 fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
