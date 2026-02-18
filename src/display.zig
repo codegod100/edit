@@ -762,10 +762,16 @@ pub fn renderBox(allocator: std.mem.Allocator, title: []const u8, lines: []const
 }
 
 pub fn resetScrollingRegion(stdout_file: std.fs.File) void {
+    const height = getTerminalHeight();
+
+    // Clear pinned status bar line so shell prompt is not visually polluted.
+    var clear_buf: [32]u8 = undefined;
+    const clear_seq = std.fmt.bufPrint(&clear_buf, "\x1b[{d};1H\x1b[2K", .{height}) catch "";
+    if (clear_seq.len > 0) _ = stdout_file.write(clear_seq) catch {};
+
     // Reset margins to full screen
     _ = stdout_file.write("\x1b[r") catch {};
     // Ensure cursor is at bottom of region
-    const height = getTerminalHeight();
     var buf: [32]u8 = undefined;
     const seq = std.fmt.bufPrint(&buf, "\x1b[{d};1H", .{height}) catch return;
     _ = stdout_file.write(seq) catch {};

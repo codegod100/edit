@@ -200,8 +200,7 @@ pub fn readPromptLine(
                             history_index.? -= 1;
                             const entry_raw = history.items.items[history_index.?];
                             const entry = context.normalizeHistoryLine(entry_raw);
-                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
-                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+                            try stdout.writeAll("\r\x1b[K");
                             try stdout.writeAll(prompt);
                             line = try arena_alloc.dupe(u8, entry);
                             cursor_pos = line.len;
@@ -214,16 +213,14 @@ pub fn readPromptLine(
                             history_index.? += 1;
                             const entry_raw = history.items.items[history_index.?];
                             const entry = context.normalizeHistoryLine(entry_raw);
-                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
-                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+                            try stdout.writeAll("\r\x1b[K");
                             try stdout.writeAll(prompt);
                             line = try arena_alloc.dupe(u8, entry);
                             cursor_pos = line.len;
                             try stdout.writeAll(line);
                         } else {
                             history_index = null;
-                            while (cursor_pos > 0) { try stdout.writeAll("\x08 \x08"); cursor_pos -= 1; }
-                            for (0..line.len) |_| try stdout.writeAll("\x08 \x08");
+                            try stdout.writeAll("\r\x1b[K");
                             try stdout.writeAll(prompt);
                             line = try arena_alloc.dupe(u8, saved_line);
                             cursor_pos = line.len;
@@ -393,6 +390,51 @@ pub fn drainQueuedLinesFromStdin(
                 partial.append(allocator, ch) catch continue;
                 var echo_buf = [1]u8{ch};
                 _ = std.posix.write(stdout_fd, &echo_buf) catch 0;
+            }
+        }
+    }
+}
+
+pub fn discardPendingInput(stdin_file: std.fs.File) void {
+    if (!stdin_file.isTty()) return;
+
+    const O_NONBLOCK = if (builtin.os.tag == .linux)
+        @as(u32, 0o4000)
+    else if (builtin.os.tag == .macos)
+        @as(u32, 0x0004)
+    else
+        @as(u32, 0);
+
+    const original_flags = std.posix.fcntl(stdin_file.handle, std.posix.F.GETFL, 0) catch return;
+    const already_nonblocking = (original_flags & O_NONBLOCK) != 0;
+
+    if (!already_nonblocking) {
+        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
+    }
+    defer if (!already_nonblocking) {
+        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
+    };
+
+    var buf: [256]u8 = undefined;
+    var saw_esc = false;
+    var esc_grace_retries: usize = 0;
+    while (true) {
+        const n = std.posix.read(stdin_file.handle, &buf) catch 0;
+        if (n == 0) {
+            // If we just saw ESC, wait briefly for the rest of the sequence
+            // so we don't leak trailing bytes like "[A" to the parent shell.
+            if (saw_esc and esc_grace_retries < 4) {
+                esc_grace_retries += 1;
+                std.Thread.sleep(2 * std.time.ns_per_ms);
+                continue;
+            }
+            break;
+        }
+        esc_grace_retries = 0;
+        for (buf[0..n]) |b| {
+            if (b == 0x1b) {
+                saw_esc = true;
+                break;
             }
         }
     }

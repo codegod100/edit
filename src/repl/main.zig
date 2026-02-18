@@ -310,6 +310,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         }
 
         if (line_opt == null) {
+            // Ensure terminal/input are clean before returning to parent shell.
+            cancel.disableRawMode();
+            line_editor.discardPendingInput(stdin_file);
             try stdout.print("\nEOF.\n", .{});
             break;
         }
