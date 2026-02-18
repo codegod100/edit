@@ -142,6 +142,9 @@ pub fn runModel(
     var perf_fix_rechecked = false;
     var perf_close_miss_active = false;
     var perf_close_miss_gap_percent: f64 = 0.0;
+    var correctness_failure_active = false;
+    var correctness_fix_edit_made = false;
+    var correctness_fix_rechecked = false;
     var latest_verification_has_metrics = false;
     var latest_verification_had_failure = false;
     var latest_verification_metric_snapshot: []const u8 = "";
@@ -206,6 +209,7 @@ pub fn runModel(
     var prev_paths_len: usize = 0;
     var prev_mutating_tools_executed: usize = 0;
     var prev_perf_fix_rechecked = false;
+    var prev_correctness_fix_rechecked = false;
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
@@ -461,6 +465,21 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (correctness_failure_active and !correctness_fix_edit_made) {
+                    const msg = "Verification shows correctness/feasibility failures. Make a focused correctness fix first (schema/shape/consistency), then re-run the failing correctness check.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (correctness_failure_active and correctness_fix_edit_made and !correctness_fix_rechecked) {
+                    const msg = "You edited for correctness, but have not re-run the failing correctness check yet. Re-run it before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (correctness_failure_active and latest_verification_had_failure) {
+                    const msg = "Correctness is still failing. Do not continue optimization yet; fix correctness failures first, then verify again.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 if (perf_threshold_active and !perf_fix_edit_made) {
                     toolOutput("{s}Note:{s} threshold failure is still active; perform a focused optimization edit first.", .{ display.C_YELLOW, display.C_RESET });
                     const msg = "A numeric threshold/performance failure was detected. Make a focused optimization edit before finishing.";
@@ -516,6 +535,10 @@ pub fn runModel(
             if (tools.isMutatingToolName(tc.tool)) {
                 mutating_tools_executed += 1;
                 ran_verification_since_mutation = false;
+                if (correctness_failure_active) {
+                    correctness_fix_edit_made = true;
+                    correctness_fix_rechecked = false;
+                }
                 if (perf_threshold_active) {
                     perf_fix_edit_made = true;
                     perf_fix_rechecked = false;
@@ -577,8 +600,28 @@ pub fn runModel(
                             latest_verification_has_metrics = insight.has_metrics;
                             latest_verification_had_failure = insight.has_failure;
                             latest_verification_metric_snapshot = try buildMetricSnapshot(arena_alloc, clean_result);
+                            if (looksLikeCorrectnessFailure(clean_result)) {
+                                correctness_failure_active = true;
+                                correctness_fix_edit_made = false;
+                                correctness_fix_rechecked = false;
+                                // Correctness failures invalidate optimization progress until fixed.
+                                perf_threshold_active = false;
+                                perf_fix_edit_made = false;
+                                perf_fix_rechecked = false;
+                                perf_close_miss_active = false;
+                                perf_close_miss_gap_percent = 0.0;
+                                const msg = "Correctness/feasibility failure detected. Fix correctness first and rerun the failing correctness check before any further optimization.";
+                                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                            } else if (correctness_failure_active) {
+                                correctness_fix_rechecked = true;
+                                if (!looksLikeAnyFailure(clean_result)) {
+                                    correctness_failure_active = false;
+                                    correctness_fix_edit_made = false;
+                                    correctness_fix_rechecked = false;
+                                }
+                            }
                             const threshold = analyzeThresholdFailure(clean_result);
-                            if (threshold.detected) {
+                            if (!correctness_failure_active and threshold.detected) {
                                 perf_threshold_active = true;
                                 perf_fix_edit_made = false;
                                 perf_fix_rechecked = false;
@@ -664,7 +707,8 @@ pub fn runModel(
         const progress_signal =
             (paths.items.len > prev_paths_len) or
             (mutating_tools_executed > prev_mutating_tools_executed) or
-            (perf_fix_rechecked and !prev_perf_fix_rechecked);
+            (perf_fix_rechecked and !prev_perf_fix_rechecked) or
+            (correctness_fix_rechecked and !prev_correctness_fix_rechecked);
 
         if (progress_signal) {
             stagnant_iterations = 0;
@@ -675,6 +719,7 @@ pub fn runModel(
         prev_paths_len = paths.items.len;
         prev_mutating_tools_executed = mutating_tools_executed;
         prev_perf_fix_rechecked = perf_fix_rechecked;
+        prev_correctness_fix_rechecked = correctness_fix_rechecked;
 
         if (iter >= 10 and stagnant_iterations >= 8) {
             if (objective_request and mutating_tools_executed > 0 and !objective_drift_notice_sent) {
@@ -699,7 +744,7 @@ pub fn runModel(
 
         const should_extend_for_completion =
             mutation_request and mutating_tools_executed > 0 and
-            (!ran_verification_since_mutation or perf_threshold_active or perf_close_miss_active);
+            (!ran_verification_since_mutation or correctness_failure_active or perf_threshold_active or perf_close_miss_active);
 
         if (iter == max_iterations - 1 and adaptive_extensions_used < max_adaptive_extensions and (progress_signal or should_extend_for_completion)) {
             adaptive_extensions_used += 1;
@@ -797,6 +842,15 @@ fn looksLikeAnyFailure(out: []const u8) bool {
     return utils.containsIgnoreCase(out, "failed") or
         utils.containsIgnoreCase(out, "error") or
         utils.containsIgnoreCase(out, "assertionerror");
+}
+
+fn looksLikeCorrectnessFailure(out: []const u8) bool {
+    return utils.containsIgnoreCase(out, "shape_feasibility") or
+        utils.containsIgnoreCase(out, "batch_consistency") or
+        (utils.containsIgnoreCase(out, "seq_align") and std.mem.indexOf(u8, out, " >= ") != null) or
+        (utils.containsIgnoreCase(out, "schema") and utils.containsIgnoreCase(out, "fail")) or
+        (utils.containsIgnoreCase(out, "feasibility") and utils.containsIgnoreCase(out, "fail")) or
+        (utils.containsIgnoreCase(out, "coverage") and utils.containsIgnoreCase(out, "fail"));
 }
 
 fn isObjectiveMetricsRequest(raw_user_request: []const u8) bool {
