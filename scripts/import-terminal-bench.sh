@@ -19,6 +19,7 @@ Options:
   --index-file PATH      Task index file (default: <output-dir>/task-list.txt)
   --refresh-import       Force re-download + re-index even if cache exists
   --run N                Run first N tasks sequentially with run-harbor-trial.sh
+  --task-index N         Run exactly task N from the index (1-based)
   --force-build          Pass --force-build to each trial run
   --dry-run              Print intended run commands without executing
   --help, -h             Show help
@@ -30,6 +31,7 @@ OUTPUT_DIR="third_party/terminal-bench-2"
 FLAT_DIR=""
 INDEX_FILE=""
 RUN_COUNT=0
+TASK_INDEX=0
 FORCE_BUILD=0
 DRY_RUN=0
 REFRESH_IMPORT=0
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --run)
       RUN_COUNT="${2:-0}"
+      shift 2
+      ;;
+    --task-index)
+      TASK_INDEX="${2:-0}"
       shift 2
       ;;
     --refresh-import)
@@ -92,6 +98,18 @@ fi
 
 if [[ "$RUN_COUNT" =~ ^[0-9]+$ ]] && [[ "$RUN_COUNT" -lt 0 ]]; then
   echo "--run must be a non-negative integer" >&2
+  exit 1
+fi
+if ! [[ "$TASK_INDEX" =~ ^[0-9]+$ ]]; then
+  echo "--task-index must be a positive integer (1-based)" >&2
+  exit 1
+fi
+if [[ "$TASK_INDEX" -lt 0 ]]; then
+  echo "--task-index must be a positive integer (1-based)" >&2
+  exit 1
+fi
+if [[ "$TASK_INDEX" -gt 0 && "$RUN_COUNT" -gt 0 ]]; then
+  echo "Use either --run or --task-index, not both." >&2
   exit 1
 fi
 
@@ -155,6 +173,38 @@ fi
 
 task_total="$(wc -l < "$INDEX_FILE" | tr -d ' ')"
 echo "Indexed $task_total tasks at: $INDEX_FILE"
+
+if [[ "$RUN_COUNT" -eq 0 ]]; then
+  if [[ "$TASK_INDEX" -eq 0 ]]; then
+    echo "Import complete. No trials run."
+    exit 0
+  fi
+else
+  if [[ "$TASK_INDEX" -gt 0 ]]; then
+    echo "Use either --run or --task-index, not both." >&2
+    exit 1
+  fi
+fi
+
+if [[ "$TASK_INDEX" -gt 0 ]]; then
+  if [[ "$TASK_INDEX" -gt "$task_total" ]]; then
+    echo "--task-index $TASK_INDEX is out of range (1..$task_total)" >&2
+    exit 1
+  fi
+  task_path="$(sed -n "${TASK_INDEX}p" "$INDEX_FILE")"
+  task_name="$(basename "$task_path")"
+  trial_name="tb2_${task_name}_$(date +%Y%m%d_%H%M%S)"
+  cmd=(scripts/run-harbor-trial.sh --task "$task_path" --trial-name "$trial_name")
+  if [[ "$FORCE_BUILD" -eq 1 ]]; then
+    cmd+=(-- --force-build)
+  fi
+  echo "[${TASK_INDEX}/${task_total}] ${cmd[*]}"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    "${cmd[@]}"
+  fi
+  echo "Done."
+  exit 0
+fi
 
 if [[ "$RUN_COUNT" -eq 0 ]]; then
   echo "Import complete. No trials run."

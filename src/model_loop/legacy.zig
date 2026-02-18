@@ -133,6 +133,7 @@ pub fn runModel(
 
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const skill_request = isSkillCreationRequest(raw_user_request);
+    const objective_request = isObjectiveMetricsRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
     var ran_verification_since_mutation = false;
     var saw_tool_error = false;
@@ -141,6 +142,13 @@ pub fn runModel(
     var perf_fix_rechecked = false;
     var perf_close_miss_active = false;
     var perf_close_miss_gap_percent: f64 = 0.0;
+    var latest_verification_has_metrics = false;
+    var latest_verification_had_failure = false;
+    var latest_verification_metric_snapshot: []const u8 = "";
+    var best_single_gap_percent: ?f64 = null;
+    var perf_metric_regressed = false;
+    var perf_metric_regression_percent: f64 = 0.0;
+    var objective_drift_notice_sent = false;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -471,6 +479,21 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, msg);
                     continue;
                 }
+                if (objective_request and mutating_tools_executed > 0 and !latest_verification_has_metrics) {
+                    const msg = "Objective/threshold task detected, but no metric snapshot was found in verification output yet. Re-run a targeted evaluator/test command and capture current numeric metrics before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (objective_request and latest_verification_has_metrics and latest_verification_had_failure) {
+                    const msg = try std.fmt.allocPrint(arena_alloc, "Latest verification still shows failing objective metrics/tests: {s}. Continue focused optimization and recheck before finishing.", .{latest_verification_metric_snapshot});
+                    try turn_results.append(arena_alloc, msg);
+                    continue;
+                }
+                if (objective_request and perf_metric_regressed) {
+                    const msg = try std.fmt.allocPrint(arena_alloc, "Metric regression detected (+{d:.2}% vs best known gap). Revert or adjust strategy, then rerun failing check before finishing.", .{perf_metric_regression_percent});
+                    try turn_results.append(arena_alloc, msg);
+                    continue;
+                }
                 const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                     toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
@@ -550,6 +573,10 @@ pub fn runModel(
                         }
                         if (isLikelyVerificationCommand(cmd)) {
                             ran_verification_since_mutation = true;
+                            const insight = analyzeVerificationOutput(clean_result);
+                            latest_verification_has_metrics = insight.has_metrics;
+                            latest_verification_had_failure = insight.has_failure;
+                            latest_verification_metric_snapshot = try buildMetricSnapshot(arena_alloc, clean_result);
                             const threshold = analyzeThresholdFailure(clean_result);
                             if (threshold.detected) {
                                 perf_threshold_active = true;
@@ -566,6 +593,19 @@ pub fn runModel(
                                         .{perf_close_miss_gap_percent},
                                     );
                                     try turn_results.append(arena_alloc, msg);
+                                    if (best_single_gap_percent == null or perf_close_miss_gap_percent < best_single_gap_percent.?) {
+                                        best_single_gap_percent = perf_close_miss_gap_percent;
+                                        perf_metric_regressed = false;
+                                        perf_metric_regression_percent = 0.0;
+                                    } else {
+                                        const regression = perf_close_miss_gap_percent - best_single_gap_percent.?;
+                                        perf_metric_regressed = regression > 0.25;
+                                        perf_metric_regression_percent = if (best_single_gap_percent.? > 0.0) (regression / best_single_gap_percent.?) * 100.0 else 0.0;
+                                        if (perf_metric_regressed) {
+                                            const warn = try std.fmt.allocPrint(arena_alloc, "Current numeric gap regressed to {d:.2}% over target (best was {d:.2}%). Prefer a smaller, targeted edit and rerun.", .{ perf_close_miss_gap_percent, best_single_gap_percent.? });
+                                            try turn_results.append(arena_alloc, warn);
+                                        }
+                                    }
                                 } else {
                                     const msg = "Threshold/performance failure detected. Prioritize objective optimization, then rerun only failing checks.";
                                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
@@ -578,6 +618,8 @@ pub fn runModel(
                                     perf_fix_rechecked = false;
                                     perf_close_miss_active = false;
                                     perf_close_miss_gap_percent = 0.0;
+                                    perf_metric_regressed = false;
+                                    perf_metric_regression_percent = 0.0;
                                 }
                             }
                         }
@@ -635,6 +677,15 @@ pub fn runModel(
         prev_perf_fix_rechecked = perf_fix_rechecked;
 
         if (iter >= 10 and stagnant_iterations >= 8) {
+            if (objective_request and mutating_tools_executed > 0 and !objective_drift_notice_sent) {
+                objective_drift_notice_sent = true;
+                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                try w.writer(arena_alloc).print(
+                    "{f}",
+                    .{std.json.fmt("Avoid broad exploration. From now on, do tight edit -> targeted verify loops on the primary solution files and optimize the failing objective metric directly.", .{})},
+                );
+                try w.appendSlice(arena_alloc, "}");
+            }
             const msg = "Stopping early: no meaningful progress in recent steps. Try a narrower instruction or different model.";
             toolOutput("{s}Stop:{s} {s}", .{ display.C_YELLOW, display.C_RESET, msg });
             return .{
@@ -748,11 +799,69 @@ fn looksLikeAnyFailure(out: []const u8) bool {
         utils.containsIgnoreCase(out, "assertionerror");
 }
 
+fn isObjectiveMetricsRequest(raw_user_request: []const u8) bool {
+    return utils.containsIgnoreCase(raw_user_request, "threshold") or
+        utils.containsIgnoreCase(raw_user_request, "latency") or
+        utils.containsIgnoreCase(raw_user_request, "cost") or
+        utils.containsIgnoreCase(raw_user_request, "optimiz") or
+        utils.containsIgnoreCase(raw_user_request, "benchmark");
+}
+
 const ThresholdAnalysis = struct {
     detected: bool,
     single_numeric: bool,
     gap_percent: ?f64,
 };
+
+const VerificationInsight = struct {
+    has_failure: bool,
+    has_metrics: bool,
+};
+
+fn analyzeVerificationOutput(out: []const u8) VerificationInsight {
+    var has_metrics = false;
+
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (looksLikeMetricLine(trimmed)) {
+            has_metrics = true;
+        }
+    }
+    return .{
+        .has_failure = looksLikeAnyFailure(out),
+        .has_metrics = has_metrics,
+    };
+}
+
+fn buildMetricSnapshot(allocator: std.mem.Allocator, out: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (!looksLikeMetricLine(trimmed)) continue;
+        if (buf.items.len > 0) try buf.appendSlice(allocator, "; ");
+        const remain = 220 - buf.items.len;
+        if (remain == 0) break;
+        const to_copy = @min(trimmed.len, remain);
+        try buf.appendSlice(allocator, trimmed[0..to_copy]);
+        if (buf.items.len >= 220) break;
+    }
+    if (buf.items.len == 0) return allocator.dupe(u8, "metrics not captured");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn looksLikeMetricLine(line: []const u8) bool {
+    return (utils.containsIgnoreCase(line, "cost") and (std.mem.indexOf(u8, line, ":") != null or std.mem.indexOf(u8, line, " > ") != null)) or
+        (utils.containsIgnoreCase(line, "latency") and std.mem.indexOf(u8, line, ":") != null) or
+        (utils.containsIgnoreCase(line, "pad ratio") and std.mem.indexOf(u8, line, ":") != null) or
+        (utils.containsIgnoreCase(line, "timecost") and std.mem.indexOf(u8, line, ":") != null) or
+        (utils.containsIgnoreCase(line, "bucket") and std.mem.indexOf(u8, line, " > ") != null);
+}
 
 fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
     var has_numeric_assert = false;
