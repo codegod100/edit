@@ -191,7 +191,7 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    var max_iterations: usize = 25;
+    var max_iterations: usize = 35;
     var adaptive_extensions_used: usize = 0;
     const max_adaptive_extensions: usize = 2;
     var stagnant_iterations: usize = 0;
@@ -646,14 +646,18 @@ pub fn runModel(
             };
         }
 
-        if (iter == max_iterations - 1 and adaptive_extensions_used < max_adaptive_extensions and progress_signal) {
+        const should_extend_for_completion =
+            mutation_request and mutating_tools_executed > 0 and
+            (!ran_verification_since_mutation or perf_threshold_active or perf_close_miss_active);
+
+        if (iter == max_iterations - 1 and adaptive_extensions_used < max_adaptive_extensions and (progress_signal or should_extend_for_completion)) {
             adaptive_extensions_used += 1;
             max_iterations += 10;
-            toolOutput("{s}Note:{s} progress detected near step limit, extending budget to {d} steps.", .{ display.C_YELLOW, display.C_RESET, max_iterations });
+            toolOutput("{s}Note:{s} extending step budget to {d} for completion/verification.", .{ display.C_YELLOW, display.C_RESET, max_iterations });
             try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
             try w.writer(arena_alloc).print(
                 "{f}",
-                .{std.json.fmt("Progress is visible. Continue with focused edits/checks and finish when done.", .{})},
+                .{std.json.fmt("Continue with focused edits/checks and finish only after verification is complete.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
