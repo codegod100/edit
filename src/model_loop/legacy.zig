@@ -134,6 +134,8 @@ pub fn runModel(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const skill_request = isSkillCreationRequest(raw_user_request);
     const objective_request = isObjectiveMetricsRequest(raw_user_request);
+    const requires_plan_b1 = utils.containsIgnoreCase(raw_user_request, "plan_b1.jsonl");
+    const requires_plan_b2 = utils.containsIgnoreCase(raw_user_request, "plan_b2.jsonl");
     var mutating_tools_executed: usize = 0;
     var ran_verification_since_mutation = false;
     var saw_tool_error = false;
@@ -162,6 +164,7 @@ pub fn runModel(
     var objective_invariant_prompt_sent = false;
     var correctness_was_clean_once = false;
     var correctness_regressed = false;
+    var artifact_prompt_sent = false;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -518,6 +521,11 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (objective_request and !requiredArtifactsExist(requires_plan_b1, requires_plan_b2)) {
+                    const msg = "Required output artifacts are missing (e.g., plan_b1/plan_b2). Create/update them before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 if (objective_request and mutating_tools_executed > 0 and !invariant_check_seen) {
                     const msg = "Objective task requires a structural invariant check after edits (e.g., shape/schema/consistency check). Run it before finishing.";
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
@@ -790,6 +798,16 @@ pub fn runModel(
                 stagnant_iterations = 0;
                 continue;
             }
+            if (objective_request) {
+                stagnant_iterations = 0;
+                try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                try w.writer(arena_alloc).print(
+                    "{f}",
+                    .{std.json.fmt("Do not stop for stagnation on this objective task. Continue with focused edit -> verify loops until required outputs exist and checks pass.", .{})},
+                );
+                try w.appendSlice(arena_alloc, "}");
+                continue;
+            }
             if (objective_request and mutating_tools_executed > 0 and !objective_drift_notice_sent) {
                 objective_drift_notice_sent = true;
                 try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
@@ -840,6 +858,15 @@ pub fn runModel(
             try w.writer(arena_alloc).print(
                 "{f}",
                 .{std.json.fmt("Run a structural invariant check now (shape/schema/consistency constraints). If it fails, repair those violations before further optimization.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+        if (objective_request and !artifact_prompt_sent and !requiredArtifactsExist(requires_plan_b1, requires_plan_b2)) {
+            artifact_prompt_sent = true;
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("Required outputs are missing. Create/update /app/task_file/output_data/plan_b1.jsonl and /app/task_file/output_data/plan_b2.jsonl now, then run definitive verification.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
@@ -1044,6 +1071,17 @@ fn buildFailureSnapshot(allocator: std.mem.Allocator, out: []const u8) ![]const 
     }
     if (buf.items.len == 0) return allocator.dupe(u8, "correctness invariant failed");
     return buf.toOwnedSlice(allocator);
+}
+
+fn requiredArtifactsExist(require_b1: bool, require_b2: bool) bool {
+    if (require_b1 and !fileExists("/app/task_file/output_data/plan_b1.jsonl")) return false;
+    if (require_b2 and !fileExists("/app/task_file/output_data/plan_b2.jsonl")) return false;
+    return true;
+}
+
+fn fileExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
 }
 
 fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
