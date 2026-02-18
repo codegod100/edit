@@ -12,6 +12,11 @@ const logger = @import("../logger.zig");
 
 const turn = @import("turn.zig");
 
+const ArtifactSnapshot = struct {
+    path: []u8,
+    content: []u8,
+};
+
 // Tool output callback type for timeline integration
 // Takes a pre-formatted string and adds it to timeline
 pub const ToolOutputCallback = *const fn ([]const u8) void;
@@ -170,6 +175,16 @@ pub fn runModel(
     var correctness_was_clean_once = false;
     var correctness_regressed = false;
     var artifact_prompt_sent = false;
+    var best_verification_score: f64 = 1.0e30;
+    var has_best_artifact_snapshot = false;
+    var best_artifact_snapshots: std.ArrayListUnmanaged(ArtifactSnapshot) = .empty;
+    defer {
+        for (best_artifact_snapshots.items) |it| {
+            allocator.free(it.path);
+            allocator.free(it.content);
+        }
+        best_artifact_snapshots.deinit(allocator);
+    }
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -767,6 +782,16 @@ pub fn runModel(
                                     single_metric_no_improve_cycles = 0;
                                 }
                             }
+
+                            if (objective_request and required_output_paths.items.len > 0 and requiredArtifactsExistPaths(required_output_paths.items)) {
+                                const score = verificationScore(clean_result);
+                                if (score + 0.001 < best_verification_score) {
+                                    try captureArtifactSnapshots(allocator, required_output_paths.items, &best_artifact_snapshots);
+                                    best_verification_score = score;
+                                    has_best_artifact_snapshot = true;
+                                    toolOutput("{s}Note:{s} saved improved output snapshot (score {d:.2}).", .{ display.C_DIM, display.C_RESET, score });
+                                }
+                            }
                         }
                     }
                 } else |_| {}
@@ -931,6 +956,10 @@ pub fn runModel(
     }
 
     toolOutput("{s}Stop:{s} Step limit reached ({d}).", .{ display.C_RED, display.C_RESET, max_iterations });
+    if (objective_request and has_best_artifact_snapshot) {
+        restoreArtifactSnapshots(&best_artifact_snapshots) catch {};
+        toolOutput("{s}Note:{s} restored best-known output snapshot before exiting.", .{ display.C_YELLOW, display.C_RESET });
+    }
     const msg = "Task paused (max steps). Use 'continue' to resume or give new instructions.";
     toolOutput("{s}»{s} {s}", .{ display.C_RED, display.C_RESET, msg });
 
@@ -1165,6 +1194,42 @@ fn containsPathStr(paths: []const []const u8, p: []const u8) bool {
         if (std.mem.eql(u8, x, p)) return true;
     }
     return false;
+}
+
+fn captureArtifactSnapshots(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+    out: *std.ArrayListUnmanaged(ArtifactSnapshot),
+) !void {
+    for (out.items) |it| {
+        allocator.free(it.path);
+        allocator.free(it.content);
+    }
+    out.clearRetainingCapacity();
+
+    for (paths) |p| {
+        const content = std.fs.cwd().readFileAlloc(allocator, p, 8 * 1024 * 1024) catch continue;
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, p),
+            .content = content,
+        });
+    }
+}
+
+fn restoreArtifactSnapshots(snaps: *const std.ArrayListUnmanaged(ArtifactSnapshot)) !void {
+    for (snaps.items) |it| {
+        var f = try std.fs.cwd().createFile(it.path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(it.content);
+    }
+}
+
+fn verificationScore(out: []const u8) f64 {
+    var score: f64 = 0.0;
+    if (looksLikeAnyFailure(out)) score += 1.0e6;
+    const threshold = analyzeThresholdFailure(out);
+    if (threshold.detected and threshold.gap_percent != null) score += threshold.gap_percent.?;
+    return score;
 }
 
 fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
