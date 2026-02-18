@@ -152,6 +152,11 @@ pub fn runModel(
     var perf_metric_regressed = false;
     var perf_metric_regression_percent: f64 = 0.0;
     var objective_drift_notice_sent = false;
+    var golden_verify_seen = false;
+    var objective_needs_golden_verify = false;
+    var objective_golden_prompt_sent = false;
+    var objective_script_write_count: usize = 0;
+    var latest_correctness_failure_snapshot: []const u8 = "";
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -202,7 +207,7 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    var max_iterations: usize = 35;
+    var max_iterations: usize = if (objective_request) 50 else 35;
     var adaptive_extensions_used: usize = 0;
     const max_adaptive_extensions: usize = 2;
     var stagnant_iterations: usize = 0;
@@ -503,6 +508,11 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (objective_request and mutating_tools_executed > 0 and !golden_verify_seen) {
+                    const msg = "Objective task requires at least one definitive verifier run (e.g., pytest/verify script) after edits. Run it before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 if (objective_request and latest_verification_has_metrics and latest_verification_had_failure) {
                     const msg = try std.fmt.allocPrint(arena_alloc, "Latest verification still shows failing objective metrics/tests: {s}. Continue focused optimization and recheck before finishing.", .{latest_verification_metric_snapshot});
                     try turn_results.append(arena_alloc, msg);
@@ -533,8 +543,26 @@ pub fn runModel(
                 };
             }
             if (tools.isMutatingToolName(tc.tool)) {
+                if (objective_request and (std.mem.eql(u8, tc.tool, "write_file") or std.mem.eql(u8, tc.tool, "edit_file"))) {
+                    if (tools.parsePrimaryPathFromArgs(arena_alloc, tc.args)) |pp| {
+                        defer arena_alloc.free(pp);
+                        const is_script = std.mem.indexOf(u8, pp, "/scripts/") != null or std.mem.startsWith(u8, pp, "scripts/");
+                        if (is_script) {
+                            objective_script_write_count += 1;
+                            if (objective_script_write_count > 2) {
+                                const msg = "Too many script-file edits for an objective task. Stop adding analysis scripts and switch to direct solution-file edit -> definitive verify loops.";
+                                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                                continue;
+                            }
+                        }
+                    }
+                }
                 mutating_tools_executed += 1;
                 ran_verification_since_mutation = false;
+                if (objective_request) {
+                    objective_needs_golden_verify = true;
+                    objective_golden_prompt_sent = false;
+                }
                 if (correctness_failure_active) {
                     correctness_fix_edit_made = true;
                     correctness_fix_rechecked = false;
@@ -596,11 +624,16 @@ pub fn runModel(
                         }
                         if (isLikelyVerificationCommand(cmd)) {
                             ran_verification_since_mutation = true;
+                            if (isGoldenVerificationCommand(cmd)) {
+                                golden_verify_seen = true;
+                                objective_needs_golden_verify = false;
+                            }
                             const insight = analyzeVerificationOutput(clean_result);
                             latest_verification_has_metrics = insight.has_metrics;
                             latest_verification_had_failure = insight.has_failure;
                             latest_verification_metric_snapshot = try buildMetricSnapshot(arena_alloc, clean_result);
                             if (looksLikeCorrectnessFailure(clean_result)) {
+                                latest_correctness_failure_snapshot = try buildFailureSnapshot(arena_alloc, clean_result);
                                 correctness_failure_active = true;
                                 correctness_fix_edit_made = false;
                                 correctness_fix_rechecked = false;
@@ -610,7 +643,7 @@ pub fn runModel(
                                 perf_fix_rechecked = false;
                                 perf_close_miss_active = false;
                                 perf_close_miss_gap_percent = 0.0;
-                                const msg = "Correctness/feasibility failure detected. Fix correctness first and rerun the failing correctness check before any further optimization.";
+                                const msg = try std.fmt.allocPrint(arena_alloc, "Correctness/feasibility failure detected: {s}. Fix this invariant first, then rerun the failing correctness check before optimization.", .{latest_correctness_failure_snapshot});
                                 try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                             } else if (correctness_failure_active) {
                                 correctness_fix_rechecked = true;
@@ -618,6 +651,7 @@ pub fn runModel(
                                     correctness_failure_active = false;
                                     correctness_fix_edit_made = false;
                                     correctness_fix_rechecked = false;
+                                    latest_correctness_failure_snapshot = "";
                                 }
                             }
                             const threshold = analyzeThresholdFailure(clean_result);
@@ -754,6 +788,15 @@ pub fn runModel(
             try w.writer(arena_alloc).print(
                 "{f}",
                 .{std.json.fmt("Continue with focused edits/checks and finish only after verification is complete.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+        if (objective_request and objective_needs_golden_verify and !objective_golden_prompt_sent) {
+            objective_golden_prompt_sent = true;
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("Run a definitive verifier command now (e.g., pytest/verify script), then use its failing assertions to drive the next focused edit.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
@@ -915,6 +958,39 @@ fn looksLikeMetricLine(line: []const u8) bool {
         (utils.containsIgnoreCase(line, "pad ratio") and std.mem.indexOf(u8, line, ":") != null) or
         (utils.containsIgnoreCase(line, "timecost") and std.mem.indexOf(u8, line, ":") != null) or
         (utils.containsIgnoreCase(line, "bucket") and std.mem.indexOf(u8, line, " > ") != null);
+}
+
+fn isGoldenVerificationCommand(cmd: []const u8) bool {
+    const c = std.mem.trim(u8, cmd, " \t\r\n");
+    return std.mem.indexOf(u8, c, "pytest") != null or
+        std.mem.indexOf(u8, c, " verify") != null or
+        std.mem.endsWith(u8, c, "verify.sh") or
+        std.mem.indexOf(u8, c, "test_outputs.py") != null;
+}
+
+fn buildFailureSnapshot(allocator: std.mem.Allocator, out: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (!(utils.containsIgnoreCase(trimmed, "assert") or
+            utils.containsIgnoreCase(trimmed, "failed") or
+            utils.containsIgnoreCase(trimmed, "error")))
+        {
+            continue;
+        }
+        if (buf.items.len > 0) try buf.appendSlice(allocator, "; ");
+        const remain = 220 - buf.items.len;
+        if (remain == 0) break;
+        const to_copy = @min(trimmed.len, remain);
+        try buf.appendSlice(allocator, trimmed[0..to_copy]);
+        if (buf.items.len >= 220) break;
+    }
+    if (buf.items.len == 0) return allocator.dupe(u8, "correctness invariant failed");
+    return buf.toOwnedSlice(allocator);
 }
 
 fn analyzeThresholdFailure(out: []const u8) ThresholdAnalysis {
