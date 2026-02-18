@@ -1,6 +1,7 @@
 // zagent Web UI
 class ZagentApp {
     constructor() {
+        this.lastSessionStorageKey = 'zagent_last_session_id';
         this.ws = null;
         this.connected = false;
         this.currentPath = null;
@@ -10,6 +11,9 @@ class ZagentApp {
         this.typingTimer = null;
         this.requestInFlight = false;
         this.requestTimeoutHandle = null;
+        this.activeSessionId = null;
+        this.pendingRestoreSessionId = this.loadLastSessionId();
+        this.activeLogGroup = null;
         
         this.init();
     }
@@ -185,7 +189,6 @@ class ZagentApp {
     }
     
     setProjectPath(path) {
-        this.currentPath = path;
         this.send({
             type: 'set_project',
             project_path: path
@@ -213,6 +216,7 @@ class ZagentApp {
             content: content,
             project_path: this.currentPath
         });
+        this.activeLogGroup = null;
         
         this.markRequestPending();
 
@@ -229,9 +233,25 @@ class ZagentApp {
     handleMessage(data) {
         switch (data.type) {
             case 'assistant_output':
-                this.hideTypingIndicator();
-                this.clearPendingRequest();
-                this.addMessage('assistant', data.content);
+                if (data.kind) {
+                    this.addAgentLog(data.kind, data.content || '');
+                } else {
+                    this.hideTypingIndicator();
+                    this.clearPendingRequest();
+                    const reasoning = typeof data.reasoning === 'string' ? data.reasoning.trim() : '';
+                    const toolOutput = typeof data.tool_output === 'string' ? data.tool_output.trim() : '';
+                    const commandOutput = typeof data.command_output === 'string' ? data.command_output.trim() : '';
+                    const content = typeof data.content === 'string' ? data.content.trim() : '';
+                    if (reasoning && !this.isDuplicateForKind('thinking', reasoning)) this.addAgentLog('thinking', reasoning);
+                    if (toolOutput) this.addAgentLog('tool', toolOutput);
+                    const normalizedEvent = this.normalizeEventLog(commandOutput);
+                    if (normalizedEvent && !this.isDuplicateForKind('event', normalizedEvent)) this.addAgentLog('event', normalizedEvent);
+                    if (content) this.addAgentLog('response', content);
+                }
+                break;
+
+            case 'assistant_stream':
+                this.addAgentLog(data.kind || 'event', data.content || '');
                 break;
                 
             case 'tool_call':
@@ -247,11 +267,27 @@ class ZagentApp {
                 break;
 
             case 'recent_sessions':
+                this.maybeRestoreLastSession(data.sessions || []);
                 this.renderRecentSessions(data.sessions || []);
                 break;
 
             case 'session_loaded':
                 this.applyLoadedSession(data);
+                break;
+
+            case 'project_set':
+                if (typeof data.project_path === 'string' && data.project_path.trim()) {
+                    this.currentPath = data.project_path;
+                    this.elements.projectPathInput.value = data.project_path;
+                }
+                this.activeSessionId = null;
+                this.clearLastSessionId();
+                if (data.content) this.addSystemMessage(data.content);
+                break;
+
+            case 'session_title_updated':
+                this.addSystemMessage('Session title updated.');
+                this.requestRecentSessions();
                 break;
 
             case 'dir_list':
@@ -294,16 +330,21 @@ class ZagentApp {
         }
 
         sessions.forEach((session) => {
-            const item = document.createElement('button');
-            item.type = 'button';
+            const item = document.createElement('div');
             item.className = 'session-entry';
+
             const title = session.title || session.id;
             const when = this.formatSessionTime(session.updated);
-            item.innerHTML = `
+            const sessionPath = this.pathFromSession(session);
+            const loadBtn = document.createElement('button');
+            loadBtn.type = 'button';
+            loadBtn.className = 'session-load';
+            loadBtn.innerHTML = `
                 <span class="session-title">${this.escapeHtml(title)}</span>
                 <span class="session-meta">${this.escapeHtml(session.id)} · ${this.escapeHtml(when)}</span>
+                ${sessionPath ? `<span class="session-path">${this.escapeHtml(sessionPath)}</span>` : ''}
             `;
-            item.addEventListener('click', () => {
+            loadBtn.addEventListener('click', () => {
                 const candidatePath = this.pathFromSession(session);
                 if (candidatePath) {
                     this.currentPath = candidatePath;
@@ -311,11 +352,42 @@ class ZagentApp {
                 }
                 this.send({ type: 'load_session', session_id: session.id });
             });
+
+            item.appendChild(loadBtn);
+            if (session.id === this.activeSessionId) {
+                const editBtn = document.createElement('button');
+                editBtn.type = 'button';
+                editBtn.className = 'session-edit';
+                editBtn.textContent = 'Rename';
+                editBtn.addEventListener('click', () => this.editSessionTitle(session));
+                item.appendChild(editBtn);
+            }
             this.elements.sessionsList.appendChild(item);
         });
     }
 
+    editSessionTitle(session) {
+        if (!session || !session.id) return;
+        const currentTitle = (session.title || '').trim();
+        const nextTitle = window.prompt('Edit session title', currentTitle);
+        if (nextTitle === null) return;
+        const trimmed = nextTitle.trim();
+        if (!trimmed) {
+            this.addErrorMessage('Session title cannot be empty.');
+            return;
+        }
+        this.send({
+            type: 'rename_session',
+            session_id: session.id,
+            title: trimmed,
+        });
+    }
+
     applyLoadedSession(data) {
+        this.activeSessionId = data.session_id || null;
+        this.saveLastSessionId(this.activeSessionId);
+        this.requestRecentSessions();
+
         const turns = Array.isArray(data.turns) ? data.turns : [];
         this.elements.messages.innerHTML = '';
         turns.forEach((turn) => {
@@ -342,6 +414,48 @@ class ZagentApp {
         this.addSystemMessage(`Loaded session ${data.session_id || ''}`.trim());
     }
 
+    maybeRestoreLastSession(sessions) {
+        if (!this.pendingRestoreSessionId || !Array.isArray(sessions) || sessions.length === 0) return;
+        const targetId = this.pendingRestoreSessionId;
+        const found = sessions.find((s) => s && s.id === targetId);
+        this.pendingRestoreSessionId = null;
+        if (!found) {
+            this.clearLastSessionId();
+            return;
+        }
+        if (this.activeSessionId === targetId) return;
+        const candidatePath = this.pathFromSession(found);
+        if (candidatePath) {
+            this.currentPath = candidatePath;
+            this.elements.projectPathInput.value = candidatePath;
+        }
+        this.send({ type: 'load_session', session_id: targetId });
+    }
+
+    loadLastSessionId() {
+        try {
+            const value = window.localStorage.getItem(this.lastSessionStorageKey);
+            return value && value.trim() ? value.trim() : null;
+        } catch (_err) {
+            return null;
+        }
+    }
+
+    saveLastSessionId(sessionId) {
+        try {
+            if (sessionId && sessionId.trim()) {
+                window.localStorage.setItem(this.lastSessionStorageKey, sessionId.trim());
+            } else {
+                window.localStorage.removeItem(this.lastSessionStorageKey);
+            }
+        } catch (_err) {}
+    }
+
+    clearLastSessionId() {
+        this.pendingRestoreSessionId = null;
+        this.saveLastSessionId(null);
+    }
+
     formatSessionTime(rawValue) {
         const n = Number(rawValue);
         if (!Number.isFinite(n)) return 'unknown time';
@@ -353,7 +467,7 @@ class ZagentApp {
 
     pathFromSession(session) {
         if (!session) return null;
-        const candidate = session.project_path || session.title || '';
+        const candidate = session.project_path || '';
         if (typeof candidate !== 'string') return null;
         const trimmed = candidate.trim();
         if (!trimmed.startsWith('/')) return null;
@@ -391,6 +505,76 @@ class ZagentApp {
         messageDiv.appendChild(contentDiv);
         this.elements.messages.appendChild(messageDiv);
         this.scrollToBottom();
+    }
+
+    addAgentLog(kind, content) {
+        const text = String(content || '').trim();
+        if (!text) return;
+        const label = this.agentLogLabel(kind);
+        if (!label) return;
+
+        const normalizedKind = String(kind || '').toLowerCase();
+        const isResponse = normalizedKind === 'response';
+
+        if (isResponse) {
+            this.activeLogGroup = null;
+            this.addMessage('assistant', `### ${label}\n${text}`);
+            return;
+        }
+
+        if (this.activeLogGroup && this.activeLogGroup.kind === normalizedKind && this.activeLogGroup.contentNode) {
+            this.activeLogGroup.body += `\n${text}`;
+            const body = `### ${label}\n${this.activeLogGroup.body}`;
+            this.activeLogGroup.contentNode.innerHTML = this.formatMessage(body);
+            this.scrollToBottom();
+            return;
+        }
+
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'message assistant';
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
+        contentDiv.innerHTML = this.formatMessage(`### ${label}\n${text}`);
+        messageDiv.appendChild(contentDiv);
+        this.elements.messages.appendChild(messageDiv);
+        this.scrollToBottom();
+
+        this.activeLogGroup = {
+            kind: normalizedKind,
+            body: text,
+            contentNode: contentDiv,
+        };
+    }
+
+    normalizeEventLog(text) {
+        const raw = String(text || '').trim();
+        if (!raw) return '';
+        if (raw.includes('--- Thinking ---')) return '';
+        if (raw.includes('⛬ ')) return '';
+        return raw;
+    }
+
+    isDuplicateForKind(kind, text) {
+        if (!this.activeLogGroup) return false;
+        if (this.activeLogGroup.kind !== String(kind || '').toLowerCase()) return false;
+        const existing = String(this.activeLogGroup.body || '').trim();
+        const incoming = String(text || '').trim();
+        return existing === incoming || existing.includes(incoming) || incoming.includes(existing);
+    }
+
+    agentLogLabel(kind) {
+        switch (String(kind || '').toLowerCase()) {
+            case 'thinking':
+                return 'Thinking';
+            case 'tool':
+                return 'Command Output';
+            case 'status':
+                return null;
+            case 'response':
+                return 'Response';
+            default:
+                return 'Event';
+        }
     }
     
     addSystemMessage(content) {

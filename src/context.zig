@@ -150,6 +150,17 @@ pub const ActiveModel = struct {
 
 pub const HistoryNav = enum { up, down };
 
+fn stripRunMetadataSuffix(input: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    const idx = std.mem.lastIndexOf(u8, trimmed, " [tools=") orelse return trimmed;
+    const tail = trimmed[idx..];
+    if (std.mem.indexOf(u8, tail, " errors=") == null) return trimmed;
+    if (std.mem.indexOf(u8, tail, " files=") == null) return trimmed;
+    if (trimmed[trimmed.len - 1] != ']') return trimmed;
+    return std.mem.trimRight(u8, trimmed[0..idx], " \t\r\n");
+}
+
 pub fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: HistoryNav) ?usize {
     if (entries.len == 0) return null;
     return switch (nav) {
@@ -301,6 +312,13 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
                 const start = idx + 9;
                 if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
                     title = try allocator.dupe(u8, peek_data[start..end]);
+                }
+            }
+            if (title) |parsed_title| {
+                const trimmed = std.mem.trim(u8, parsed_title, " \t\r\n");
+                if (trimmed.len > 0 and std.fs.path.isAbsolute(trimmed)) {
+                    allocator.free(parsed_title);
+                    title = null;
                 }
             }
 
@@ -538,15 +556,9 @@ pub fn buildHeuristicSummary(allocator: std.mem.Allocator, window: *const Contex
     while (idx < compact_count) : (idx += 1) {
         const turn = window.turns.items[idx];
         const prefix = if (turn.role == .assistant) "A" else "U";
-        const cap_len = @min(turn.content.len, 220);
-        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null)) {
-            try summary_buf.writer(allocator).print(
-                "- {s}: {s} [tools={d} errors={d}{s}]\n",
-                .{ prefix, turn.content[0..cap_len], turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
-            );
-        } else {
-            try summary_buf.writer(allocator).print("- {s}: {s}\n", .{ prefix, turn.content[0..cap_len] });
-        }
+        const content = if (turn.role == .assistant) stripRunMetadataSuffix(turn.content) else turn.content;
+        const cap_len = @min(content.len, 220);
+        try summary_buf.writer(allocator).print("- {s}: {s}\n", .{ prefix, content[0..cap_len] });
     }
     return summary_buf.toOwnedSlice(allocator);
 }
@@ -559,13 +571,8 @@ fn summarizeTurnsWithModel(allocator: std.mem.Allocator, window: *const ContextW
     while (idx < compact_count) : (idx += 1) {
         const turn = window.turns.items[idx];
         const role = if (turn.role == .assistant) "assistant" else "user";
-        try w.print("- {s}: {s}", .{ role, turn.content });
-        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
-            try w.print(" [tools={d} errors={d}", .{ turn.tool_calls, turn.error_count });
-            if (turn.files_touched) |f| try w.print(" files={s}", .{f});
-            try w.print("]", .{});
-        }
-        try w.print("\n", .{});
+        const content = if (turn.role == .assistant) stripRunMetadataSuffix(turn.content) else turn.content;
+        try w.print("- {s}: {s}\n", .{ role, content });
     }
 
     const prompt = try std.fmt.allocPrint(
@@ -634,14 +641,8 @@ pub fn buildContextPrompt(allocator: std.mem.Allocator, window: *const ContextWi
         for (indices) |idx| {
             const turn = window.turns.items[idx];
             const tag = if (turn.role == .assistant) "Assistant" else "User";
-            if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
-                try w.print(
-                    "{s}: {s} [tools={d} errors={d}{s}]\n",
-                    .{ tag, turn.content, turn.tool_calls, turn.error_count, if (turn.files_touched) |f| f else "" },
-                );
-            } else {
-                try w.print("{s}: {s}\n", .{ tag, turn.content });
-            }
+            const content = if (turn.role == .assistant) stripRunMetadataSuffix(turn.content) else turn.content;
+            try w.print("{s}: {s}\n", .{ tag, content });
         }
     }
 
@@ -680,13 +681,8 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
         defer content_buf.deinit(allocator);
         const cw = content_buf.writer(allocator);
         
-        if (turn.role == .assistant and (turn.tool_calls > 0 or turn.files_touched != null or turn.error_count > 0)) {
-            try cw.print("{s} [tools={d} errors={d}", .{ turn.content, turn.tool_calls, turn.error_count });
-            if (turn.files_touched) |f| try cw.print(" files={s}", .{f});
-            try cw.print("]", .{});
-        } else {
-            try cw.writeAll(turn.content);
-        }
+        const content = if (turn.role == .assistant) stripRunMetadataSuffix(turn.content) else turn.content;
+        try cw.writeAll(content);
         
         try w.print("{f}", .{std.json.fmt(content_buf.items, .{})});
         try w.writeAll("},");

@@ -451,12 +451,18 @@ pub fn describeModelQueryError(err: anyerror) []const u8 {
 var g_timeline_entries: std.ArrayListUnmanaged([]const u8) = .{};
 var g_timeline_allocator: ?std.mem.Allocator = null;
 var g_timeline_mutex: std.Thread.Mutex = .{};
+pub const TimelineCallback = *const fn ([]const u8) void;
+var g_timeline_callback: ?TimelineCallback = null;
 
 // Global stdout mutex to prevent concurrent writes
 pub var g_stdout_mutex: std.Thread.Mutex = .{};
 
 pub fn initTimeline(allocator: std.mem.Allocator) void {
     g_timeline_allocator = allocator;
+}
+
+pub fn setTimelineCallback(callback: ?TimelineCallback) void {
+    g_timeline_callback = callback;
 }
 
 pub fn deinitTimeline() void {
@@ -470,6 +476,22 @@ pub fn deinitTimeline() void {
     }
 }
 
+pub fn consumeTimelineEntries(allocator: std.mem.Allocator) ![]u8 {
+    g_timeline_mutex.lock();
+    defer g_timeline_mutex.unlock();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (g_timeline_entries.items) |entry| {
+        try out.appendSlice(allocator, entry);
+        allocator.free(entry);
+    }
+    g_timeline_entries.clearRetainingCapacity();
+
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     g_timeline_mutex.lock();
     defer g_timeline_mutex.unlock();
@@ -479,6 +501,12 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     defer g_stdout_mutex.unlock();
     
     std.debug.print(format, args);
+
+    if (g_timeline_callback) |callback| {
+        const rendered = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch return;
+        defer std.heap.page_allocator.free(rendered);
+        callback(rendered);
+    }
 
     if (g_timeline_allocator) |allocator| {
         const entry = std.fmt.allocPrint(allocator, format, args) catch return;

@@ -8,6 +8,7 @@ const provider = @import("provider.zig");
 const provider_store = @import("provider_store.zig");
 const model_select = @import("model_select.zig");
 const model_loop = @import("model_loop/main.zig");
+const display = @import("display.zig");
 
 const log = std.log.scoped(.web_main);
 const active_module = @import("context.zig");
@@ -18,7 +19,13 @@ var g_sessions: ?*SessionMap = null;
 var g_server: ?*web.Server = null;
 var g_config_dir: ?[]const u8 = null;
 var g_provider_specs: ?[]const provider.ProviderSpec = null;
+var g_model_run_mutex: std.Thread.Mutex = .{};
+var g_tool_capture_mutex: std.Thread.Mutex = .{};
+var g_tool_capture_buffer: ?*std.ArrayListUnmanaged(u8) = null;
+var g_tool_capture_allocator: ?std.mem.Allocator = null;
+var g_stream_client_id: ?u32 = null;
 const FIXED_FALLBACK_PORT: u16 = 28713;
+const MAX_SESSION_TITLE_CHARS: usize = 80;
 
 // WebSocket message types
 const MessageType = enum {
@@ -28,6 +35,7 @@ const MessageType = enum {
     write_file,
     list_sessions,
     load_session,
+    rename_session,
 };
 
 // WebSocket session state
@@ -196,6 +204,7 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         content: ?[]const u8 = null,
         project_path: ?[]const u8 = null,
         session_id: ?[]const u8 = null,
+        title: ?[]const u8 = null,
     }, allocator, ws_message, .{}) catch |err| {
         log.err("Failed to parse message: {}", .{err});
         return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Invalid JSON\"}}", .{});
@@ -216,29 +225,33 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
 
     if (std.mem.eql(u8, data.value.type, "set_project")) {
         if (data.value.project_path) |path| {
+            const canonical_path = normalizeProjectPath(allocator, path) catch try allocator.dupe(u8, path);
+            defer allocator.free(canonical_path);
+
             if (session.project_path) |old_path| session.allocator.free(old_path);
-            session.project_path = try session.allocator.dupe(u8, path);
+            session.project_path = try session.allocator.dupe(u8, canonical_path);
             session.context_window.deinit(session.allocator);
             session.context_window = context.ContextWindow.init(32000, 20);
-            if (session.context_window.title) |old_title| session.allocator.free(old_title);
-            session.context_window.title = try session.allocator.dupe(u8, path);
             if (session.context_window.project_path) |old_project_path| session.allocator.free(old_project_path);
-            session.context_window.project_path = try session.allocator.dupe(u8, path);
-            const project_hash = context.hashProjectPath(path);
+            session.context_window.project_path = try session.allocator.dupe(u8, canonical_path);
+            const project_hash = context.hashProjectPath(canonical_path);
             context.loadContextWindow(session.allocator, config_dir, &session.context_window, project_hash) catch |err| {
-                log.warn("Failed to load context for {s}: {}", .{ path, err });
+                log.warn("Failed to load context for {s}: {}", .{ canonical_path, err });
             };
             if (session.context_window.project_path == null) {
-                session.context_window.project_path = try session.allocator.dupe(u8, path);
+                session.context_window.project_path = try session.allocator.dupe(u8, canonical_path);
             }
-            try sendFileList(server, session, path);
-            return try std.fmt.allocPrint(allocator, "{{\"type\":\"status\",\"content\":\"Project set to {s}\"}}", .{path});
+            _ = ensureSessionSummaryTitle(session.allocator, &session.context_window) catch false;
+            try sendFileList(server, session, canonical_path);
+            const canonical_path_json = try jsonQuoted(allocator, canonical_path);
+            defer allocator.free(canonical_path_json);
+            return try std.fmt.allocPrint(allocator, "{{\"type\":\"project_set\",\"project_path\":{s},\"content\":\"Project set\"}}", .{canonical_path_json});
         }
     } else if (std.mem.eql(u8, data.value.type, "list_dir")) {
         return try listDirectoriesResponse(allocator, data.value.path);
     } else if (std.mem.eql(u8, data.value.type, "user_input")) {
         if (data.value.content) |content| {
-            try processUserInput(allocator, server, session, content, config_dir);
+            try processUserInput(allocator, server, session, client_id, content, config_dir);
             return try allocator.dupe(u8, "");
         }
     } else if (std.mem.eql(u8, data.value.type, "read_file")) {
@@ -257,10 +270,221 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         if (data.value.session_id) |session_id| {
             return try loadSessionResponse(allocator, server, session, config_dir, session_id);
         }
+    } else if (std.mem.eql(u8, data.value.type, "rename_session")) {
+        if (data.value.session_id) |session_id| {
+            if (data.value.title) |title| {
+                return try renameSessionResponse(allocator, config_dir, session_id, title);
+            }
+        }
     }
 
     return try allocator.dupe(u8, "");
 }
+
+fn normalizeProjectPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, input_path, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+    if (std.fs.path.isAbsolute(trimmed)) {
+        return try std.fs.path.resolve(allocator, &.{trimmed});
+    }
+    return try std.fs.cwd().realpathAlloc(allocator, trimmed);
+}
+
+fn appendToolOutputSanitized(text: []const u8) void {
+    g_tool_capture_mutex.lock();
+    defer g_tool_capture_mutex.unlock();
+
+    const buffer = g_tool_capture_buffer orelse return;
+    const allocator = g_tool_capture_allocator orelse return;
+
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '[') {
+            i += 2;
+            while (i < text.len) : (i += 1) {
+                const c = text[i];
+                if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) break;
+            }
+            continue;
+        }
+        buffer.append(allocator, text[i]) catch return;
+    }
+}
+
+fn webToolOutputCallback(text: []const u8) void {
+    appendToolOutputSanitized(text);
+
+    const allocator = g_tool_capture_allocator orelse return;
+    const server = g_server orelse return;
+    const clean = stripAnsiAlloc(allocator, text) catch return;
+    defer allocator.free(clean);
+    const trimmed = std.mem.trim(u8, clean, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    sendAssistantStreamEvent(allocator, server, "tool", trimmed);
+}
+
+fn webTimelineCallback(text: []const u8) void {
+    const allocator = g_tool_capture_allocator orelse return;
+    const server = g_server orelse return;
+    const clean = stripAnsiAlloc(allocator, text) catch return;
+    defer allocator.free(clean);
+    const trimmed = std.mem.trim(u8, clean, " \t\r\n");
+    if (trimmed.len == 0) return;
+    sendAssistantStreamEvent(allocator, server, "event", trimmed);
+}
+
+fn stripAnsiAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (input[i] == 0x1b and i + 1 < input.len and input[i + 1] == '[') {
+            i += 2;
+            while (i < input.len) : (i += 1) {
+                const c = input[i];
+                if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) break;
+            }
+            continue;
+        }
+        try out.append(allocator, input[i]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn extractThinkingFromTimeline(allocator: std.mem.Allocator, timeline_text: []const u8) !?[]u8 {
+    const marker = "--- Thinking ---";
+    const start_idx = std.mem.indexOf(u8, timeline_text, marker) orelse return null;
+    var rest = timeline_text[start_idx + marker.len ..];
+    rest = std.mem.trimLeft(u8, rest, " \t\r\n");
+    if (rest.len == 0) return null;
+
+    // Prefer text until the next obvious section marker or prompt marker.
+    var end_idx = rest.len;
+    if (std.mem.indexOf(u8, rest, "\n--- ")) |i| end_idx = @min(end_idx, i);
+    if (std.mem.indexOf(u8, rest, "\n• ")) |i| end_idx = @min(end_idx, i);
+    if (std.mem.indexOf(u8, rest, "\n⛬")) |i| end_idx = @min(end_idx, i);
+    if (std.mem.indexOf(u8, rest, "\n> ")) |i| end_idx = @min(end_idx, i);
+
+    const candidate = std.mem.trim(u8, rest[0..end_idx], " \t\r\n");
+    if (candidate.len == 0) return null;
+    return try allocator.dupe(u8, candidate);
+}
+
+fn stripRunMetadataSuffix(input: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    const idx = std.mem.lastIndexOf(u8, trimmed, " [tools=") orelse return trimmed;
+    const tail = trimmed[idx..];
+    if (std.mem.indexOf(u8, tail, " errors=") == null) return trimmed;
+    if (std.mem.indexOf(u8, tail, " files=") == null) return trimmed;
+    if (trimmed[trimmed.len - 1] != ']') return trimmed;
+    return std.mem.trimRight(u8, trimmed[0..idx], " \t\r\n");
+}
+
+fn splitEmbeddedThinking(allocator: std.mem.Allocator, response_text: []const u8) !struct {
+    content: []u8,
+    reasoning: ?[]u8,
+} {
+    const trimmed = std.mem.trim(u8, response_text, " \t\r\n");
+    const marker = "--- Thinking ---";
+    const symbol = "⛬";
+    if (std.mem.indexOf(u8, trimmed, marker)) |midx| {
+        if (std.mem.indexOfPos(u8, trimmed, midx + marker.len, symbol)) |sidx| {
+            const reasoning_part = std.mem.trim(u8, trimmed[midx + marker.len .. sidx], " \t\r\n");
+            const content_part = std.mem.trim(u8, trimmed[sidx + symbol.len ..], " \t\r\n");
+            return .{
+                .content = try allocator.dupe(u8, stripRunMetadataSuffix(content_part)),
+                .reasoning = if (reasoning_part.len > 0) try allocator.dupe(u8, reasoning_part) else null,
+            };
+        }
+    }
+    return .{
+        .content = try allocator.dupe(u8, stripRunMetadataSuffix(trimmed)),
+        .reasoning = null,
+    };
+}
+
+fn isPathLikeTitle(title: []const u8) bool {
+    const trimmed = std.mem.trim(u8, title, " \t\r\n");
+    return trimmed.len > 0 and std.fs.path.isAbsolute(trimmed);
+}
+
+fn summarizeForTitle(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
+    var compact = try allocator.alloc(u8, trimmed.len);
+    errdefer allocator.free(compact);
+
+    var out_len: usize = 0;
+    var prev_was_space = false;
+    for (trimmed) |c| {
+        const is_space = c == ' ' or c == '\n' or c == '\r' or c == '\t';
+        if (is_space) {
+            if (prev_was_space) continue;
+            compact[out_len] = ' ';
+            out_len += 1;
+            prev_was_space = true;
+            continue;
+        }
+        compact[out_len] = c;
+        out_len += 1;
+        prev_was_space = false;
+    }
+
+    while (out_len > 0 and compact[out_len - 1] == ' ') : (out_len -= 1) {}
+    if (out_len == 0) {
+        allocator.free(compact);
+        return null;
+    }
+
+    if (out_len <= MAX_SESSION_TITLE_CHARS) {
+        return try allocator.realloc(compact, out_len);
+    }
+
+    const ellipsis = "...";
+    const head_len = MAX_SESSION_TITLE_CHARS - ellipsis.len;
+    var title = try allocator.alloc(u8, MAX_SESSION_TITLE_CHARS);
+    @memcpy(title[0..head_len], compact[0..head_len]);
+    @memcpy(title[head_len..], ellipsis);
+    allocator.free(compact);
+    return title;
+}
+
+fn deriveTitleFromWindow(allocator: std.mem.Allocator, window: *const context.ContextWindow) !?[]u8 {
+    for (window.turns.items) |turn| {
+        if (turn.role != .user) continue;
+        if (try summarizeForTitle(allocator, turn.content)) |title| return title;
+    }
+    return null;
+}
+
+fn ensureSessionSummaryTitle(allocator: std.mem.Allocator, window: *context.ContextWindow) !bool {
+    if (window.title) |existing| {
+        const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+        if (trimmed.len > 0 and !isPathLikeTitle(trimmed)) return false;
+    }
+
+    const derived = try deriveTitleFromWindow(allocator, window);
+    if (derived == null) return false;
+    errdefer if (derived) |t| allocator.free(t);
+
+    if (window.title) |existing| allocator.free(existing);
+    window.title = derived;
+    return true;
+}
+
+const SessionMetadata = struct {
+    project_path: ?[]u8 = null,
+    derived_title: ?[]u8 = null,
+
+    fn deinit(self: *SessionMetadata, allocator: std.mem.Allocator) void {
+        if (self.project_path) |p| allocator.free(p);
+        if (self.derived_title) |t| allocator.free(t);
+    }
+};
 
 // Helper functions
 fn listDirectoriesResponse(allocator: std.mem.Allocator, requested_path: ?[]const u8) ![]u8 {
@@ -268,13 +492,13 @@ fn listDirectoriesResponse(allocator: std.mem.Allocator, requested_path: ?[]cons
         if (requested_path) |rp| {
             const trimmed = std.mem.trim(u8, rp, " \t\r\n");
             if (trimmed.len > 0) {
-                if (std.fs.path.isAbsolute(trimmed)) {
-                    break :blk try allocator.dupe(u8, trimmed);
-                }
-                break :blk try std.fs.cwd().realpathAlloc(allocator, trimmed);
+                break :blk normalizeProjectPath(allocator, trimmed) catch |err| switch (err) {
+                    error.FileNotFound => try allocator.dupe(u8, trimmed),
+                    else => return err,
+                };
             }
         }
-        break :blk try std.fs.cwd().realpathAlloc(allocator, ".");
+        break :blk try normalizeProjectPath(allocator, ".");
     };
     defer allocator.free(base_path);
 
@@ -361,14 +585,17 @@ fn inferProjectPathFromWindow(allocator: std.mem.Allocator, window: *const conte
     return null;
 }
 
-fn inferProjectPathForSession(allocator: std.mem.Allocator, config_dir: []const u8, session_id: []const u8) !?[]u8 {
+fn inferSessionMetadata(allocator: std.mem.Allocator, config_dir: []const u8, session_id: []const u8) !SessionMetadata {
     var window = context.ContextWindow.init(32000, 20);
     defer window.deinit(allocator);
 
     const loaded_hash = try context.loadContextWindowWithHash(allocator, config_dir, &window, session_id);
-    if (loaded_hash == null) return null;
+    if (loaded_hash == null) return .{};
 
-    return try inferProjectPathFromWindow(allocator, &window);
+    return .{
+        .project_path = try inferProjectPathFromWindow(allocator, &window),
+        .derived_title = try deriveTitleFromWindow(allocator, &window),
+    };
 }
 
 fn listSessionsResponse(allocator: std.mem.Allocator, config_dir: []const u8) ![]u8 {
@@ -388,17 +615,21 @@ fn listSessionsResponse(allocator: std.mem.Allocator, config_dir: []const u8) ![
         const id_json = try jsonQuoted(allocator, s.id);
         defer allocator.free(id_json);
 
-        const title_value = if (s.title) |title|
-            title
-        else
-            s.path;
+        var metadata = try inferSessionMetadata(allocator, config_dir, s.id);
+        defer metadata.deinit(allocator);
+
+        const title_value: []const u8 = blk: {
+            if (s.title) |title| {
+                const trimmed = std.mem.trim(u8, title, " \t\r\n");
+                if (trimmed.len > 0 and !isPathLikeTitle(trimmed)) break :blk title;
+            }
+            if (metadata.derived_title) |derived| break :blk derived;
+            break :blk s.id;
+        };
         const title_json = try jsonQuoted(allocator, title_value);
         defer allocator.free(title_json);
 
-        const inferred_project_path = try inferProjectPathForSession(allocator, config_dir, s.id);
-        defer if (inferred_project_path) |p| allocator.free(p);
-
-        const project_path_candidate: ?[]const u8 = if (inferred_project_path) |p|
+        const project_path_candidate: ?[]const u8 = if (metadata.project_path) |p|
             p
         else if (s.title) |title| blk: {
             const trimmed = std.mem.trim(u8, title, " \t\r\n");
@@ -427,6 +658,39 @@ fn listSessionsResponse(allocator: std.mem.Allocator, config_dir: []const u8) ![
     return out.toOwnedSlice(allocator);
 }
 
+fn renameSessionResponse(allocator: std.mem.Allocator, config_dir: []const u8, session_id: []const u8, title: []const u8) ![]u8 {
+    const normalized_title = summarizeForTitle(allocator, title) catch null;
+    if (normalized_title == null) {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Session title cannot be empty\"}}", .{});
+    }
+    defer allocator.free(normalized_title.?);
+
+    const project_hash = std.fmt.parseInt(u64, session_id, 16) catch {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Invalid session id\"}}", .{});
+    };
+
+    const context_path = try context.contextPathAlloc(allocator, config_dir, project_hash);
+    defer allocator.free(context_path);
+    const file = std.fs.openFileAbsolute(context_path, .{}) catch {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Session not found\"}}", .{});
+    };
+    file.close();
+
+    var window = context.ContextWindow.init(32000, 20);
+    defer window.deinit(allocator);
+
+    try context.loadContextWindow(allocator, config_dir, &window, project_hash);
+    if (window.title) |existing| allocator.free(existing);
+    window.title = try allocator.dupe(u8, normalized_title.?);
+    try context.saveContextWindow(allocator, config_dir, &window, project_hash);
+
+    const session_id_json = try jsonQuoted(allocator, session_id);
+    defer allocator.free(session_id_json);
+    const title_json = try jsonQuoted(allocator, normalized_title.?);
+    defer allocator.free(title_json);
+    return try std.fmt.allocPrint(allocator, "{{\"type\":\"session_title_updated\",\"session_id\":{s},\"title\":{s}}}", .{ session_id_json, title_json });
+}
+
 fn loadSessionResponse(
     allocator: std.mem.Allocator,
     server: *web.Server,
@@ -453,13 +717,20 @@ fn loadSessionResponse(
     defer if (maybe_project_path) |p| allocator.free(p);
 
     if (maybe_project_path) |project_path| {
-        session.project_path = try allocator.dupe(u8, project_path);
-        if (session.context_window.title) |old_title| allocator.free(old_title);
-        session.context_window.title = try allocator.dupe(u8, project_path);
+        const canonical_project_path = normalizeProjectPath(allocator, project_path) catch try allocator.dupe(u8, project_path);
+        defer allocator.free(canonical_project_path);
+        session.project_path = try allocator.dupe(u8, canonical_project_path);
         if (session.context_window.project_path) |old_project_path| allocator.free(old_project_path);
-        session.context_window.project_path = try allocator.dupe(u8, project_path);
-        sendFileList(server, session, project_path) catch |err| {
+        session.context_window.project_path = try allocator.dupe(u8, canonical_project_path);
+        sendFileList(server, session, canonical_project_path) catch |err| {
             log.warn("Failed to send file list for loaded session {s}: {}", .{ session_id, err });
+        };
+    }
+
+    const updated_title = try ensureSessionSummaryTitle(allocator, &session.context_window);
+    if (updated_title) {
+        context.saveContextWindow(allocator, config_dir, &session.context_window, loaded_hash.?) catch |err| {
+            log.warn("Failed to save migrated session title for {s}: {}", .{ session_id, err });
         };
     }
 
@@ -601,9 +872,10 @@ fn writeAndBroadcastFile(allocator: std.mem.Allocator, server: *web.Server, proj
     try server.broadcast(response);
 }
 
-fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: *Session, input: []const u8, config_dir: []const u8) !void {
+fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: *Session, client_id: u32, input: []const u8, config_dir: []const u8) !void {
     const trimmed_input = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed_input.len == 0) return;
+    sendAssistantStreamEvent(allocator, server, "status", "Running agent...");
     cancel.resetCancelled();
     cancel.beginProcessing();
     defer cancel.resetCancelled();
@@ -656,6 +928,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
     session.context_window.project_path = try session.allocator.dupe(u8, project_path);
 
     try session.context_window.append(allocator, .user, trimmed_input, .{});
+    _ = try ensureSessionSummaryTitle(allocator, &session.context_window);
     context.saveContextWindow(allocator, config_dir, &session.context_window, project_hash) catch |err| {
         log.warn("Failed to save context before run: {}", .{err});
     };
@@ -672,11 +945,42 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
     const turn_alloc = turn_arena.allocator();
 
     const ctx_messages = try context.buildContextMessagesJson(turn_alloc, &session.context_window, model_input);
-    const sink = std.io.null_writer;
+    var command_output: std.ArrayListUnmanaged(u8) = .empty;
+    defer command_output.deinit(allocator);
+
+    var tool_output: std.ArrayListUnmanaged(u8) = .empty;
+    defer tool_output.deinit(allocator);
+
+    g_model_run_mutex.lock();
+    defer g_model_run_mutex.unlock();
+
+    model_loop.initToolOutputArena(allocator);
+    defer model_loop.deinitToolOutputArena();
+    model_loop.setToolOutputCallback(webToolOutputCallback);
+    display.setTimelineCallback(webTimelineCallback);
+    display.initTimeline(allocator);
+    defer {
+        display.setTimelineCallback(null);
+        display.deinitTimeline();
+        model_loop.setToolOutputCallback(null);
+        g_tool_capture_mutex.lock();
+        g_tool_capture_buffer = null;
+        g_tool_capture_allocator = null;
+        g_tool_capture_mutex.unlock();
+        g_stream_client_id = null;
+    }
+
+    g_tool_capture_mutex.lock();
+    g_tool_capture_buffer = &tool_output;
+    g_tool_capture_allocator = allocator;
+    g_tool_capture_mutex.unlock();
+    g_stream_client_id = client_id;
+
+    const stdout_capture = command_output.writer(allocator);
 
     const result = model_loop.runModel(
         allocator,
-        sink,
+        stdout_capture,
         session.active_model.?,
         trimmed_input,
         ctx_messages,
@@ -697,12 +1001,21 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         try server.broadcast(error_msg);
         return;
     };
+    const timeline_output = display.consumeTimelineEntries(allocator) catch null;
+    defer if (timeline_output) |t| allocator.free(t);
+    if (timeline_output) |t| {
+        if (t.len > 0) command_output.appendSlice(allocator, t) catch {};
+    }
     defer {
         var mut = result;
         mut.deinit(allocator);
     }
 
-    try session.context_window.append(allocator, .assistant, result.response, .{
+    const split = try splitEmbeddedThinking(allocator, result.response);
+    defer allocator.free(split.content);
+    defer if (split.reasoning) |r| allocator.free(r);
+
+    try session.context_window.append(allocator, .assistant, split.content, .{
         .reasoning = result.reasoning,
         .tool_calls = result.tool_calls,
         .error_count = result.error_count,
@@ -715,11 +1028,57 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         log.warn("Failed to save context after run: {}", .{err});
     };
 
-    const input_json = try jsonQuoted(allocator, result.response);
+    const input_json = try jsonQuoted(allocator, split.content);
     defer allocator.free(input_json);
-    const response = try std.fmt.allocPrint(allocator, "{{\"type\":\"assistant_output\",\"content\":{s}}}", .{input_json});
+    const command_output_clean = try stripAnsiAlloc(allocator, command_output.items);
+    defer allocator.free(command_output_clean);
+    const trimmed_reasoning = std.mem.trim(u8, result.reasoning, " \t\r\n");
+    const reasoning_value = if (trimmed_reasoning.len > 0)
+        try allocator.dupe(u8, trimmed_reasoning)
+    else if (split.reasoning) |embedded|
+        try allocator.dupe(u8, embedded)
+    else
+        try extractThinkingFromTimeline(allocator, command_output_clean) orelse try allocator.dupe(u8, "");
+    defer allocator.free(reasoning_value);
+    const reasoning_json = try jsonQuoted(allocator, reasoning_value);
+    defer allocator.free(reasoning_json);
+    if (reasoning_value.len > 0) {
+        sendAssistantStreamEvent(allocator, server, "thinking", reasoning_value);
+    }
+    const files_json = if (result.files_touched) |f| try jsonQuoted(allocator, f) else try allocator.dupe(u8, "null");
+    defer allocator.free(files_json);
+    const command_output_json = blk: {
+        const trimmed = std.mem.trim(u8, command_output_clean, " \t\r\n");
+        if (trimmed.len == 0) break :blk try allocator.dupe(u8, "null");
+        break :blk try jsonQuoted(allocator, trimmed);
+    };
+    defer allocator.free(command_output_json);
+    const tool_output_json = blk: {
+        const trimmed = std.mem.trim(u8, tool_output.items, " \t\r\n");
+        if (trimmed.len == 0) break :blk try allocator.dupe(u8, "null");
+        break :blk try jsonQuoted(allocator, trimmed);
+    };
+    defer allocator.free(tool_output_json);
+
+    const response = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"assistant_output\",\"content\":{s},\"reasoning\":{s},\"command_output\":{s},\"tool_output\":{s},\"tool_calls\":{d},\"error_count\":{d},\"files_touched\":{s}}}",
+        .{ input_json, reasoning_json, command_output_json, tool_output_json, result.tool_calls, result.error_count, files_json },
+    );
     defer allocator.free(response);
     try server.broadcast(response);
+}
+
+fn sendAssistantStreamEvent(allocator: std.mem.Allocator, server: *web.Server, kind: []const u8, content: []const u8) void {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return;
+    const kind_json = jsonQuoted(allocator, kind) catch return;
+    defer allocator.free(kind_json);
+    const content_json = jsonQuoted(allocator, trimmed) catch return;
+    defer allocator.free(content_json);
+    const msg = std.fmt.allocPrint(allocator, "{{\"type\":\"assistant_output\",\"kind\":{s},\"content\":{s}}}", .{ kind_json, content_json }) catch return;
+    defer allocator.free(msg);
+    server.broadcast(msg) catch {};
 }
 
 fn jsonQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
