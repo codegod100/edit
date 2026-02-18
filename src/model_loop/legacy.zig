@@ -157,6 +157,11 @@ pub fn runModel(
     var objective_golden_prompt_sent = false;
     var objective_script_write_count: usize = 0;
     var latest_correctness_failure_snapshot: []const u8 = "";
+    var invariant_check_seen = false;
+    var objective_needs_invariant_check = false;
+    var objective_invariant_prompt_sent = false;
+    var correctness_was_clean_once = false;
+    var correctness_regressed = false;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -513,9 +518,19 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (objective_request and mutating_tools_executed > 0 and !invariant_check_seen) {
+                    const msg = "Objective task requires a structural invariant check after edits (e.g., shape/schema/consistency check). Run it before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 if (objective_request and latest_verification_has_metrics and latest_verification_had_failure) {
                     const msg = try std.fmt.allocPrint(arena_alloc, "Latest verification still shows failing objective metrics/tests: {s}. Continue focused optimization and recheck before finishing.", .{latest_verification_metric_snapshot});
                     try turn_results.append(arena_alloc, msg);
+                    continue;
+                }
+                if (objective_request and correctness_regressed) {
+                    const msg = "Correctness regressed after a previously clean check. Revert/repair the recent change and rerun structural invariant checks before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
                 if (objective_request and perf_metric_regressed) {
@@ -562,6 +577,8 @@ pub fn runModel(
                 if (objective_request) {
                     objective_needs_golden_verify = true;
                     objective_golden_prompt_sent = false;
+                    objective_needs_invariant_check = true;
+                    objective_invariant_prompt_sent = false;
                 }
                 if (correctness_failure_active) {
                     correctness_fix_edit_made = true;
@@ -628,12 +645,17 @@ pub fn runModel(
                                 golden_verify_seen = true;
                                 objective_needs_golden_verify = false;
                             }
+                            if (isInvariantVerificationCommand(cmd, clean_result)) {
+                                invariant_check_seen = true;
+                                objective_needs_invariant_check = false;
+                            }
                             const insight = analyzeVerificationOutput(clean_result);
                             latest_verification_has_metrics = insight.has_metrics;
                             latest_verification_had_failure = insight.has_failure;
                             latest_verification_metric_snapshot = try buildMetricSnapshot(arena_alloc, clean_result);
                             if (looksLikeCorrectnessFailure(clean_result)) {
                                 latest_correctness_failure_snapshot = try buildFailureSnapshot(arena_alloc, clean_result);
+                                if (correctness_was_clean_once) correctness_regressed = true;
                                 correctness_failure_active = true;
                                 correctness_fix_edit_made = false;
                                 correctness_fix_rechecked = false;
@@ -652,6 +674,8 @@ pub fn runModel(
                                     correctness_fix_edit_made = false;
                                     correctness_fix_rechecked = false;
                                     latest_correctness_failure_snapshot = "";
+                                    correctness_was_clean_once = true;
+                                    correctness_regressed = false;
                                 }
                             }
                             const threshold = analyzeThresholdFailure(clean_result);
@@ -797,6 +821,15 @@ pub fn runModel(
             try w.writer(arena_alloc).print(
                 "{f}",
                 .{std.json.fmt("Run a definitive verifier command now (e.g., pytest/verify script), then use its failing assertions to drive the next focused edit.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
+        if (objective_request and objective_needs_invariant_check and !objective_invariant_prompt_sent) {
+            objective_invariant_prompt_sent = true;
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("Run a structural invariant check now (shape/schema/consistency constraints). If it fails, repair those violations before further optimization.", .{})},
             );
             try w.appendSlice(arena_alloc, "}");
         }
@@ -966,6 +999,16 @@ fn isGoldenVerificationCommand(cmd: []const u8) bool {
         std.mem.indexOf(u8, c, " verify") != null or
         std.mem.endsWith(u8, c, "verify.sh") or
         std.mem.indexOf(u8, c, "test_outputs.py") != null;
+}
+
+fn isInvariantVerificationCommand(cmd: []const u8, out: []const u8) bool {
+    const c = std.mem.trim(u8, cmd, " \t\r\n");
+    return std.mem.indexOf(u8, c, "shape") != null or
+        std.mem.indexOf(u8, c, "schema") != null or
+        std.mem.indexOf(u8, c, "consistency") != null or
+        std.mem.indexOf(u8, c, "test_solution_shape_feasibility") != null or
+        std.mem.indexOf(u8, c, "test_generate_and_schema") != null or
+        looksLikeCorrectnessFailure(out);
 }
 
 fn buildFailureSnapshot(allocator: std.mem.Allocator, out: []const u8) ![]const u8 {
