@@ -134,6 +134,11 @@ pub fn runModel(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const skill_request = isSkillCreationRequest(raw_user_request);
     var mutating_tools_executed: usize = 0;
+    var ran_verification_since_mutation = false;
+    var saw_tool_error = false;
+    var perf_threshold_active = false;
+    var perf_fix_edit_made = false;
+    var perf_fix_rechecked = false;
 
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer paths.deinit(arena_alloc);
@@ -149,7 +154,8 @@ pub fn runModel(
         "4. **Tools & Output**: Use `bash` with `rg` for searching. Read files with `offset` and `limit`. Never scan the entire filesystem (`find /`, recursive `/` searches). Stay in the project/task workspace. You will receive tool outputs with ANSI colors removed for clarity. Always verify your changes if possible.\n" ++
         "5. **Skill Requests**: If user asks to create a skill, you must create a `SKILL.md` file under `.zagent/skills/<skill-name>/SKILL.md` (project-local) or `skills/<skill-name>/SKILL.md` in config. Do not create language/source files instead of `SKILL.md`.\n" ++
         "6. **Start in Task Root**: First inspect the current working directory and likely task roots (for example `/app/task_file` when present) before broad discovery.\n" ++
-        "7. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
+        "7. **Numeric Targets**: When tests expose numeric thresholds (cost/latency/percent), extract the failing metric, perform a focused optimization edit, then re-run the failing check(s) before finishing.\n" ++
+        "8. **Finish Cleanly**: Once the task is complete, provide a concise summary of your actions via `respond_text`.";
 
     // Build messages array
     if (std.mem.startsWith(u8, user_input, "[") and std.mem.endsWith(u8, user_input, "]")) {
@@ -183,7 +189,13 @@ pub fn runModel(
     var rejected_repeated_other: usize = 0;
     var consecutive_empty_rg: usize = 0;
 
-    const max_iterations: usize = 25;
+    var max_iterations: usize = 25;
+    var adaptive_extensions_used: usize = 0;
+    const max_adaptive_extensions: usize = 2;
+    var stagnant_iterations: usize = 0;
+    var prev_paths_len: usize = 0;
+    var prev_mutating_tools_executed: usize = 0;
+    var prev_perf_fix_rechecked = false;
     var iter: usize = 0;
 
     while (iter < max_iterations) : (iter += 1) {
@@ -427,6 +439,30 @@ pub fn runModel(
                     try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
                     continue;
                 }
+                if (mutation_request and mutating_tools_executed > 0 and !ran_verification_since_mutation) {
+                    toolOutput("{s}Note:{s} run at least one verification/check command after edits before finishing.", .{ display.C_YELLOW, display.C_RESET });
+                    const msg = "You made edits but have not run a verification/check command yet. Run a quick local check (tests/build/lint/smoke command) before calling respond_text.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (saw_tool_error) {
+                    toolOutput("{s}Note:{s} recent tool errors detected; resolve or explain before finishing.", .{ display.C_YELLOW, display.C_RESET });
+                    const msg = "Recent tool execution reported errors. Resolve the errors (or explain why they are non-blocking) before calling respond_text.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (perf_threshold_active and !perf_fix_edit_made) {
+                    toolOutput("{s}Note:{s} threshold failure is still active; perform a focused optimization edit first.", .{ display.C_YELLOW, display.C_RESET });
+                    const msg = "A numeric threshold/performance failure was detected. Make a focused optimization edit before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
+                if (perf_threshold_active and perf_fix_edit_made and !perf_fix_rechecked) {
+                    toolOutput("{s}Note:{s} threshold fix not rechecked yet; run the failing check(s) before finishing.", .{ display.C_YELLOW, display.C_RESET });
+                    const msg = "You edited for a threshold failure but have not re-run the failing check(s). Re-run targeted failing tests/metrics before finishing.";
+                    try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                    continue;
+                }
                 const final_text = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                     toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                     return .{
@@ -446,14 +482,35 @@ pub fn runModel(
                     .files_touched = try utils.joinPaths(allocator, paths.items),
                 };
             }
-            if (tools.isMutatingToolName(tc.tool)) mutating_tools_executed += 1;
+            if (tools.isMutatingToolName(tc.tool)) {
+                mutating_tools_executed += 1;
+                ran_verification_since_mutation = false;
+                if (perf_threshold_active) {
+                    perf_fix_edit_made = true;
+                    perf_fix_rechecked = false;
+                }
+            }
+
+            if (std.mem.eql(u8, tc.tool, "bash")) {
+                if (tools.parseBashCommandFromArgs(allocator, tc.args)) |cmd_raw| {
+                    defer allocator.free(cmd_raw);
+                    const cmd = std.mem.trim(u8, cmd_raw, " \t\r\n");
+                    if (isGlobalFilesystemScanCommand(cmd)) {
+                        const msg = "Rejected: global filesystem scan command. Stay within the project/task workspace and use targeted paths.";
+                        try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                        continue;
+                    }
+                }
+            }
 
             const result = tools.executeNamed(arena_alloc, tc.tool, tc.args, todo_list) catch |err| {
                 toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
+                saw_tool_error = true;
                 const err_msg = try std.fmt.allocPrint(arena_alloc, "Tool {s} failed: {s}", .{ tc.tool, @errorName(err) });
                 try turn_results.append(arena_alloc, err_msg);
                 continue;
             };
+            saw_tool_error = false;
 
             if (result.len > 0) {
                 try display.printTruncatedCommandOutput(stdout, result);
@@ -482,6 +539,23 @@ pub fn runModel(
                             }
                         } else {
                             consecutive_empty_rg = 0;
+                        }
+                        if (isLikelyVerificationCommand(cmd)) {
+                            ran_verification_since_mutation = true;
+                            if (looksLikeThresholdFailure(clean_result)) {
+                                perf_threshold_active = true;
+                                perf_fix_edit_made = false;
+                                perf_fix_rechecked = false;
+                                const msg = "Threshold/performance failure detected. Prioritize objective optimization, then rerun only failing checks.";
+                                try turn_results.append(arena_alloc, try arena_alloc.dupe(u8, msg));
+                            } else if (perf_threshold_active) {
+                                perf_fix_rechecked = true;
+                                if (!looksLikeAnyFailure(clean_result)) {
+                                    perf_threshold_active = false;
+                                    perf_fix_edit_made = false;
+                                    perf_fix_rechecked = false;
+                                }
+                            }
                         }
                     }
                 } else |_| {}
@@ -517,6 +591,48 @@ pub fn runModel(
                 try w.appendSlice(arena_alloc, "}");
             }
         }
+
+        // Progress-aware step control:
+        // - extend a bit when signals indicate meaningful progress
+        // - stop early when signals indicate we're stuck
+        const progress_signal =
+            (paths.items.len > prev_paths_len) or
+            (mutating_tools_executed > prev_mutating_tools_executed) or
+            (perf_fix_rechecked and !prev_perf_fix_rechecked);
+
+        if (progress_signal) {
+            stagnant_iterations = 0;
+        } else {
+            stagnant_iterations += 1;
+        }
+
+        prev_paths_len = paths.items.len;
+        prev_mutating_tools_executed = mutating_tools_executed;
+        prev_perf_fix_rechecked = perf_fix_rechecked;
+
+        if (iter >= 10 and stagnant_iterations >= 8) {
+            const msg = "Stopping early: no meaningful progress in recent steps. Try a narrower instruction or different model.";
+            toolOutput("{s}Stop:{s} {s}", .{ display.C_YELLOW, display.C_RESET, msg });
+            return .{
+                .response = try allocator.dupe(u8, msg),
+                .reasoning = try allocator.dupe(u8, ""),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try utils.joinPaths(allocator, paths.items),
+            };
+        }
+
+        if (iter == max_iterations - 1 and adaptive_extensions_used < max_adaptive_extensions and progress_signal) {
+            adaptive_extensions_used += 1;
+            max_iterations += 10;
+            toolOutput("{s}Note:{s} progress detected near step limit, extending budget to {d} steps.", .{ display.C_YELLOW, display.C_RESET, max_iterations });
+            try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+            try w.writer(arena_alloc).print(
+                "{f}",
+                .{std.json.fmt("Progress is visible. Continue with focused edits/checks and finish when done.", .{})},
+            );
+            try w.appendSlice(arena_alloc, "}");
+        }
     }
 
     toolOutput("{s}Stop:{s} Step limit reached ({d}).", .{ display.C_RED, display.C_RESET, max_iterations });
@@ -551,4 +667,44 @@ fn isSkillCreationRequest(raw_user_request: []const u8) bool {
     const has_explicit_path = utils.containsIgnoreCase(raw_user_request, "SKILL.md") or
         utils.containsIgnoreCase(raw_user_request, "/skills/");
     return (has_skill and has_create_verb) or has_explicit_path;
+}
+
+fn isGlobalFilesystemScanCommand(cmd: []const u8) bool {
+    const c = std.mem.trim(u8, cmd, " \t\r\n");
+    return std.mem.indexOf(u8, c, "find /") != null or
+        std.mem.indexOf(u8, c, "find\t/") != null or
+        std.mem.indexOf(u8, c, "ls -R /") != null or
+        std.mem.indexOf(u8, c, "du -a /") != null or
+        std.mem.indexOf(u8, c, "grep -R /") != null or
+        std.mem.indexOf(u8, c, "rg / ") != null;
+}
+
+fn isLikelyVerificationCommand(cmd: []const u8) bool {
+    const c = std.mem.trim(u8, cmd, " \t\r\n");
+    return std.mem.indexOf(u8, c, " test") != null or
+        std.mem.indexOf(u8, c, "pytest") != null or
+        std.mem.indexOf(u8, c, "zig build") != null or
+        std.mem.indexOf(u8, c, "zig test") != null or
+        std.mem.indexOf(u8, c, "go test") != null or
+        std.mem.indexOf(u8, c, "cargo test") != null or
+        std.mem.indexOf(u8, c, "npm test") != null or
+        std.mem.indexOf(u8, c, "pnpm test") != null or
+        std.mem.indexOf(u8, c, "yarn test") != null or
+        std.mem.indexOf(u8, c, "ruff check") != null or
+        std.mem.indexOf(u8, c, "eslint") != null or
+        std.mem.indexOf(u8, c, "tsc") != null or
+        std.mem.indexOf(u8, c, "make") != null;
+}
+
+fn looksLikeThresholdFailure(out: []const u8) bool {
+    return (utils.containsIgnoreCase(out, "threshold") and utils.containsIgnoreCase(out, "fail")) or
+        (utils.containsIgnoreCase(out, "AssertionError") and utils.containsIgnoreCase(out, "cost")) or
+        (utils.containsIgnoreCase(out, "AssertionError") and utils.containsIgnoreCase(out, "latency")) or
+        (utils.containsIgnoreCase(out, "cost") and std.mem.indexOf(u8, out, " > ") != null);
+}
+
+fn looksLikeAnyFailure(out: []const u8) bool {
+    return utils.containsIgnoreCase(out, "failed") or
+        utils.containsIgnoreCase(out, "error") or
+        utils.containsIgnoreCase(out, "assertionerror");
 }
