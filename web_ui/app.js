@@ -16,6 +16,8 @@ class ZagentApp {
         this.activeLogGroup = null;
         this.projectPathDirty = false;
         this.pendingProjectSet = false;
+        this.currentModel = null;
+        this.currentProvider = null;
         
         this.init();
     }
@@ -50,6 +52,7 @@ class ZagentApp {
             folderManualGoBtn: document.getElementById('folderManualGoBtn'),
             refreshSessionsBtn: document.getElementById('refreshSessionsBtn'),
             sessionsList: document.getElementById('sessionsList'),
+            modelValue: document.getElementById('modelValue'),
         };
     }
     
@@ -131,6 +134,7 @@ class ZagentApp {
             this.elements.sendBtn.disabled = false;
             this.addSystemMessage('Connected to zagent');
             this.requestRecentSessions();
+            this.requestModelInfo();
         };
         
         this.ws.onclose = () => {
@@ -256,26 +260,38 @@ class ZagentApp {
     
     handleMessage(data) {
         switch (data.type) {
+            case 'model_info':
+                this.currentProvider = data.provider_id || null;
+                this.currentModel = data.model_id || null;
+                this.updateModelDisplay();
+                break;
+
             case 'assistant_output':
                 if (data.kind) {
-                    this.addAgentLog(data.kind, data.content || '');
+                    this.addAgentLog(data.kind, data.content || '', true);
                 } else {
                     this.hideTypingIndicator();
                     this.clearPendingRequest();
+                    
+                    const streamLogs = this.elements.messages.querySelectorAll('.stream-log');
+                    streamLogs.forEach(el => el.remove());
+                    this.activeLogGroup = null;
+                    
                     const reasoning = typeof data.reasoning === 'string' ? data.reasoning.trim() : '';
                     const toolOutput = typeof data.tool_output === 'string' ? data.tool_output.trim() : '';
                     const commandOutput = typeof data.command_output === 'string' ? data.command_output.trim() : '';
                     const content = typeof data.content === 'string' ? data.content.trim() : '';
-                    if (reasoning && !this.isDuplicateForKind('thinking', reasoning)) this.addAgentLog('thinking', reasoning);
+                    
+                    if (reasoning) this.addAgentLog('thinking', reasoning);
                     if (toolOutput) this.addAgentLog('tool', toolOutput);
                     const normalizedEvent = this.normalizeEventLog(commandOutput);
-                    if (normalizedEvent && !this.isDuplicateForKind('event', normalizedEvent)) this.addAgentLog('event', normalizedEvent);
+                    if (normalizedEvent) this.addAgentLog('event', normalizedEvent);
                     if (content) this.addAgentLog('response', content);
                 }
                 break;
 
             case 'assistant_stream':
-                this.addAgentLog(data.kind || 'event', data.content || '');
+                this.addAgentLog(data.kind || 'event', data.content || '', true);
                 break;
                 
             case 'tool_call':
@@ -335,18 +351,32 @@ class ZagentApp {
                 this.clearPendingRequest();
                 this.addErrorMessage(data.content);
                 break;
-                
+
             case 'status':
                 this.addSystemMessage(data.content);
                 break;
-                
+
             default:
                 console.log('Unknown message type:', data.type);
         }
     }
 
+    updateModelDisplay() {
+        if (this.currentModel && this.currentProvider) {
+            this.elements.modelValue.textContent = `${this.currentProvider}/${this.currentModel}`;
+            this.elements.modelValue.title = `${this.currentProvider}/${this.currentModel}`;
+        } else {
+            this.elements.modelValue.textContent = 'No model selected';
+            this.elements.modelValue.title = '';
+        }
+    }
+
     requestRecentSessions() {
         this.send({ type: 'list_sessions' });
+    }
+
+    requestModelInfo() {
+        this.send({ type: 'get_model_info' });
     }
 
     renderRecentSessions(sessions) {
@@ -544,9 +574,12 @@ class ZagentApp {
         });
     }
     
-    addMessage(role, content) {
+    addMessage(role, content, isStream = false) {
         const messageDiv = document.createElement('div');
         messageDiv.className = `message ${role}`;
+        if (isStream) {
+            messageDiv.classList.add('stream-log');
+        }
         
         const avatarDiv = document.createElement('div');
         avatarDiv.className = 'message-avatar';
@@ -573,7 +606,7 @@ class ZagentApp {
         this.scrollToBottom();
     }
 
-    addAgentLog(kind, content) {
+    addAgentLog(kind, content, isStream = false) {
         const text = String(content || '').trim();
         if (!text) return;
         const label = this.agentLogLabel(kind);
@@ -584,7 +617,7 @@ class ZagentApp {
 
         if (isResponse) {
             this.activeLogGroup = null;
-            this.addMessage('assistant', `### ${label}\n${text}`);
+            this.addMessage('assistant', `### ${label}\n${text}`, isStream);
             return;
         }
 
@@ -598,6 +631,9 @@ class ZagentApp {
 
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant';
+        if (isStream) {
+            messageDiv.classList.add('stream-log');
+        }
         
         const avatarDiv = document.createElement('div');
         avatarDiv.className = 'message-avatar';
@@ -636,14 +672,6 @@ class ZagentApp {
         if (raw.includes('--- Thinking ---')) return '';
         if (raw.includes('⛬ ')) return '';
         return raw;
-    }
-
-    isDuplicateForKind(kind, text) {
-        if (!this.activeLogGroup) return false;
-        if (this.activeLogGroup.kind !== String(kind || '').toLowerCase()) return false;
-        const existing = String(this.activeLogGroup.body || '').trim();
-        const incoming = String(text || '').trim();
-        return existing === incoming || existing.includes(incoming) || incoming.includes(existing);
     }
 
     agentLogLabel(kind) {
