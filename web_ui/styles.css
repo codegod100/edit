@@ -167,10 +167,7 @@ body {
 }
 
 .folder-browser-header #folderBrowserPath {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-secondary);
+    display: none;
 }
 
 .folder-browser-header button {
@@ -188,6 +185,44 @@ body {
     gap: 6px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--border-color);
+}
+
+.folder-browser-manual {
+    display: flex;
+    gap: 6px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.folder-browser-manual input {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-primary);
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 5px 8px;
+}
+
+.folder-browser-manual input:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+.folder-browser-manual button {
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-primary);
+    border-radius: 6px;
+    font-size: 12px;
+    padding: 5px 8px;
+    cursor: pointer;
+}
+
+.folder-browser-manual button:hover {
+    border-color: var(--accent-color);
+    color: var(--accent-color);
 }
 
 .folder-browser-actions button {
@@ -292,6 +327,7 @@ body {
     display: flex;
     flex-direction: column;
     gap: 3px;
+    position: relative;
 }
 
 .session-load:hover {
@@ -312,6 +348,12 @@ body {
 .session-edit:hover {
     border-color: var(--accent-color);
     color: var(--accent-color);
+}
+
+.session-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 6px;
 }
 
 .session-title {

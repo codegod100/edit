@@ -19,11 +19,9 @@ var g_sessions: ?*SessionMap = null;
 var g_server: ?*web.Server = null;
 var g_config_dir: ?[]const u8 = null;
 var g_provider_specs: ?[]const provider.ProviderSpec = null;
-var g_model_run_mutex: std.Thread.Mutex = .{};
-var g_tool_capture_mutex: std.Thread.Mutex = .{};
-var g_tool_capture_buffer: ?*std.ArrayListUnmanaged(u8) = null;
-var g_tool_capture_allocator: ?std.mem.Allocator = null;
-var g_stream_client_id: ?u32 = null;
+threadlocal var g_tool_capture_buffer: ?*std.ArrayListUnmanaged(u8) = null;
+threadlocal var g_tool_capture_allocator: ?std.mem.Allocator = null;
+threadlocal var g_stream_client_id: ?u32 = null;
 const FIXED_FALLBACK_PORT: u16 = 28713;
 const MAX_SESSION_TITLE_CHARS: usize = 80;
 
@@ -242,7 +240,7 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
                 session.context_window.project_path = try session.allocator.dupe(u8, canonical_path);
             }
             _ = ensureSessionSummaryTitle(session.allocator, &session.context_window) catch false;
-            try sendFileList(server, session, canonical_path);
+            try sendFileList(server, session, client_id, canonical_path);
             const canonical_path_json = try jsonQuoted(allocator, canonical_path);
             defer allocator.free(canonical_path_json);
             return try std.fmt.allocPrint(allocator, "{{\"type\":\"project_set\",\"project_path\":{s},\"content\":\"Project set\"}}", .{canonical_path_json});
@@ -256,19 +254,19 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         }
     } else if (std.mem.eql(u8, data.value.type, "read_file")) {
         if (data.value.path) |path| {
-            try sendFileContent(server, session.project_path orelse ".", path);
+            try sendFileContent(server, client_id, session.project_path orelse ".", path);
         }
     } else if (std.mem.eql(u8, data.value.type, "write_file")) {
         if (data.value.path) |path| {
             if (data.value.content) |content| {
-                try writeAndBroadcastFile(allocator, server, session.project_path orelse ".", path, content);
+                try writeAndSendFile(allocator, server, client_id, session.project_path orelse ".", path, content);
             }
         }
     } else if (std.mem.eql(u8, data.value.type, "list_sessions")) {
         return try listSessionsResponse(allocator, config_dir);
     } else if (std.mem.eql(u8, data.value.type, "load_session")) {
         if (data.value.session_id) |session_id| {
-            return try loadSessionResponse(allocator, server, session, config_dir, session_id);
+            return try loadSessionResponse(allocator, server, session, client_id, config_dir, session_id);
         }
     } else if (std.mem.eql(u8, data.value.type, "rename_session")) {
         if (data.value.session_id) |session_id| {
@@ -291,9 +289,6 @@ fn normalizeProjectPath(allocator: std.mem.Allocator, input_path: []const u8) ![
 }
 
 fn appendToolOutputSanitized(text: []const u8) void {
-    g_tool_capture_mutex.lock();
-    defer g_tool_capture_mutex.unlock();
-
     const buffer = g_tool_capture_buffer orelse return;
     const allocator = g_tool_capture_allocator orelse return;
 
@@ -316,22 +311,24 @@ fn webToolOutputCallback(text: []const u8) void {
 
     const allocator = g_tool_capture_allocator orelse return;
     const server = g_server orelse return;
+    const client_id = g_stream_client_id orelse return;
     const clean = stripAnsiAlloc(allocator, text) catch return;
     defer allocator.free(clean);
     const trimmed = std.mem.trim(u8, clean, " \t\r\n");
     if (trimmed.len == 0) return;
 
-    sendAssistantStreamEvent(allocator, server, "tool", trimmed);
+    sendAssistantStreamEvent(allocator, server, client_id, "tool", trimmed);
 }
 
 fn webTimelineCallback(text: []const u8) void {
     const allocator = g_tool_capture_allocator orelse return;
     const server = g_server orelse return;
+    const client_id = g_stream_client_id orelse return;
     const clean = stripAnsiAlloc(allocator, text) catch return;
     defer allocator.free(clean);
     const trimmed = std.mem.trim(u8, clean, " \t\r\n");
     if (trimmed.len == 0) return;
-    sendAssistantStreamEvent(allocator, server, "event", trimmed);
+    sendAssistantStreamEvent(allocator, server, client_id, "event", trimmed);
 }
 
 fn stripAnsiAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -695,6 +692,7 @@ fn loadSessionResponse(
     allocator: std.mem.Allocator,
     server: *web.Server,
     session: *Session,
+    client_id: u32,
     config_dir: []const u8,
     session_id: []const u8,
 ) ![]u8 {
@@ -722,7 +720,7 @@ fn loadSessionResponse(
         session.project_path = try allocator.dupe(u8, canonical_project_path);
         if (session.context_window.project_path) |old_project_path| allocator.free(old_project_path);
         session.context_window.project_path = try allocator.dupe(u8, canonical_project_path);
-        sendFileList(server, session, canonical_project_path) catch |err| {
+        sendFileList(server, session, client_id, canonical_project_path) catch |err| {
             log.warn("Failed to send file list for loaded session {s}: {}", .{ session_id, err });
         };
     }
@@ -765,7 +763,7 @@ fn loadSessionResponse(
     return out.toOwnedSlice(allocator);
 }
 
-fn sendFileList(server: *web.Server, session: *Session, project_path: []const u8) !void {
+fn sendFileList(server: *web.Server, session: *Session, client_id: u32, project_path: []const u8) !void {
     var files: std.ArrayListUnmanaged(struct { name: []const u8, path: []const u8 }) = .empty;
     defer {
         for (files.items) |f| {
@@ -809,10 +807,10 @@ fn sendFileList(server: *web.Server, session: *Session, project_path: []const u8
 
     try json_builder.appendSlice(session.allocator, "]}");
 
-    try server.broadcast(json_builder.items);
+    try server.sendToClient(client_id, json_builder.items);
 }
 
-fn sendFileContent(server: *web.Server, project_path: []const u8, file_path: []const u8) !void {
+fn sendFileContent(server: *web.Server, client_id: u32, project_path: []const u8, file_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
     
     const full_path = try std.fs.path.join(allocator, &.{ project_path, file_path });
@@ -822,7 +820,7 @@ fn sendFileContent(server: *web.Server, project_path: []const u8, file_path: []c
         log.err("Failed to open file {s}: {}", .{full_path, err});
         const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Failed to read file\"}}", .{});
         defer allocator.free(error_msg);
-        try server.broadcast(error_msg);
+        try server.sendToClient(client_id, error_msg);
         return;
     };
     defer file.close();
@@ -831,7 +829,7 @@ fn sendFileContent(server: *web.Server, project_path: []const u8, file_path: []c
         log.err("Failed to read file content: {}", .{err});
         const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Failed to read file content\"}}", .{});
         defer allocator.free(error_msg);
-        try server.broadcast(error_msg);
+        try server.sendToClient(client_id, error_msg);
         return;
     };
     defer allocator.free(content);
@@ -844,10 +842,10 @@ fn sendFileContent(server: *web.Server, project_path: []const u8, file_path: []c
     const response = try std.fmt.allocPrint(allocator, "{{\"type\":\"file_content\",\"path\":{s},\"content\":{s}}}", .{ path_json, content_json });
     defer allocator.free(response);
 
-    try server.broadcast(response);
+    try server.sendToClient(client_id, response);
 }
 
-fn writeAndBroadcastFile(allocator: std.mem.Allocator, server: *web.Server, project_path: []const u8, file_path: []const u8, content: []const u8) !void {
+fn writeAndSendFile(allocator: std.mem.Allocator, server: *web.Server, client_id: u32, project_path: []const u8, file_path: []const u8, content: []const u8) !void {
     const full_path = try std.fs.path.join(allocator, &.{ project_path, file_path });
     defer allocator.free(full_path);
 
@@ -869,13 +867,13 @@ fn writeAndBroadcastFile(allocator: std.mem.Allocator, server: *web.Server, proj
     const response = try std.fmt.allocPrint(allocator, "{{\"type\":\"file_saved\",\"path\":{s}}}", .{path_json});
     defer allocator.free(response);
 
-    try server.broadcast(response);
+    try server.sendToClient(client_id, response);
 }
 
 fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: *Session, client_id: u32, input: []const u8, config_dir: []const u8) !void {
     const trimmed_input = std.mem.trim(u8, input, " \t\r\n");
     if (trimmed_input.len == 0) return;
-    sendAssistantStreamEvent(allocator, server, "status", "Running agent...");
+    sendAssistantStreamEvent(allocator, server, client_id, "status", "Running agent...");
     cancel.resetCancelled();
     cancel.beginProcessing();
     defer cancel.resetCancelled();
@@ -886,7 +884,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         if (selected == null) {
             const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"No model selected. Use /model to select one.\"}}", .{});
             defer allocator.free(error_msg);
-            try server.broadcast(error_msg);
+            try server.sendToClient(client_id, error_msg);
             return;
         }
         defer {
@@ -897,7 +895,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         const specs = g_provider_specs orelse {
             const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Provider configuration unavailable.\"}}", .{});
             defer allocator.free(error_msg);
-            try server.broadcast(error_msg);
+            try server.sendToClient(client_id, error_msg);
             return;
         };
 
@@ -911,7 +909,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         if (active == null) {
             const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"No connected provider for selected model.\"}}", .{});
             defer allocator.free(error_msg);
-            try server.broadcast(error_msg);
+            try server.sendToClient(client_id, error_msg);
             return;
         }
 
@@ -951,9 +949,6 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
     var tool_output: std.ArrayListUnmanaged(u8) = .empty;
     defer tool_output.deinit(allocator);
 
-    g_model_run_mutex.lock();
-    defer g_model_run_mutex.unlock();
-
     model_loop.initToolOutputArena(allocator);
     defer model_loop.deinitToolOutputArena();
     model_loop.setToolOutputCallback(webToolOutputCallback);
@@ -963,17 +958,13 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         display.setTimelineCallback(null);
         display.deinitTimeline();
         model_loop.setToolOutputCallback(null);
-        g_tool_capture_mutex.lock();
         g_tool_capture_buffer = null;
         g_tool_capture_allocator = null;
-        g_tool_capture_mutex.unlock();
         g_stream_client_id = null;
     }
 
-    g_tool_capture_mutex.lock();
     g_tool_capture_buffer = &tool_output;
     g_tool_capture_allocator = allocator;
-    g_tool_capture_mutex.unlock();
     g_stream_client_id = client_id;
 
     const stdout_capture = command_output.writer(allocator);
@@ -998,7 +989,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         defer allocator.free(message_json);
         const error_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":{s}}}", .{message_json});
         defer allocator.free(error_msg);
-        try server.broadcast(error_msg);
+        try server.sendToClient(client_id, error_msg);
         return;
     };
     const timeline_output = display.consumeTimelineEntries(allocator) catch null;
@@ -1043,7 +1034,7 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
     const reasoning_json = try jsonQuoted(allocator, reasoning_value);
     defer allocator.free(reasoning_json);
     if (reasoning_value.len > 0) {
-        sendAssistantStreamEvent(allocator, server, "thinking", reasoning_value);
+        sendAssistantStreamEvent(allocator, server, client_id, "thinking", reasoning_value);
     }
     const files_json = if (result.files_touched) |f| try jsonQuoted(allocator, f) else try allocator.dupe(u8, "null");
     defer allocator.free(files_json);
@@ -1066,10 +1057,10 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
         .{ input_json, reasoning_json, command_output_json, tool_output_json, result.tool_calls, result.error_count, files_json },
     );
     defer allocator.free(response);
-    try server.broadcast(response);
+    try server.sendToClient(client_id, response);
 }
 
-fn sendAssistantStreamEvent(allocator: std.mem.Allocator, server: *web.Server, kind: []const u8, content: []const u8) void {
+fn sendAssistantStreamEvent(allocator: std.mem.Allocator, server: *web.Server, client_id: u32, kind: []const u8, content: []const u8) void {
     const trimmed = std.mem.trim(u8, content, " \t\r\n");
     if (trimmed.len == 0) return;
     const kind_json = jsonQuoted(allocator, kind) catch return;
@@ -1078,7 +1069,7 @@ fn sendAssistantStreamEvent(allocator: std.mem.Allocator, server: *web.Server, k
     defer allocator.free(content_json);
     const msg = std.fmt.allocPrint(allocator, "{{\"type\":\"assistant_output\",\"kind\":{s},\"content\":{s}}}", .{ kind_json, content_json }) catch return;
     defer allocator.free(msg);
-    server.broadcast(msg) catch {};
+    server.sendToClient(client_id, msg) catch {};
 }
 
 fn jsonQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {

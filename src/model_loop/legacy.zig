@@ -21,14 +21,14 @@ const ArtifactSnapshot = struct {
 // Takes a pre-formatted string and adds it to timeline
 pub const ToolOutputCallback = *const fn ([]const u8) void;
 
-var g_tool_output_callback: ?ToolOutputCallback = null;
+threadlocal var g_tool_output_callback: ?ToolOutputCallback = null;
 
 pub fn setToolOutputCallback(callback: ?ToolOutputCallback) void {
     g_tool_output_callback = callback;
 }
 
 // Global arena for tool output strings (cleared each turn)
-var g_tool_output_arena: ?std.heap.ArenaAllocator = null;
+threadlocal var g_tool_output_arena: ?std.heap.ArenaAllocator = null;
 
 pub fn initToolOutputArena(allocator: std.mem.Allocator) void {
     g_tool_output_arena = std.heap.ArenaAllocator.init(allocator);

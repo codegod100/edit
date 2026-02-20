@@ -448,11 +448,11 @@ pub fn describeModelQueryError(err: anyerror) []const u8 {
 }
 
 // Timeline display for keeping prompt at bottom
-var g_timeline_entries: std.ArrayListUnmanaged([]const u8) = .{};
-var g_timeline_allocator: ?std.mem.Allocator = null;
+threadlocal var g_timeline_entries: std.ArrayListUnmanaged([]const u8) = .{};
+threadlocal var g_timeline_allocator: ?std.mem.Allocator = null;
 var g_timeline_mutex: std.Thread.Mutex = .{};
 pub const TimelineCallback = *const fn ([]const u8) void;
-var g_timeline_callback: ?TimelineCallback = null;
+threadlocal var g_timeline_callback: ?TimelineCallback = null;
 
 // Global stdout mutex to prevent concurrent writes
 pub var g_stdout_mutex: std.Thread.Mutex = .{};

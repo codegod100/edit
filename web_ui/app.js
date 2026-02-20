@@ -14,6 +14,8 @@ class ZagentApp {
         this.activeSessionId = null;
         this.pendingRestoreSessionId = this.loadLastSessionId();
         this.activeLogGroup = null;
+        this.projectPathDirty = false;
+        this.pendingProjectSet = false;
         
         this.init();
     }
@@ -44,6 +46,8 @@ class ZagentApp {
             folderBrowserList: document.getElementById('folderBrowserList'),
             folderUpBtn: document.getElementById('folderUpBtn'),
             folderChooseBtn: document.getElementById('folderChooseBtn'),
+            folderManualPathInput: document.getElementById('folderManualPathInput'),
+            folderManualGoBtn: document.getElementById('folderManualGoBtn'),
             refreshSessionsBtn: document.getElementById('refreshSessionsBtn'),
             sessionsList: document.getElementById('sessionsList'),
         };
@@ -71,13 +75,25 @@ class ZagentApp {
         this.elements.folderChooseBtn.addEventListener('click', () => {
             if (!this.browserPath) return;
             this.elements.projectPathInput.value = this.browserPath;
+            this.projectPathDirty = false;
             this.setProjectPath(this.browserPath);
             this.closeFolderBrowser();
         });
-        
-        this.elements.projectPathInput.addEventListener('keypress', (e) => {
+        this.elements.folderManualGoBtn.addEventListener('click', () => this.openManualFolderPath());
+        this.elements.folderManualPathInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') {
-                this.setProjectPath(this.elements.projectPathInput.value);
+                e.preventDefault();
+                this.openManualFolderPath();
+            }
+        });
+        
+        this.elements.projectPathInput.addEventListener('input', () => {
+            this.projectPathDirty = true;
+        });
+        this.elements.projectPathInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                this.setProjectPath(this.elements.projectPathInput.value.trim());
             }
         });
         this.elements.refreshSessionsBtn.addEventListener('click', () => this.requestRecentSessions());
@@ -172,12 +188,19 @@ class ZagentApp {
 
     openFolderBrowser() {
         this.elements.folderBrowser.classList.remove('hidden');
+        this.elements.folderManualPathInput.value = this.currentPath || this.elements.projectPathInput.value.trim() || '';
         const startPath = this.currentPath || this.elements.projectPathInput.value.trim() || '.';
         this.requestDirectoryList(startPath);
     }
 
     closeFolderBrowser() {
         this.elements.folderBrowser.classList.add('hidden');
+    }
+
+    openManualFolderPath() {
+        const path = this.elements.folderManualPathInput.value.trim();
+        if (!path) return;
+        this.requestDirectoryList(path);
     }
 
     requestDirectoryList(path) {
@@ -189,6 +212,7 @@ class ZagentApp {
     }
     
     setProjectPath(path) {
+        this.pendingProjectSet = true;
         this.send({
             type: 'set_project',
             project_path: path
@@ -276,10 +300,13 @@ class ZagentApp {
                 break;
 
             case 'project_set':
-                if (typeof data.project_path === 'string' && data.project_path.trim()) {
+                const canOverwritePathInput = this.pendingProjectSet || !this.projectPathDirty;
+                if (canOverwritePathInput && typeof data.project_path === 'string' && data.project_path.trim()) {
                     this.currentPath = data.project_path;
                     this.elements.projectPathInput.value = data.project_path;
+                    this.projectPathDirty = false;
                 }
+                this.pendingProjectSet = false;
                 this.activeSessionId = null;
                 this.clearLastSessionId();
                 if (data.content) this.addSystemMessage(data.content);
@@ -355,12 +382,19 @@ class ZagentApp {
 
             item.appendChild(loadBtn);
             if (session.id === this.activeSessionId) {
+                const actions = document.createElement('div');
+                actions.className = 'session-actions';
                 const editBtn = document.createElement('button');
                 editBtn.type = 'button';
                 editBtn.className = 'session-edit';
                 editBtn.textContent = 'Rename';
-                editBtn.addEventListener('click', () => this.editSessionTitle(session));
-                item.appendChild(editBtn);
+                editBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.editSessionTitle(session);
+                });
+                actions.appendChild(editBtn);
+                loadBtn.appendChild(actions);
             }
             this.elements.sessionsList.appendChild(item);
         });
@@ -401,11 +435,13 @@ class ZagentApp {
         if (data.project_path) {
             this.currentPath = data.project_path;
             this.elements.projectPathInput.value = data.project_path;
+            this.projectPathDirty = false;
         } else {
             const fallbackPath = this.pathFromSession(data);
             if (fallbackPath) {
                 this.currentPath = fallbackPath;
                 this.elements.projectPathInput.value = fallbackPath;
+                this.projectPathDirty = false;
             }
         }
 
@@ -477,6 +513,7 @@ class ZagentApp {
     renderDirectoryList(data) {
         this.browserPath = data.path;
         this.elements.folderBrowserPath.textContent = data.path;
+        this.elements.folderManualPathInput.value = data.path;
         this.elements.folderBrowserList.innerHTML = '';
 
         if (!data.entries || data.entries.length === 0) {
