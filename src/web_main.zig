@@ -35,6 +35,65 @@ threadlocal var g_tool_capture_allocator: ?std.mem.Allocator = null;
 threadlocal var g_stream_client_id: ?u32 = null;
 const FIXED_FALLBACK_PORT: u16 = 28713;
 const MAX_SESSION_TITLE_CHARS: usize = 80;
+const DEV_RELOAD_POLL_NS: u64 = 750 * std.time.ns_per_ms;
+const DEV_RELOAD_MESSAGE = "{\"type\":\"dev_reload\",\"reason\":\"file_changed\"}";
+
+const WatchedWebUiFile = struct {
+    path: []const u8,
+    mtime: ?i128 = null,
+};
+
+const DevReloadWatcher = struct {
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    server: *web.Server,
+    files: [3]WatchedWebUiFile = .{
+        .{ .path = "web_ui/index.html" },
+        .{ .path = "web_ui/app.js" },
+        .{ .path = "web_ui/styles.css" },
+    },
+
+    fn init(server: *web.Server) DevReloadWatcher {
+        var watcher = DevReloadWatcher{ .server = server };
+        watcher.captureMtimestamps();
+        return watcher;
+    }
+
+    fn start(self: *DevReloadWatcher) !void {
+        self.running.store(true, .release);
+        self.thread = try std.Thread.spawn(.{}, devReloadWatcherMain, .{self});
+    }
+
+    fn stop(self: *DevReloadWatcher) void {
+        self.running.store(false, .release);
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+    }
+
+    fn captureMtimestamps(self: *DevReloadWatcher) void {
+        for (&self.files) |*file| {
+            file.mtime = readFileMtime(file.path);
+        }
+    }
+
+    fn pollForChanges(self: *DevReloadWatcher) bool {
+        var changed = false;
+        for (&self.files) |*file| {
+            const current_mtime = readFileMtime(file.path);
+            if (file.mtime == null and current_mtime != null) {
+                changed = true;
+            } else if (file.mtime != null and current_mtime == null) {
+                changed = true;
+            } else if (file.mtime != null and current_mtime != null and file.mtime.? != current_mtime.?) {
+                changed = true;
+            }
+            file.mtime = current_mtime;
+        }
+        return changed;
+    }
+};
 
 // WebSocket message types
 const MessageType = enum {
@@ -195,8 +254,57 @@ pub fn main() !void {
     // Set message handler
     server.onMessage(handleMessage);
 
+    var dev_reload_watcher = DevReloadWatcher.init(&server);
+    try dev_reload_watcher.start();
+    defer dev_reload_watcher.stop();
+
     log.info("Starting web server on {s}:{d}", .{ effective_config.host, effective_config.port });
     try server.run();
+}
+
+fn devReloadWatcherMain(watcher: *DevReloadWatcher) void {
+    while (watcher.running.load(.acquire)) {
+        if (watcher.pollForChanges()) {
+            watcher.server.broadcastWebSocket(DEV_RELOAD_MESSAGE) catch |err| {
+                log.warn("Failed to broadcast dev reload message: {}", .{err});
+            };
+        }
+        std.Thread.sleep(DEV_RELOAD_POLL_NS);
+    }
+}
+
+fn readFileMtime(path: []const u8) ?i128 {
+    // 1) Try current working directory.
+    var file = std.fs.cwd().openFile(path, .{}) catch null;
+
+    // 2) Try next to the executable (same strategy as static file serving).
+    if (file == null) {
+        const allocator = std.heap.page_allocator;
+        const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+        defer if (exe_dir) |d| allocator.free(d);
+
+        if (exe_dir) |dir| {
+            const candidate1 = std.fs.path.join(allocator, &.{ dir, "..", path }) catch null;
+            defer if (candidate1) |p| allocator.free(p);
+            if (candidate1) |p| {
+                file = std.fs.openFileAbsolute(p, .{}) catch null;
+            }
+
+            if (file == null) {
+                const candidate2 = std.fs.path.join(allocator, &.{ dir, "..", "..", path }) catch null;
+                defer if (candidate2) |p2| allocator.free(p2);
+                if (candidate2) |p2| {
+                    file = std.fs.openFileAbsolute(p2, .{}) catch null;
+                }
+            }
+        }
+    }
+
+    if (file == null) return null;
+    defer file.?.close();
+
+    const stat = file.?.stat() catch return null;
+    return stat.mtime;
 }
 
 fn getOrCreateSession(allocator: std.mem.Allocator, sessions: *SessionMap, client_id: u32) !*Session {
@@ -208,9 +316,15 @@ fn getOrCreateSession(allocator: std.mem.Allocator, sessions: *SessionMap, clien
 }
 
 fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []const u8) ![]const u8 {
-    // Skip empty messages
+    // Skip empty or non-JSON messages (e.g. binary/control frames)
     const trimmed = std.mem.trim(u8, ws_message, " \t\r\n");
     if (trimmed.len == 0) {
+        return try allocator.dupe(u8, "");
+    }
+    if (trimmed[0] != '{') {
+        return try allocator.dupe(u8, "");
+    }
+    if (!std.unicode.utf8ValidateSlice(trimmed)) {
         return try allocator.dupe(u8, "");
     }
 
@@ -221,9 +335,10 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         project_path: ?[]const u8 = null,
         session_id: ?[]const u8 = null,
         title: ?[]const u8 = null,
-    }, allocator, ws_message, .{}) catch |err| {
-        log.warn("Failed to parse message from client {d}: {} (message: {s})", .{ client_id, err, trimmed });
-        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Invalid JSON\"}}", .{});
+    }, allocator, trimmed, .{}) catch |err| {
+        // Ignore malformed payloads from non-protocol clients/extensions.
+        log.debug("Ignoring non-protocol JSON payload from client {d}: {}", .{ client_id, err });
+        return try allocator.dupe(u8, "");
     };
     defer data.deinit();
 

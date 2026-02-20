@@ -129,6 +129,28 @@ pub const Server = struct {
         return;
     }
 
+    /// Broadcast a message only to websocket clients
+    pub fn broadcastWebSocket(self: *Server, message: []const u8) !void {
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
+        var i: usize = 0;
+        while (i < self.clients.items.len) {
+            var client = &self.clients.items[i];
+            if (!client.is_websocket) {
+                i += 1;
+                continue;
+            }
+
+            _ = sendWebSocketMessage(client.stream, message) catch {
+                client.stream.close();
+                _ = self.clients.orderedRemove(i);
+                continue;
+            };
+            i += 1;
+        }
+        return;
+    }
+
     /// Send agent output to all clients (used by the agent loop)
     pub fn sendAgentOutput(self: *Server, output: []const u8, message_type: []const u8) !void {
         const output_json = try jsonQuoted(self.allocator, output);
@@ -199,8 +221,8 @@ pub const Server = struct {
         if (request > 0) {
             const request_text = buffer[0..request];
 
-            // Check if it's a WebSocket upgrade request
-            if (std.mem.indexOf(u8, request_text, "Upgrade: websocket")) |_| {
+            // Check if it's a WebSocket upgrade request (case-insensitive)
+            if (hasWebSocketUpgradeHeader(request_text)) {
                 // WebSocket upgrade
                 try self.handleWebSocketUpgrade(connection.stream, request_text, client_id);
                 return;
@@ -368,18 +390,33 @@ pub const Server = struct {
                     const response = callback(self.allocator, client_id, parsed.message) catch |err| {
                         const error_msg = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"content\":\"Error: {s}\"}}", .{@errorName(err)});
                         defer self.allocator.free(error_msg);
-                        try sendWebSocketMessage(stream, error_msg);
+                        try self.sendToClient(client_id, error_msg);
                         continue;
                     };
                     if (response.len > 0) {
                         defer self.allocator.free(response);
-                        try sendWebSocketMessage(stream, response);
+                        try self.sendToClient(client_id, response);
                     }
                 }
             }
         }
     }
 };
+
+fn hasWebSocketUpgradeHeader(request: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, request, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(key, "Upgrade") and std.ascii.eqlIgnoreCase(value, "websocket")) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /// Send an HTTP response
 fn sendHttpResponse(stream: net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
@@ -493,7 +530,11 @@ fn parseWebSocketFrame(frame: []u8) !?ParsedWebSocketFrame {
     if (opcode == 0xA) {
         return .{ .consumed = if (masked) offset + 4 + payload_len else offset + payload_len, .message = &[_]u8{} };
     } // Pong - ignore
-    if (opcode != 0x1 and opcode != 0x2) return error.UnsupportedOpcode; // Only text and binary
+    if (opcode == 0x2) {
+        // Ignore binary frames; this server accepts JSON text only.
+        return .{ .consumed = if (masked) offset + 4 + payload_len else offset + payload_len, .message = &[_]u8{} };
+    }
+    if (opcode != 0x1) return error.UnsupportedOpcode; // Only text frames
 
     if (!fin) return error.FragmentedFramesNotSupported;
 

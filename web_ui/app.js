@@ -356,6 +356,10 @@ class ZagentApp {
                 this.addSystemMessage(data.content);
                 break;
 
+            case 'dev_reload':
+                window.location.reload();
+                break;
+
             default:
                 console.log('Unknown message type:', data.type);
         }
