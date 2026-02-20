@@ -10,6 +10,17 @@ const model_select = @import("model_select.zig");
 const model_loop = @import("model_loop/main.zig");
 const display = @import("display.zig");
 
+const ModelInfoResponse = struct {
+    type: []const u8 = "model_info",
+    provider_id: ?[]const u8 = null,
+    model_id: ?[]const u8 = null,
+};
+
+const ErrorResponse = struct {
+    type: []const u8 = "error",
+    content: []const u8,
+};
+
 const log = std.log.scoped(.web_main);
 const active_module = @import("context.zig");
 const todo = @import("todo.zig");
@@ -27,6 +38,7 @@ const MAX_SESSION_TITLE_CHARS: usize = 80;
 
 // WebSocket message types
 const MessageType = enum {
+    get_model_info,
     user_input,
     set_project,
     read_file,
@@ -196,6 +208,12 @@ fn getOrCreateSession(allocator: std.mem.Allocator, sessions: *SessionMap, clien
 }
 
 fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []const u8) ![]const u8 {
+    // Skip empty messages
+    const trimmed = std.mem.trim(u8, ws_message, " \t\r\n");
+    if (trimmed.len == 0) {
+        return try allocator.dupe(u8, "");
+    }
+
     const data = std.json.parseFromSlice(struct {
         type: []const u8,
         path: ?[]const u8 = null,
@@ -204,7 +222,7 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         session_id: ?[]const u8 = null,
         title: ?[]const u8 = null,
     }, allocator, ws_message, .{}) catch |err| {
-        log.err("Failed to parse message: {}", .{err});
+        log.warn("Failed to parse message from client {d}: {} (message: {s})", .{ client_id, err, trimmed });
         return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Invalid JSON\"}}", .{});
     };
     defer data.deinit();
@@ -221,7 +239,9 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
 
     const session = try getOrCreateSession(allocator, sessions, client_id);
 
-    if (std.mem.eql(u8, data.value.type, "set_project")) {
+    if (std.mem.eql(u8, data.value.type, "get_model_info")) {
+        return try getModelInfoResponse(allocator, server, session, client_id, config_dir);
+    } else if (std.mem.eql(u8, data.value.type, "set_project")) {
         if (data.value.project_path) |path| {
             const canonical_path = normalizeProjectPath(allocator, path) catch try allocator.dupe(u8, path);
             defer allocator.free(canonical_path);
@@ -484,6 +504,62 @@ const SessionMetadata = struct {
 };
 
 // Helper functions
+fn getModelInfoResponse(allocator: std.mem.Allocator, server: *web.Server, session: *Session, client_id_: u32, config_dir: []const u8) ![]u8 {
+    _ = server;
+    _ = client_id_;
+
+    var response = ModelInfoResponse{};
+
+    // Load the selected model if not already loaded
+    if (session.active_model == null) {
+        const selected = try config_store.loadSelectedModel(allocator, config_dir);
+        if (selected == null) {
+            response.provider_id = "";
+            response.model_id = "";
+        } else {
+            defer {
+                var s = selected.?;
+                s.deinit(allocator);
+            }
+
+            const specs = g_provider_specs;
+            if (specs == null) {
+                response.provider_id = "";
+                response.model_id = "";
+            } else {
+                const stored_pairs = try provider_store.load(allocator, config_dir);
+                defer provider_store.free(allocator, stored_pairs);
+
+                const provider_states = try model_select.resolveProviderStates(allocator, specs.?, stored_pairs);
+                defer allocator.free(provider_states);
+
+                const active = model_select.chooseActiveModel(specs.?, provider_states, selected, null);
+                if (active == null) {
+                    response.provider_id = "";
+                    response.model_id = "";
+                } else {
+                    session.active_model = active_module.ActiveModel{
+                        .provider_id = try allocator.dupe(u8, active.?.provider_id),
+                        .api_key = if (active.?.api_key) |k| try allocator.dupe(u8, k) else null,
+                        .model_id = try allocator.dupe(u8, active.?.model_id),
+                    };
+                    response.provider_id = session.active_model.?.provider_id;
+                    response.model_id = session.active_model.?.model_id;
+                }
+            }
+        }
+    } else {
+        response.provider_id = session.active_model.?.provider_id;
+        response.model_id = session.active_model.?.model_id;
+    }
+
+    // Encode as JSON
+    var json_out = std.ArrayListUnmanaged(u8){};
+    defer json_out.deinit(allocator);
+    try json_out.writer(allocator).print("{f}", .{std.json.fmt(response, .{})});
+    return try json_out.toOwnedSlice(allocator);
+}
+
 fn listDirectoriesResponse(allocator: std.mem.Allocator, requested_path: ?[]const u8) ![]u8 {
     const base_path = blk: {
         if (requested_path) |rp| {
@@ -918,6 +994,15 @@ fn processUserInput(allocator: std.mem.Allocator, server: *web.Server, session: 
             .api_key = if (active.?.api_key) |k| try allocator.dupe(u8, k) else null,
             .model_id = try allocator.dupe(u8, active.?.model_id),
         };
+
+        // Send model info to client
+        const provider_json = try jsonQuoted(allocator, session.active_model.?.provider_id);
+        defer allocator.free(provider_json);
+        const model_json = try jsonQuoted(allocator, session.active_model.?.model_id);
+        defer allocator.free(model_json);
+        const model_info_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"model_info\",\"provider_id\":{s},\"model_id\":{s}}}", .{ provider_json, model_json });
+        defer allocator.free(model_info_msg);
+        try server.sendToClient(client_id, model_info_msg);
     }
 
     const project_path = session.project_path orelse ".";
