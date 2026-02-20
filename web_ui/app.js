@@ -510,6 +510,19 @@ class ZagentApp {
         return trimmed;
     }
 
+    getAvatarIcon(role) {
+        if (role === 'user') {
+            return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+        } else if (role === 'assistant') {
+            return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2 2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z"></path><path d="M4 14v-4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"></path><path d="M12 16v4"></path><path d="M8 20h8"></path></svg>`;
+        } else if (role === 'system') {
+            return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>`;
+        } else if (role === 'error') {
+            return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>`;
+        }
+        return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle></svg>`;
+    }
+
     renderDirectoryList(data) {
         this.browserPath = data.path;
         this.elements.folderBrowserPath.textContent = data.path;
@@ -535,11 +548,27 @@ class ZagentApp {
         const messageDiv = document.createElement('div');
         messageDiv.className = `message ${role}`;
         
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = 'message-avatar';
+        avatarDiv.innerHTML = this.getAvatarIcon(role);
+        
+        const bodyDiv = document.createElement('div');
+        bodyDiv.className = 'message-body';
+        
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'message-header';
+        headerDiv.textContent = role === 'user' ? 'You' : 'zagent';
+        
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
         contentDiv.innerHTML = this.formatMessage(content);
         
-        messageDiv.appendChild(contentDiv);
+        bodyDiv.appendChild(headerDiv);
+        bodyDiv.appendChild(contentDiv);
+        
+        messageDiv.appendChild(avatarDiv);
+        messageDiv.appendChild(bodyDiv);
+        
         this.elements.messages.appendChild(messageDiv);
         this.scrollToBottom();
     }
@@ -569,10 +598,28 @@ class ZagentApp {
 
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message assistant';
+        
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = 'message-avatar';
+        avatarDiv.innerHTML = this.getAvatarIcon('assistant');
+        
+        const bodyDiv = document.createElement('div');
+        bodyDiv.className = 'message-body';
+        
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'message-header';
+        headerDiv.textContent = 'zagent';
+        
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
         contentDiv.innerHTML = this.formatMessage(`### ${label}\n${text}`);
-        messageDiv.appendChild(contentDiv);
+        
+        bodyDiv.appendChild(headerDiv);
+        bodyDiv.appendChild(contentDiv);
+        
+        messageDiv.appendChild(avatarDiv);
+        messageDiv.appendChild(bodyDiv);
+        
         this.elements.messages.appendChild(messageDiv);
         this.scrollToBottom();
 
@@ -618,11 +665,27 @@ class ZagentApp {
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message system';
         
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = 'message-avatar';
+        avatarDiv.innerHTML = this.getAvatarIcon('system');
+        
+        const bodyDiv = document.createElement('div');
+        bodyDiv.className = 'message-body';
+        
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'message-header';
+        headerDiv.textContent = 'System';
+        
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
         contentDiv.textContent = content;
         
-        messageDiv.appendChild(contentDiv);
+        bodyDiv.appendChild(headerDiv);
+        bodyDiv.appendChild(contentDiv);
+        
+        messageDiv.appendChild(avatarDiv);
+        messageDiv.appendChild(bodyDiv);
+        
         this.elements.messages.appendChild(messageDiv);
         this.scrollToBottom();
     }
@@ -631,11 +694,27 @@ class ZagentApp {
         const messageDiv = document.createElement('div');
         messageDiv.className = 'message error';
         
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = 'message-avatar';
+        avatarDiv.innerHTML = this.getAvatarIcon('error');
+        
+        const bodyDiv = document.createElement('div');
+        bodyDiv.className = 'message-body';
+        
+        const headerDiv = document.createElement('div');
+        headerDiv.className = 'message-header';
+        headerDiv.textContent = 'Error';
+        
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
         contentDiv.textContent = content;
         
-        messageDiv.appendChild(contentDiv);
+        bodyDiv.appendChild(headerDiv);
+        bodyDiv.appendChild(contentDiv);
+        
+        messageDiv.appendChild(avatarDiv);
+        messageDiv.appendChild(bodyDiv);
+        
         this.elements.messages.appendChild(messageDiv);
         this.scrollToBottom();
     }
@@ -832,11 +911,15 @@ class ZagentApp {
         indicator.id = 'typingIndicator';
         indicator.className = 'message assistant';
         indicator.innerHTML = `
-            <div class="message-content">
-                <div class="typing-indicator">
-                    <span></span>
-                    <span></span>
-                    <span></span>
+            <div class="message-avatar">${this.getAvatarIcon('assistant')}</div>
+            <div class="message-body">
+                <div class="message-header">zagent</div>
+                <div class="message-content">
+                    <div class="typing-indicator">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
                 </div>
             </div>
         `;
