@@ -123,12 +123,16 @@ pub const TerminalManager = struct {
             g_terminal_ptr = self;
 
             if (builtin.os.tag == .linux) {
+                // Handle SIGINT (Ctrl+C)
                 var act: std.os.linux.Sigaction = .{
                     .handler = .{ .handler = @ptrCast(&sigintHandler) },
                     .mask = std.mem.zeroes(std.os.linux.sigset_t),
                     .flags = 0,
                 };
                 _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &act, null);
+                
+                // Also handle SIGTERM
+                _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &act, null);
             } else if (builtin.os.tag == .macos) {
                 const kernel_sigaction = extern struct {
                     handler: ?*const anyopaque,
@@ -140,10 +144,11 @@ pub const TerminalManager = struct {
                     .mask = 0,
                     .flags = 0,
                 };
-                _ = std.posix.system.sigaction(2, @ptrCast(&act), null);
+                _ = std.posix.system.sigaction(2, @ptrCast(&act), null);  // SIGINT
+                _ = std.posix.system.sigaction(15, @ptrCast(&act), null); // SIGTERM
             }
         } else {
-            // Restore default signal handler
+            // Restore default signal handlers
             if (builtin.os.tag == .linux) {
                 var act: std.os.linux.Sigaction = .{
                     .handler = .{ .handler = null },
@@ -151,6 +156,7 @@ pub const TerminalManager = struct {
                     .flags = 0,
                 };
                 _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &act, null);
+                _ = std.os.linux.sigaction(std.os.linux.SIG.TERM, &act, null);
             } else if (builtin.os.tag == .macos) {
                 const kernel_sigaction = extern struct {
                     handler: ?*const anyopaque,
@@ -162,7 +168,8 @@ pub const TerminalManager = struct {
                     .mask = 0,
                     .flags = 0,
                 };
-                _ = std.posix.system.sigaction(2, @ptrCast(&act), null);
+                _ = std.posix.system.sigaction(2, @ptrCast(&act), null);  // SIGINT
+                _ = std.posix.system.sigaction(15, @ptrCast(&act), null); // SIGTERM
             }
             g_terminal_ptr = null;
         }
@@ -210,23 +217,29 @@ pub fn get() *TerminalManager {
 
 /// Signal handler - async-signal-safe
 fn sigintHandler(sig: c_int) callconv(.c) void {
-    _ = sig;
-    const tm = g_terminal_ptr orelse return;
+    const tm = g_terminal_ptr orelse {
+        // No terminal manager, just exit
+        if (builtin.os.tag == .linux) {
+            std.os.linux.exit(128 + @as(u8, @intCast(sig)));
+        } else {
+            std.posix.exit(128 + @as(u8, @intCast(sig)));
+        }
+        return;
+    };
 
     const already_cancelled = @atomicLoad(bool, &tm.cancelled, .monotonic);
-    const already_exit = @atomicLoad(bool, &tm.exit_requested, .monotonic);
 
-    if (already_exit) {
-        // 3rd Ctrl+C - nuclear exit
-        std.posix.exit(130);
-    } else if (already_cancelled) {
-        // 2nd Ctrl+C - restore terminal and exit
+    if (already_cancelled) {
+        // 2nd Ctrl+C - restore terminal and exit immediately
         tm.restore();
-        // Reset scroll region with async-signal-safe write
         const stdout_fd = std.posix.STDOUT_FILENO;
-        _ = std.posix.write(stdout_fd, "\x1b[r") catch {}; // Reset scroll region
-        _ = std.posix.write(stdout_fd, "\n") catch {}; // New line
-        std.posix.exit(130);
+        _ = std.posix.write(stdout_fd, "\x1b[r\x1b[?2004l\n") catch {};
+        
+        if (builtin.os.tag == .linux) {
+            std.os.linux.exit(128 + @as(u8, @intCast(sig)));
+        } else {
+            std.posix.exit(128 + @as(u8, @intCast(sig)));
+        }
     } else {
         // 1st Ctrl+C - just cancel
         @atomicStore(bool, &tm.cancelled, true, .monotonic);
