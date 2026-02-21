@@ -1088,6 +1088,10 @@ fn renderMarkdownLine(allocator: std.mem.Allocator, line: []const u8) ![]u8 {
 }
 
 pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void {
+    return addAssistantMessageWithSuffix(allocator, text, null);
+}
+
+pub fn addAssistantMessageWithSuffix(allocator: std.mem.Allocator, text: []const u8, suffix: ?[]const u8) !void {
     var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lines.deinit(allocator);
 
@@ -1109,6 +1113,7 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
     while (idx < lines.items.len) {
         const line = lines.items[idx];
         const trimmed_line = std.mem.trim(u8, line, " \t");
+        const is_last_line = idx + 1 == lines.items.len;
 
         if (std.mem.startsWith(u8, trimmed_line, "```")) {
             in_code_fence = !in_code_fence;
@@ -1138,12 +1143,12 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
             try renderMarkdownLine(allocator, line);
         defer allocator.free(rendered_line);
 
-        if (is_first_output) {
-            addTimelineEntry("{s}\n", .{rendered_line});
-            is_first_output = false;
+        if (is_last_line and suffix != null and suffix.?.len > 0) {
+            addTimelineEntry("{s}{s}{s}{s}\n", .{ rendered_line, C_DIM, suffix.?, C_RESET });
         } else {
             addTimelineEntry("{s}\n", .{rendered_line});
         }
+        if (is_first_output) is_first_output = false;
         idx += 1;
     }
 }

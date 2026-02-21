@@ -163,6 +163,13 @@ fn unescapeJsonString(buf: []u8, input: []const u8) []const u8 {
     return buf[0..out_idx];
 }
 
+fn formatLatencySuffix(allocator: std.mem.Allocator, total_model_latency_ns: u64) ![]u8 {
+    const tenths = @divFloor(total_model_latency_ns + 50_000_000, 100_000_000);
+    const whole = @divFloor(tenths, 10);
+    const frac = tenths % 10;
+    return std.fmt.allocPrint(allocator, " ⏱ {d}.{d}s", .{ whole, frac });
+}
+
 // Simplified bridge-based tool loop - uses Bun AI SDK
 pub fn runModel(
     allocator: std.mem.Allocator,
@@ -293,6 +300,7 @@ pub fn runModel(
     var prev_perf_fix_rechecked = false;
     var prev_correctness_fix_rechecked = false;
     var iter: usize = 0;
+    var total_model_latency_ns: u64 = 0;
 
     while (iter < max_iterations) : (iter += 1) {
         if (iter == 0 and skill_request) {
@@ -319,6 +327,7 @@ pub fn runModel(
         try w.appendSlice(arena_alloc, "]");
 
         const messages_json = w.items;
+        const llm_started_ns = std.time.nanoTimestamp();
         const response = try llm.chat(
             arena_alloc,
             active.api_key orelse "",
@@ -328,6 +337,11 @@ pub fn runModel(
             turn.toolDefsToLlm(tools.definitions[0..]),
             active.reasoning_effort,
         );
+        const llm_ended_ns = std.time.nanoTimestamp();
+        const llm_elapsed_ns = llm_ended_ns - llm_started_ns;
+        if (llm_elapsed_ns > 0) {
+            total_model_latency_ns += @intCast(llm_elapsed_ns);
+        }
 
         if (turn.isCancelled()) {
             return .{
@@ -368,7 +382,8 @@ pub fn runModel(
             const trimmed_text = std.mem.trim(u8, response.text, " \t\r\n");
             if (trimmed_text.len > 0) {
                 try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{response.text});
-                try display.addAssistantMessage(allocator, response.text);
+                const latency_suffix = try formatLatencySuffix(arena_alloc, total_model_latency_ns);
+                try display.addAssistantMessageWithSuffix(allocator, response.text, latency_suffix);
                 return .{
                     .response = try allocator.dupe(u8, response.text),
                     .reasoning = try allocator.dupe(u8, response.reasoning),
@@ -675,7 +690,8 @@ pub fn runModel(
                         .files_touched = try utils.joinPaths(allocator, paths.items),
                     };
                 };
-                try display.addAssistantMessage(arena_alloc, final_text);
+                const latency_suffix = try formatLatencySuffix(arena_alloc, total_model_latency_ns);
+                try display.addAssistantMessageWithSuffix(arena_alloc, final_text, latency_suffix);
                 return .{
                     .response = try allocator.dupe(u8, final_text),
                     .reasoning = try allocator.dupe(u8, response.reasoning),
