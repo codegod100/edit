@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const cancel = @import("cancel.zig");
 const mentions = @import("mentions.zig");
 const context = @import("context.zig");
+const terminal = @import("terminal.zig");
 
 pub const EditKey = enum {
     tab,
@@ -83,34 +84,19 @@ pub fn readPromptLine(
         }
     }.run;
 
-    const original = std.posix.tcgetattr(stdin_file.handle) catch {
+    // Check if stdin is a TTY
+    if (!std.posix.isatty(stdin_file.handle)) {
         const line = try stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024);
         return sanitizeFallback(allocator, line);
-    };
-
-    var raw = original;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.lflag.ISIG = true; // Keep ISIG for Ctrl+C
-    if (builtin.os.tag == .linux) {
-        raw.cc[6] = 1;
-        raw.cc[5] = 0;
-    } else if (builtin.os.tag == .macos) {
-        raw.cc[16] = 1;
-        raw.cc[17] = 0;
     }
-    std.posix.tcsetattr(stdin_file.handle, .NOW, raw) catch |err| {
-        if (err != error.ProcessOrphaned) {
-            std.log.debug("Failed to set raw mode: {any}", .{err});
-        }
-        const line = stdin_reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 64 * 1024) catch null;
-        return sanitizeFallback(allocator, line);
-    };
-    defer std.posix.tcsetattr(stdin_file.handle, .NOW, original) catch {};
+
+    // Use unified terminal manager for raw mode
+    terminal.get().pushRaw();
+    defer terminal.get().popRaw();
 
     // Enable bracketed paste
-    _ = stdout.writeAll("\x1b[?2004h") catch {};
-    defer _ = stdout.writeAll("\x1b[?2004l") catch {};
+    stdout.writeAll("\x1b[?2004h") catch {};
+    defer stdout.writeAll("\x1b[?2004l") catch {};
 
     // Use arena for line editing to simplify memory management
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -136,115 +122,134 @@ pub fn readPromptLine(
     if (line.len > 0) try stdout.writeAll(line);
 
     while (true) {
-        const n = try stdin_file.read(&buf);
+        // Check for exit request (double Ctrl+C)
+        if (cancel.shouldExit()) {
+            return null;
+        }
+        
+        const n = stdin_file.read(&buf) catch |err| {
+            // Input interrupted (Ctrl+C) or other error - return gracefully
+            if (err == error.InputOutput or err == error.WouldBlock or err == error.NotOpenForReading) {
+                cancel.setCancelled();
+                break;
+            }
+            return err;
+        };
         if (n == 0) break;
 
         const ch = buf[0];
 
-        // Escape sequence (arrow keys, etc.)
+        // Escape sequence (arrow keys, home/end, etc.)
         if (ch == 27) {
             var seq_buf: [2]u8 = undefined;
             const seq_n = stdin_file.read(&seq_buf) catch 0;
-            if (seq_n >= 2 and seq_buf[0] == '[') {
-                switch (seq_buf[1]) {
-                    '2' => { // Bracketed Paste [200~
-                        var p_buf: [8]u8 = undefined;
-                        var p_len: usize = 0;
-                        while (p_len < 8) {
-                            const rn = stdin_file.read(p_buf[p_len..p_len+1]) catch 0;
-                            if (rn == 0) break;
-                            p_len += 1;
-                            if (p_buf[p_len-1] == '~') break;
-                        }
-                        if (p_len >= 3 and std.mem.eql(u8, p_buf[0..3], "00~")) {
-                            while (true) {
-                                var pch_buf: [1]u8 = undefined;
-                                const pn = stdin_file.read(&pch_buf) catch 0;
-                                if (pn == 0) break;
-                                const pch = pch_buf[0];
-                                if (pch == 27) {
-                                    var esc_seq: [5]u8 = undefined;
-                                    const en = stdin_file.read(&esc_seq) catch 0;
-                                    if (en == 5 and std.mem.eql(u8, &esc_seq, "[201~")) break;
-                                }
-                                const next_line = try arena_alloc.alloc(u8, line.len + 1);
-                                @memcpy(next_line[0..cursor_pos], line[0..cursor_pos]);
-                                next_line[cursor_pos] = pch;
-                                @memcpy(next_line[cursor_pos + 1 ..], line[cursor_pos..]);
-                                line = next_line;
-                                try stdout.writeAll(line[cursor_pos..cursor_pos+1]);
-                                cursor_pos += 1;
+            if (seq_n == 0) continue;
+            if (seq_n < 2) {
+                consumeEscapeTail(stdin_file.handle);
+                continue;
+            }
+
+            const prefix = seq_buf[0];
+            const key = seq_buf[1];
+            if (prefix != '[' and prefix != 'O') {
+                consumeEscapeTail(stdin_file.handle);
+                continue;
+            }
+
+            switch (key) {
+                '2' => if (prefix == '[') { // Bracketed Paste [200~
+                    var p_buf: [8]u8 = undefined;
+                    var p_len: usize = 0;
+                    while (p_len < 8) {
+                        const rn = stdin_file.read(p_buf[p_len..p_len+1]) catch 0;
+                        if (rn == 0) break;
+                        p_len += 1;
+                        if (p_buf[p_len-1] == '~') break;
+                    }
+                    if (p_len >= 3 and std.mem.eql(u8, p_buf[0..3], "00~")) {
+                        while (true) {
+                            var pch_buf: [1]u8 = undefined;
+                            const pn = stdin_file.read(&pch_buf) catch 0;
+                            if (pn == 0) break;
+                            const pch = pch_buf[0];
+                            if (pch == 27) {
+                                var esc_seq: [5]u8 = undefined;
+                                const en = stdin_file.read(&esc_seq) catch 0;
+                                if (en == 5 and std.mem.eql(u8, &esc_seq, "[201~")) break;
                             }
-                            continue;
-                        }
-                    },
-                    'D' => { // Left
-                        if (cursor_pos > 0) {
-                            cursor_pos -= 1;
-                            try stdout.writeAll("\x1b[D");
-                        }
-                    },
-                    'C' => { // Right
-                        if (cursor_pos < line.len) {
+                            const next_line = try arena_alloc.alloc(u8, line.len + 1);
+                            @memcpy(next_line[0..cursor_pos], line[0..cursor_pos]);
+                            next_line[cursor_pos] = pch;
+                            @memcpy(next_line[cursor_pos + 1 ..], line[cursor_pos..]);
+                            line = next_line;
+                            try stdout.writeAll(line[cursor_pos..cursor_pos+1]);
                             cursor_pos += 1;
-                            try stdout.writeAll("\x1b[C");
                         }
-                    },
-                    'A' => { // Up - History
-                        if (history.items.items.len == 0) continue;
-                        if (history_index == null) {
-                            saved_line = try arena_alloc.dupe(u8, line);
-                            history_index = history.items.items.len;
-                        }
-                        if (history_index.? > 0) {
-                            history_index.? -= 1;
-                            const entry_raw = history.items.items[history_index.?];
-                            const entry = context.normalizeHistoryLine(entry_raw);
-                            try stdout.writeAll("\r\x1b[K");
-                            try stdout.writeAll(prompt);
-                            line = try arena_alloc.dupe(u8, entry);
-                            cursor_pos = line.len;
-                            try stdout.writeAll(line);
-                        }
-                    },
-                    'B' => { // Down - History
-                        if (history_index == null) continue;
-                        if (history_index.? < history.items.items.len - 1) {
-                            history_index.? += 1;
-                            const entry_raw = history.items.items[history_index.?];
-                            const entry = context.normalizeHistoryLine(entry_raw);
-                            try stdout.writeAll("\r\x1b[K");
-                            try stdout.writeAll(prompt);
-                            line = try arena_alloc.dupe(u8, entry);
-                            cursor_pos = line.len;
-                            try stdout.writeAll(line);
-                        } else {
-                            history_index = null;
-                            try stdout.writeAll("\r\x1b[K");
-                            try stdout.writeAll(prompt);
-                            line = try arena_alloc.dupe(u8, saved_line);
-                            cursor_pos = line.len;
-                            try stdout.writeAll(line);
-                        }
-                    },
-                    'H' => { // Home
-                        while (cursor_pos > 0) {
-                            cursor_pos -= 1;
-                            try stdout.writeAll("\x1b[D");
-                        }
-                    },
-                    'F' => { // End
-                        while (cursor_pos < line.len) {
-                            cursor_pos += 1;
-                            try stdout.writeAll("\x1b[C");
-                        }
-                    },
-                    else => {},
-                }
-            } else {
-                cancel.setCancelled();
-                try stdout.print("\n^C (cancelled)\n", .{});
-                return try allocator.dupe(u8, "");
+                        continue;
+                    }
+                },
+                'D' => { // Left
+                    if (cursor_pos > 0) {
+                        cursor_pos -= 1;
+                        try stdout.writeAll("\x1b[D");
+                    }
+                },
+                'C' => { // Right
+                    if (cursor_pos < line.len) {
+                        cursor_pos += 1;
+                        try stdout.writeAll("\x1b[C");
+                    }
+                },
+                'A' => { // Up - History
+                    if (history.items.items.len == 0) continue;
+                    if (history_index == null) {
+                        saved_line = try arena_alloc.dupe(u8, line);
+                        history_index = history.items.items.len;
+                    }
+                    if (history_index.? > 0) {
+                        history_index.? -= 1;
+                        const entry_raw = history.items.items[history_index.?];
+                        const entry = context.normalizeHistoryLine(entry_raw);
+                        try stdout.writeAll("\r\x1b[K");
+                        try stdout.writeAll(prompt);
+                        line = try arena_alloc.dupe(u8, entry);
+                        cursor_pos = line.len;
+                        try stdout.writeAll(line);
+                    }
+                },
+                'B' => { // Down - History
+                    if (history_index == null) continue;
+                    if (history_index.? < history.items.items.len - 1) {
+                        history_index.? += 1;
+                        const entry_raw = history.items.items[history_index.?];
+                        const entry = context.normalizeHistoryLine(entry_raw);
+                        try stdout.writeAll("\r\x1b[K");
+                        try stdout.writeAll(prompt);
+                        line = try arena_alloc.dupe(u8, entry);
+                        cursor_pos = line.len;
+                        try stdout.writeAll(line);
+                    } else {
+                        history_index = null;
+                        try stdout.writeAll("\r\x1b[K");
+                        try stdout.writeAll(prompt);
+                        line = try arena_alloc.dupe(u8, saved_line);
+                        cursor_pos = line.len;
+                        try stdout.writeAll(line);
+                    }
+                },
+                'H' => { // Home
+                    while (cursor_pos > 0) {
+                        cursor_pos -= 1;
+                        try stdout.writeAll("\x1b[D");
+                    }
+                },
+                'F' => { // End
+                    while (cursor_pos < line.len) {
+                        cursor_pos += 1;
+                        try stdout.writeAll("\x1b[C");
+                    }
+                },
+                else => {},
             }
             continue;
         }
@@ -338,7 +343,7 @@ pub fn drainQueuedLinesFromStdin(
         _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
     }
     defer if (!already_nonblocking) {
-        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
+        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch 0;
     };
 
     var buf: [1024]u8 = undefined;
@@ -478,33 +483,35 @@ pub fn discardPendingInput(stdin_file: std.fs.File) void {
     const already_nonblocking = (original_flags & O_NONBLOCK) != 0;
 
     if (!already_nonblocking) {
-        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
+        std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags | O_NONBLOCK) catch return;
     }
     defer if (!already_nonblocking) {
-        _ = std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
+        std.posix.fcntl(stdin_file.handle, std.posix.F.SETFL, original_flags) catch {};
     };
 
     var buf: [256]u8 = undefined;
-    var saw_esc = false;
-    var esc_grace_retries: usize = 0;
+    var saw_sequence_start = false;
+    var grace_retries: usize = 0;
+    const base_grace_limit: usize = 8; // ~16ms
+    const sequence_grace_limit: usize = 30; // ~60ms once sequence bytes are seen
     while (true) {
         const n = std.posix.read(stdin_file.handle, &buf) catch 0;
         if (n == 0) {
-            // If we just saw ESC, wait briefly for the rest of the sequence
-            // so we don't leak trailing bytes like "[A" to the parent shell.
-            if (saw_esc and esc_grace_retries < 4) {
-                esc_grace_retries += 1;
+            // Keep a short grace window even before seeing ESC, because
+            // sequence tails can arrive a few ms later during process teardown.
+            const limit = if (saw_sequence_start) sequence_grace_limit else base_grace_limit;
+            if (grace_retries < limit) {
+                grace_retries += 1;
                 std.Thread.sleep(2 * std.time.ns_per_ms);
                 continue;
             }
             break;
         }
-        esc_grace_retries = 0;
+        grace_retries = 0;
         for (buf[0..n]) |b| {
-            if (b == 0x1b) {
-                saw_esc = true;
-                break;
-            }
+            // Also treat orphaned CSI/SS3 tails as sequence starts (e.g. "[A")
+            // because ESC may have already been consumed elsewhere.
+            if (b == 0x1b or b == '[' or b == 'O') saw_sequence_start = true;
         }
     }
 }
