@@ -57,7 +57,7 @@ pub fn subagentThreadMain(args_ptr: *types.SubagentThreadArgs) void {
     }
 
     // Import legacy to call runModel
-    var result = @import("legacy.zig").runModel(
+    var result = @import("orchestrator.zig").runModel(
         allocator,
         &out,
         args.active,

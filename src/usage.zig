@@ -19,6 +19,7 @@ pub fn queryCurrentProviderUsage(
     provider_id: []const u8,
     api_key: ?[]const u8,
 ) ![]u8 {
+    if (std.mem.eql(u8, provider_id, "deepinfra")) return UsageError.UnsupportedProvider;
     if (!std.mem.eql(u8, provider_id, "zai")) return UsageError.UnsupportedProvider;
     const key = api_key orelse return UsageError.MissingApiKey;
     if (key.len == 0) return UsageError.MissingApiKey;

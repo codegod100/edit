@@ -2,6 +2,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const utils = @import("utils.zig");
+const paths = @import("paths.zig");
 
 pub const Role = enum {
     user,
@@ -172,7 +173,7 @@ pub fn historyNextIndex(entries: []const []const u8, current: ?usize, nav: Histo
 // --- History persistence ---
 
 pub fn historyPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ base_path, "history" });
+    return std.fs.path.join(allocator, &.{ base_path, paths.HISTORY_FILENAME });
 }
 
 pub fn loadHistory(allocator: std.mem.Allocator, base_path: []const u8, history: *CommandHistory) !void {
@@ -265,7 +266,10 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         sessions.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch |err| switch (err) {
+    const contexts_dir_path = try std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_DIR_NAME });
+    defer allocator.free(contexts_dir_path);
+
+    var dir = std.fs.openDirAbsolute(contexts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied => return sessions,
         else => return err,
     };
@@ -295,7 +299,7 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         const stat = dir.statFile(entry.name) catch continue;
 
         // Build full path
-        const full_path = try std.fs.path.join(allocator, &.{ base_path, entry.name });
+        const full_path = try std.fs.path.join(allocator, &.{ contexts_dir_path, entry.name });
         errdefer allocator.free(full_path);
 
         // Peek for title or first prompt snippet
@@ -378,7 +382,7 @@ fn formatSize(allocator: std.mem.Allocator, size: usize) ![]u8 {
 pub fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
     const filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{project_hash});
     defer allocator.free(filename);
-    return std.fs.path.join(allocator, &.{ base_path, filename });
+    return std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_DIR_NAME, filename });
 }
 
 pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, project_hash: u64) !void {
@@ -658,12 +662,17 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
     try w.writeAll("[");
 
     // 1. System Prompt (as a system message)
-    try w.writeAll("{\"role\":\"system\",\"content\":\"You are continuing an existing coding conversation. Use prior context when relevant, but prioritize correctness and current repository state.");
+    try w.writeAll("{\"role\":\"system\",\"content\":");
+    var sys_content: std.ArrayListUnmanaged(u8) = .empty;
+    defer sys_content.deinit(allocator);
+    const sw = sys_content.writer(allocator);
+    try sw.writeAll("You are continuing an existing coding conversation. Use prior context when relevant, but prioritize correctness and current repository state.");
     if (window.summary) |s| {
-        try w.writeAll("\\n\\nConversation summary:\\n");
-        try utils.writeJsonString(w, s);
+        try sw.writeAll("\n\nConversation summary:\n");
+        try sw.writeAll(s);
     }
-    try w.writeAll("\"},");
+    try w.print("{f}", .{std.json.fmt(sys_content.items, .{})});
+    try w.writeAll("},");
 
     // 2. Prior turns (full loaded context window, chronological)
     for (window.turns.items) |turn| {
@@ -676,15 +685,8 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
         try w.writeAll("{\"role\":");
         try w.print("{f}", .{std.json.fmt(if (turn.role == .user) "user" else "assistant", .{})});
         try w.writeAll(",\"content\":");
-        
-        var content_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer content_buf.deinit(allocator);
-        const cw = content_buf.writer(allocator);
-        
         const content = if (turn.role == .assistant) stripRunMetadataSuffix(turn.content) else turn.content;
-        try cw.writeAll(content);
-        
-        try w.print("{f}", .{std.json.fmt(content_buf.items, .{})});
+        try w.print("{f}", .{std.json.fmt(content, .{})});
         try w.writeAll("},");
     }
 

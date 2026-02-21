@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths = @import("paths.zig");
 
 pub const SelectedModel = struct {
     provider_id: []u8,
@@ -89,7 +90,7 @@ pub fn saveSelectedModel(allocator: std.mem.Allocator, base_path: []const u8, mo
 }
 
 fn configPathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ base_path, "config.json" });
+    return std.fs.path.join(allocator, &.{ base_path, paths.SELECTED_MODEL_FILENAME });
 }
 
 test "save and load selected model" {

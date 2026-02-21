@@ -9,6 +9,7 @@ const provider_store = @import("provider_store.zig");
 const model_select = @import("model_select.zig");
 const model_loop = @import("model_loop/main.zig");
 const display = @import("display.zig");
+const paths = @import("paths.zig");
 
 const ModelInfoResponse = struct {
     type: []const u8 = "model_info",
@@ -188,8 +189,7 @@ pub fn main() !void {
     }
 
     // Initialize logging
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    const log_path = try std.fs.path.join(allocator, &.{ home, ".config", "zagent", "debug.log" });
+    const log_path = try paths.getLogPath(allocator);
     defer allocator.free(log_path);
 
     try logger.init(allocator, .info, log_path);
@@ -201,7 +201,7 @@ pub fn main() !void {
     log.info("zagent-web starting up", .{});
 
     // Load the selected model
-    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
+    const config_dir = try paths.getConfigDir(allocator);
     defer allocator.free(config_dir);
 
     // Create the web server, falling back to a fixed port if preferred is in use.
@@ -335,6 +335,8 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
         project_path: ?[]const u8 = null,
         session_id: ?[]const u8 = null,
         title: ?[]const u8 = null,
+        provider_id: ?[]const u8 = null,
+        model_id: ?[]const u8 = null,
     }, allocator, trimmed, .{}) catch |err| {
         // Ignore malformed payloads from non-protocol clients/extensions.
         log.debug("Ignoring non-protocol JSON payload from client {d}: {}", .{ client_id, err });
@@ -356,6 +358,15 @@ fn handleMessage(allocator: std.mem.Allocator, client_id: u32, ws_message: []con
 
     if (std.mem.eql(u8, data.value.type, "get_model_info")) {
         return try getModelInfoResponse(allocator, server, session, client_id, config_dir);
+    } else if (std.mem.eql(u8, data.value.type, "list_models")) {
+        return try listModelOptionsResponse(allocator, session, config_dir);
+    } else if (std.mem.eql(u8, data.value.type, "set_model")) {
+        if (data.value.provider_id) |provider_id| {
+            if (data.value.model_id) |model_id| {
+                return try setModelResponse(allocator, session, config_dir, provider_id, model_id);
+            }
+        }
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Missing provider_id or model_id\"}}", .{});
     } else if (std.mem.eql(u8, data.value.type, "set_project")) {
         if (data.value.project_path) |path| {
             const canonical_path = normalizeProjectPath(allocator, path) catch try allocator.dupe(u8, path);
@@ -673,6 +684,153 @@ fn getModelInfoResponse(allocator: std.mem.Allocator, server: *web.Server, sessi
     defer json_out.deinit(allocator);
     try json_out.writer(allocator).print("{f}", .{std.json.fmt(response, .{})});
     return try json_out.toOwnedSlice(allocator);
+}
+
+fn clearActiveModel(session: *Session) void {
+    if (session.active_model) |*m| {
+        session.allocator.free(m.provider_id);
+        session.allocator.free(m.model_id);
+        if (m.api_key) |k| session.allocator.free(k);
+        if (m.reasoning_effort) |r| session.allocator.free(r);
+    }
+    session.active_model = null;
+}
+
+fn encodeModelOptionsResponse(
+    allocator: std.mem.Allocator,
+    options: []const model_select.ModelOption,
+    current_provider_id: ?[]const u8,
+    current_model_id: ?[]const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"type\":\"model_options\",\"options\":[");
+    for (options, 0..) |option, i| {
+        if (i > 0) try out.append(allocator, ',');
+        const provider_json = try jsonQuoted(allocator, option.provider_id);
+        defer allocator.free(provider_json);
+        const model_json = try jsonQuoted(allocator, option.model_id);
+        defer allocator.free(model_json);
+        try out.writer(allocator).print("{{\"provider_id\":{s},\"model_id\":{s}}}", .{ provider_json, model_json });
+    }
+    try out.appendSlice(allocator, "],\"current_provider_id\":");
+    if (current_provider_id) |provider_id| {
+        const provider_json = try jsonQuoted(allocator, provider_id);
+        defer allocator.free(provider_json);
+        try out.appendSlice(allocator, provider_json);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+
+    try out.appendSlice(allocator, ",\"current_model_id\":");
+    if (current_model_id) |model_id| {
+        const model_json = try jsonQuoted(allocator, model_id);
+        defer allocator.free(model_json);
+        try out.appendSlice(allocator, model_json);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+
+    try out.appendSlice(allocator, "}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn listModelOptionsResponse(allocator: std.mem.Allocator, session: *Session, config_dir: []const u8) ![]u8 {
+    const specs = g_provider_specs orelse {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Provider configuration unavailable.\"}}", .{});
+    };
+
+    const stored_pairs = try provider_store.load(allocator, config_dir);
+    defer provider_store.free(allocator, stored_pairs);
+
+    const provider_states = try model_select.resolveProviderStates(allocator, specs, stored_pairs);
+    defer allocator.free(provider_states);
+
+    const options = try model_select.collectModelOptions(allocator, specs, provider_states, null);
+    defer allocator.free(options);
+
+    var current_provider_id: ?[]const u8 = null;
+    var current_model_id: ?[]const u8 = null;
+    var selected_provider_owned: ?[]u8 = null;
+    var selected_model_owned: ?[]u8 = null;
+    defer {
+        if (selected_provider_owned) |p| allocator.free(p);
+        if (selected_model_owned) |m| allocator.free(m);
+    }
+
+    if (session.active_model) |active| {
+        current_provider_id = active.provider_id;
+        current_model_id = active.model_id;
+    } else {
+        const selected = try config_store.loadSelectedModel(allocator, config_dir);
+        if (selected) |sel| {
+            defer {
+                var owned = sel;
+                owned.deinit(allocator);
+            }
+            selected_provider_owned = try allocator.dupe(u8, sel.provider_id);
+            selected_model_owned = try allocator.dupe(u8, sel.model_id);
+            current_provider_id = selected_provider_owned;
+            current_model_id = selected_model_owned;
+        }
+    }
+
+    return try encodeModelOptionsResponse(allocator, options, current_provider_id, current_model_id);
+}
+
+fn setModelResponse(allocator: std.mem.Allocator, session: *Session, config_dir: []const u8, provider_id_raw: []const u8, model_id_raw: []const u8) ![]u8 {
+    const provider_id = std.mem.trim(u8, provider_id_raw, " \t\r\n");
+    const model_id = std.mem.trim(u8, model_id_raw, " \t\r\n");
+    if (provider_id.len == 0 or model_id.len == 0) {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Model selection cannot be empty\"}}", .{});
+    }
+
+    const specs = g_provider_specs orelse {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Provider configuration unavailable.\"}}", .{});
+    };
+
+    const stored_pairs = try provider_store.load(allocator, config_dir);
+    defer provider_store.free(allocator, stored_pairs);
+
+    const provider_states = try model_select.resolveProviderStates(allocator, specs, stored_pairs);
+    defer allocator.free(provider_states);
+
+    const options = try model_select.collectModelOptions(allocator, specs, provider_states, null);
+    defer allocator.free(options);
+
+    var allowed = false;
+    for (options) |option| {
+        if (std.mem.eql(u8, option.provider_id, provider_id) and std.mem.eql(u8, option.model_id, model_id)) {
+            allowed = true;
+            break;
+        }
+    }
+    if (!allowed) {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Model is not available for connected providers\"}}", .{});
+    }
+
+    const provider_state = model_select.findConnectedProvider(provider_states, provider_id) orelse {
+        return try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"content\":\"Provider is not connected\"}}", .{});
+    };
+
+    try config_store.saveSelectedModel(allocator, config_dir, .{
+        .provider_id = provider_id,
+        .model_id = model_id,
+    });
+
+    clearActiveModel(session);
+    session.active_model = .{
+        .provider_id = try allocator.dupe(u8, provider_id),
+        .model_id = try allocator.dupe(u8, model_id),
+        .api_key = if (provider_state.key) |k| try allocator.dupe(u8, k) else null,
+    };
+
+    const provider_json = try jsonQuoted(allocator, session.active_model.?.provider_id);
+    defer allocator.free(provider_json);
+    const model_json = try jsonQuoted(allocator, session.active_model.?.model_id);
+    defer allocator.free(model_json);
+    return try std.fmt.allocPrint(allocator, "{{\"type\":\"model_info\",\"provider_id\":{s},\"model_id\":{s}}}", .{ provider_json, model_json });
 }
 
 fn listDirectoriesResponse(allocator: std.mem.Allocator, requested_path: ?[]const u8) ![]u8 {
@@ -1296,4 +1454,32 @@ fn jsonQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try out.append(allocator, '"');
 
     return out.toOwnedSlice(allocator);
+}
+
+test "encodeModelOptionsResponse includes options" {
+    const allocator = std.testing.allocator;
+    const options = [_]model_select.ModelOption{
+        .{ .provider_id = "openai", .model_id = "gpt-5" },
+        .{ .provider_id = "anthropic", .model_id = "claude-sonnet-4" },
+    };
+
+    const json = try encodeModelOptionsResponse(allocator, &options, "openai", "gpt-5");
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"model_options\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"provider_id\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_id\":\"gpt-5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"provider_id\":\"anthropic\"") != null);
+}
+
+test "encodeModelOptionsResponse handles empty list" {
+    const allocator = std.testing.allocator;
+    const options = [_]model_select.ModelOption{};
+
+    const json = try encodeModelOptionsResponse(allocator, &options, null, null);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"options\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"current_provider_id\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"current_model_id\":null") != null);
 }

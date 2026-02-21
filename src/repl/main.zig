@@ -13,6 +13,7 @@ const tools = @import("../tools.zig");
 const context = @import("../context.zig");
 const model_loop = @import("../model_loop.zig");
 const model_select = @import("../model_select.zig");
+const paths = @import("../paths.zig");
 
 const todo = @import("../todo.zig");
 const display = @import("../display.zig");
@@ -113,6 +114,77 @@ fn hasExtHint(line: []const u8, recent_files: ?[]const u8, ext: []const u8) bool
     return false;
 }
 
+/// Non-interactive mode: read stdin, send to model, print response, exit
+fn runNonInteractive(
+    allocator: std.mem.Allocator,
+    stdin: anytype,
+    stdout: anytype,
+    active: ?context.ActiveModel,
+    state: *state_mod.ReplState,
+) !void {
+    // Disable ANSI codes for non-interactive output
+    display.setNoAnsi(true);
+
+    // Read all stdin content
+    var input = std.ArrayListUnmanaged(u8).empty;
+    defer input.deinit(allocator);
+    
+    // Read in chunks until EOF
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = stdin.read(&buf) catch 0;
+        if (n == 0) break;
+        try input.appendSlice(allocator, buf[0..n]);
+    }
+    
+    const line = std.mem.trim(u8, input.items, " \t\r\n");
+    if (line.len == 0) return;
+
+    // Check for active model
+    if (active == null) {
+        try stdout.print("Error: No active model/provider. Use /model or set --model flag.\n", .{});
+        return;
+    }
+
+    logger.info("Non-interactive mode: sending to model", .{});
+
+    // Set up context
+    var turn_arena = std.heap.ArenaAllocator.init(allocator);
+    defer turn_arena.deinit();
+    const turn_alloc = turn_arena.allocator();
+
+    const ctx_messages = try context.buildContextMessagesJson(turn_alloc, &state.context_window, line);
+
+    cancel.init();
+    defer cancel.deinit();
+    cancel.resetCancelled();
+    cancel.beginProcessing();
+
+    // Run model (no TTY, no spinner, no tools in non-interactive mode)
+    const result = model_loop.runModel(allocator, stdout, active.?, line, ctx_messages, false, &state.todo_list, null) catch |err| {
+        logger.err("runModel failed: {any}", .{err});
+        try stdout.print("Error: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Print response plainly
+    if (result.reasoning.len > 0) {
+        try stdout.print("--- Reasoning ---\n{s}\n--- Response ---\n", .{result.reasoning});
+    }
+    try stdout.print("{s}\n", .{result.response});
+
+    // Save to context
+    try state.context_window.append(allocator, .assistant, result.response, .{
+        .reasoning = result.reasoning,
+        .tool_calls = result.tool_calls,
+        .error_count = result.error_count,
+        .files_touched = result.files_touched,
+    });
+
+    var mut_res = result;
+    mut_res.deinit(allocator);
+}
+
 pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Arena for provider specs that live for the entire session
     var provider_arena = std.heap.ArenaAllocator.init(allocator);
@@ -122,6 +194,10 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
 
     const stdin_file = line_editor.stdInFile();
     const stdout_file = line_editor.stdOutFile();
+    
+    // Check if we're in non-interactive mode (stdin is piped)
+    const is_interactive = std.posix.isatty(std.posix.STDIN_FILENO);
+    
     // Use reader/writer directly
     const stdin = if (@hasDecl(std.fs.File, "deprecatedReader"))
         stdin_file.deprecatedReader()
@@ -139,14 +215,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Setup paths
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
-    const home = std.posix.getenv("HOME") orelse "";
-    const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
+    const config_dir = try paths.getConfigDir(allocator);
     defer allocator.free(config_dir);
     try std.fs.cwd().makePath(config_dir);
-
-
-
-
 
     // Load initial data
     const provider_specs = try provider.loadProviderSpecs(provider_alloc, config_dir);
@@ -157,6 +228,7 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     defer store.free(allocator, stored_pairs);
 
     // Codex token sync
+    const home = std.posix.getenv("HOME") orelse "/tmp";
     {
         const codex_path = try std.fs.path.join(allocator, &.{ home, ".codex", "copilot_auth.json" });
         defer allocator.free(codex_path);
@@ -216,14 +288,19 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         display.setStatusBarInfo("none", "none", cwd);
     }
 
+    // Non-interactive mode: read from stdin, get response, exit
+    if (!is_interactive) {
+        return runNonInteractive(allocator, stdin, stdout, active_init, &state);
+    }
+
     // Initialize scrolling region (reserves bottom line for status bar)
     display.setupScrollingRegion(stdout_file);
     defer display.resetScrollingRegion(stdout_file);
 
     // Print Session Info
-    try stdout.print("Session ID: {s}{s}{s} (Log: {s}/transcript_{s}.txt)\n", .{ 
+    try stdout.print("Session ID: {s}{s}{s} (Log: {s}/{s}/transcript_{s}.txt)\n", .{ 
         display.C_BOLD, logger.getSessionID(), display.C_RESET,
-        config_dir, logger.getSessionID() 
+        config_dir, paths.TRANSCRIPTS_DIR_NAME, logger.getSessionID() 
     });
 
     // Load Context/History
@@ -318,10 +395,10 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         }
 
         if (line_opt == null) {
-            // Ensure terminal/input are clean before returning to parent shell.
-            cancel.disableRawMode();
-            line_editor.discardPendingInput(stdin_file);
-            try stdout.print("\nEOF.\n", .{});
+            // EOF or Ctrl+C - exit cleanly
+            if (!cancel.isCancelled()) {
+                try stdout.print("\nEOF.\n", .{});
+            }
             break;
         }
         var line = line_opt.?;
@@ -368,6 +445,10 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         std.debug.print("\r\x1b[K", .{});
 
         if (line.len == 0) {
+            // Exit on empty line after cancellation (Ctrl+C)
+            if (cancel.isCancelled()) {
+                break;
+            }
             continue;
         }
 
@@ -496,9 +577,9 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
         try context.saveContextWindow(allocator, config_dir, &state.context_window, save_hash);
 
         // Initialize tool output arena for persistent strings
-        const legacy = @import("../model_loop/legacy.zig");
-        legacy.initToolOutputArena(allocator);
-        defer legacy.deinitToolOutputArena();
+        const orchestrator = @import("../model_loop/orchestrator.zig");
+        orchestrator.initToolOutputArena(allocator);
+        defer orchestrator.deinitToolOutputArena();
         
         g_callback_stdout_file = stdout_file;
         model_loop.setToolOutputCallback(struct {

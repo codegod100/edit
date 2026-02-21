@@ -1,6 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Global flag to disable ANSI codes (for non-interactive mode)
+var g_no_ansi: bool = false;
+
+pub fn setNoAnsi(no_ansi: bool) void {
+    g_no_ansi = no_ansi;
+}
+
+pub fn noAnsi() bool {
+    return g_no_ansi;
+}
+
 // ANSI color codes
 pub const C_RESET = "\x1b[0m";
 pub const C_BOLD = "\x1b[1m";
@@ -240,6 +251,7 @@ pub fn buildToolResultEventLine(
 
     const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
     const status_symbol = if (std.mem.eql(u8, status, "ok")) "✓" else "✗";
+    const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) "listing files in" else tool_name;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -247,9 +259,9 @@ pub fn buildToolResultEventLine(
 
     try w.print("{s}{s}{s} ", .{ status_color, status_symbol, C_RESET });
     if (file_path) |fp| {
-        try w.print("{s} {s}", .{ tool_name, fp });
+        try w.print("{s} {s}", .{ shown_tool_name, fp });
     } else {
-        try w.print("{s}", .{tool_name});
+        try w.print("{s}", .{shown_tool_name});
     }
     try w.print(" {s}({d}ms){s}", .{ C_DIM, duration_ms, C_RESET });
 
@@ -259,7 +271,8 @@ pub fn buildToolResultEventLine(
 pub fn printColoredToolEvent(stdout: anytype, event_type: []const u8, step: ?usize, call_id: ?[]const u8, tool_name: ?[]const u8) !void {
     if (!std.mem.eql(u8, event_type, "tool-call")) return;
     if (tool_name) |tname| {
-        try stdout.print("• {s}\n", .{tname});
+        const shown_tool_name = if (std.mem.eql(u8, tname, "list_files") or std.mem.eql(u8, tname, "list")) "listing files in" else tname;
+        try stdout.print("{s}• {s}{s}\n", .{ C_CYAN, shown_tool_name, C_RESET });
     }
     _ = step;
     _ = call_id;
@@ -273,6 +286,9 @@ pub fn printTruncatedCommandOutput(stdout: anytype, output: []const u8) !void {
 
 /// Format command output for timeline and add it via callback
 fn formatTruncatedCommandOutput(output: []const u8) void {
+    // Use background color with grey text for tool output (color 248 = medium grey)
+    const prefix_color = C_REASONING_BG ++ "\x1b[38;5;248m";
+    
     // 1. Detect if this is a box (Plan & Progress, etc.)
     const is_box = blk: {
         if (output.len < 3) break :blk false;
@@ -286,6 +302,7 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
 
     // 2. If it's a box, bypass truncation logic entirely
     if (is_box) {
+        addTimelineEntry("{s}\x1b[K{s}\n", .{ prefix_color, C_RESET });
         var line_start: usize = 0;
         var i: usize = 0;
         while (i <= output.len) : (i += 1) {
@@ -296,12 +313,12 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 if (trimmed.len == 0) continue;
 
                 // For boxes, we use a simple indent but no L-bracket prefix
-                const prefix = "    ";
+                const prefix = "";
                 if (trimmed.len > MAX_WIDTH) {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
-                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6\x1b[K{s}\n", .{ prefix_color, prefix, trimmed[0..safe_len], C_RESET });
                 } else {
-                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                    addTimelineEntry("{s}{s}{s}\x1b[K{s}\n", .{ prefix_color, prefix, trimmed, C_RESET });
                 }
             }
         }
@@ -369,11 +386,11 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
     }
 
     if (total == 0) return;
+    addTimelineEntry("{s}\x1b[K{s}\n", .{ prefix_color, C_RESET });
 
     const trunc = total > (head_limit + tail_limit);
 
     if (!trunc) {
-        var printed_any = false;
         line_start = 0;
         i = 0;
         while (i <= output.len) : (i += 1) {
@@ -383,48 +400,45 @@ fn formatTruncatedCommandOutput(output: []const u8) void {
                 line_start = i + 1;
                 if (trimmed.len == 0) continue;
 
-                const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
-                printed_any = true;
+                const prefix = "";
                 
                 if (trimmed.len > MAX_WIDTH) {
                     const safe_len = findUtf8SafeLen(trimmed, MAX_WIDTH);
-                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, trimmed[0..safe_len], C_RESET });
+                    addTimelineEntry("{s}{s}{s}\xe2\x80\xa6\x1b[K{s}\n", .{ prefix_color, prefix, trimmed[0..safe_len], C_RESET });
                 } else {
-                    addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, trimmed, C_RESET });
+                    addTimelineEntry("{s}{s}{s}\x1b[K{s}\n", .{ prefix_color, prefix, trimmed, C_RESET });
                 }
             }
         }
         return;
     }
 
-    var printed_any = false;
     for (head[0..head_len]) |r| {
         const line = output[r.start..r.end];
-        const prefix = if (!printed_any) "  \xe2\x94\x94 " else "    ";
-        printed_any = true;
+        const prefix = "";
 
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6\x1b[K{s}\n", .{ prefix_color, prefix, line[0..safe_len], C_RESET });
         } else {
-            addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
+            addTimelineEntry("{s}{s}{s}\x1b[K{s}\n", .{ prefix_color, prefix, line, C_RESET });
         }
     }
 
     const omitted = total - head_limit - tail_limit;
-    addTimelineEntry("    {s}\xe2\x80\xa6 +{d} lines{s}\n", .{ C_GREY, omitted, C_RESET });
+    addTimelineEntry("{s}\xe2\x80\xa6 +{d} lines\x1b[K{s}\n", .{ prefix_color, omitted, C_RESET });
 
     const first = tail_seen - tail_len;
     var t: usize = 0;
     while (t < tail_len) : (t += 1) {
         const r = tail[(first + t) % tail_limit];
         const line = output[r.start..r.end];
-        const prefix = "    ";
+        const prefix = "";
         if (line.len > MAX_WIDTH) {
             const safe_len = findUtf8SafeLen(line, MAX_WIDTH);
-            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6{s}\n", .{ prefix, C_GREY, line[0..safe_len], C_RESET });
+            addTimelineEntry("{s}{s}{s}\xe2\x80\xa6\x1b[K{s}\n", .{ prefix_color, prefix, line[0..safe_len], C_RESET });
         } else {
-            addTimelineEntry("{s}{s}{s}{s}\n", .{ prefix, C_GREY, line, C_RESET });
+            addTimelineEntry("{s}{s}{s}\x1b[K{s}\n", .{ prefix_color, prefix, line, C_RESET });
         }
     }
 }
@@ -500,7 +514,16 @@ pub fn addTimelineEntry(comptime format: []const u8, args: anytype) void {
     g_stdout_mutex.lock();
     defer g_stdout_mutex.unlock();
     
-    std.debug.print(format, args);
+    if (g_no_ansi) {
+        // Strip ANSI codes for non-interactive mode
+        const rendered = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch return;
+        defer std.heap.page_allocator.free(rendered);
+        const stripped = stripAnsi(std.heap.page_allocator, rendered) catch rendered;
+        defer if (stripped.ptr != rendered.ptr) std.heap.page_allocator.free(stripped);
+        std.debug.print("{s}", .{stripped});
+    } else {
+        std.debug.print(format, args);
+    }
 
     if (g_timeline_callback) |callback| {
         const rendered = std.fmt.allocPrint(std.heap.page_allocator, format, args) catch return;
@@ -578,6 +601,19 @@ pub fn addWrappedTimelineEntry(prefix: []const u8, text: []const u8, suffix: []c
                 if (j < line.len) {
                     if (last_space_idx) |space_idx| {
                         if (space_idx > start) end = space_idx;
+                    } else {
+                        // No space found within width - find next space or end of line
+                        // to avoid breaking in the middle of a word
+                        var next_space = std.mem.indexOfScalarPos(u8, line, start, ' ');
+                        if (next_space == null) {
+                            next_space = std.mem.indexOfScalarPos(u8, line, start, '\t');
+                        }
+                        if (next_space) |space_pos| {
+                            end = space_pos;
+                        } else {
+                            // No space at all - take the rest of the line
+                            end = line.len;
+                        }
                     }
                 }
 
@@ -1064,6 +1100,9 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
         }
     }
 
+    // Add blank line before response for visual separation
+    addTimelineEntry("\n", .{});
+
     var is_first_output = true;
     var in_code_fence = false;
     var idx: usize = 0;
@@ -1086,7 +1125,7 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
             defer allocator.free(rendered);
 
             if (is_first_output) {
-                addTimelineEntry("{s}⛬{s}\n", .{ C_CYAN, C_RESET });
+                addTimelineEntry("\n", .{});
                 is_first_output = false;
             }
             addTimelineEntry("{s}", .{rendered});
@@ -1100,7 +1139,7 @@ pub fn addAssistantMessage(allocator: std.mem.Allocator, text: []const u8) !void
         defer allocator.free(rendered_line);
 
         if (is_first_output) {
-            addTimelineEntry("{s}⛬{s} {s}\n", .{ C_CYAN, C_RESET, rendered_line });
+            addTimelineEntry("{s}\n", .{rendered_line});
             is_first_output = false;
         } else {
             addTimelineEntry("{s}\n", .{rendered_line});

@@ -20,7 +20,9 @@ pub const TerminalManager = struct {
         if (!std.posix.isatty(std.posix.STDIN_FILENO)) return;
 
         self.original_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch null;
-        self.original_flags = std.posix.fcntl(std.posix.STDIN_FILENO, .GETFL, 0) catch null;
+        if (std.posix.fcntl(std.posix.STDIN_FILENO, 3, 0)) |flags| { // F_GETFL = 3
+            self.original_flags = @intCast(flags);
+        } else |_| {}
         self.cancelled = false;
         self.exit_requested = false;
         self.in_raw_mode = false;
@@ -61,12 +63,12 @@ pub const TerminalManager = struct {
 
         // Restore termios (async-signal-safe)
         if (self.original_termios) |orig| {
-            _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, orig);
+            _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, orig) catch {};
         }
 
         // Restore blocking mode (async-signal-safe)
         if (self.original_flags) |flags| {
-            _ = std.posix.fcntl(std.posix.STDIN_FILENO, .SETFL, flags);
+            _ = std.posix.fcntl(std.posix.STDIN_FILENO, 4, flags) catch {}; // F_SETFL = 4
         }
 
         self.in_raw_mode = false;
@@ -105,12 +107,12 @@ pub const TerminalManager = struct {
             raw.cc[17] = 0; // VTIME
         }
 
-        _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
+        _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {};
 
         // Set non-blocking for escape sequence polling
         const O_NONBLOCK: u32 = if (builtin.os.tag == .linux) 0o4000 else 0x0004;
         if (self.original_flags) |flags| {
-            _ = std.posix.fcntl(std.posix.STDIN_FILENO, .SETFL, flags | O_NONBLOCK);
+            _ = std.posix.fcntl(std.posix.STDIN_FILENO, 4, flags | O_NONBLOCK) catch {}; // F_SETFL = 4
         }
 
         self.in_raw_mode = true;
@@ -175,11 +177,11 @@ pub const TerminalManager = struct {
         _ = self; // Not used, but keeping API consistent
 
         const O_NONBLOCK: u32 = if (builtin.os.tag == .linux) 0o4000 else 0x0004;
-        const orig_flags = std.posix.fcntl(std.posix.STDIN_FILENO, .GETFL, 0) catch return;
+        const orig_flags = std.posix.fcntl(std.posix.STDIN_FILENO, 3, 0) catch return; // F_GETFL = 3
         const was_nonblocking = (orig_flags & O_NONBLOCK) != 0;
 
         if (!was_nonblocking) {
-            _ = std.posix.fcntl(std.posix.STDIN_FILENO, .SETFL, orig_flags | O_NONBLOCK);
+            _ = std.posix.fcntl(std.posix.STDIN_FILENO, 4, orig_flags | O_NONBLOCK) catch {}; // F_SETFL = 4
         }
 
         var buf: [256]u8 = undefined;
@@ -195,7 +197,7 @@ pub const TerminalManager = struct {
         }
 
         if (!was_nonblocking) {
-            _ = std.posix.fcntl(std.posix.STDIN_FILENO, .SETFL, orig_flags);
+            _ = std.posix.fcntl(std.posix.STDIN_FILENO, 4, orig_flags) catch {}; // F_SETFL = 4
         }
     }
 };

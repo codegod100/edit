@@ -174,51 +174,21 @@ pub fn collectModelOptions(
         const openai_oauth = std.mem.eql(u8, spec.id, "openai") and state != null and state.?.key != null and auth.isLikelyOAuthToken(state.?.key.?);
         const copilot_live_allowlist = std.mem.eql(u8, spec.id, "github-copilot") and state != null and state.?.key != null;
         if (openai_oauth or copilot_live_allowlist) {
-            // Prefer live allowlist from the provider, but fall back to substring filter on failure.
-            var allowed_ids: ?[][]u8 = null;
-            if (state.?.key) |k| {
-                allowed_ids = ai_bridge.fetchModelIDsDirect(allocator, k, spec.id) catch null;
-            }
-            defer if (allowed_ids) |ids| ai_bridge.freeModelIDs(allocator, ids);
-
-            if (allowed_ids) |ids| {
-                var seen = std.StringHashMap(void).init(allocator);
-                defer seen.deinit();
-
-                for (ids) |id| {
-                    _ = try seen.put(id, {});
-                }
-
-                // Add catalog models that are allowed.
+            // Avoid live model-catalog HTTP calls in the model list path.
+            // Some upstream responses trigger std.http decompression panics on Zig 0.15.x.
+            // Use static provider catalog here and apply auth-aware filtering.
+            if (copilot_live_allowlist) {
                 for (spec.models) |m_id| {
-                    if (seen.contains(m_id)) {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
-                        _ = seen.remove(m_id);
-                    }
-                }
-
-                // Add any allowed models not present in our static catalog.
-                var it = seen.keyIterator();
-                while (it.next()) |key_ptr| {
-                    const id = key_ptr.*;
-                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = id });
-                }
-                continue;
-            } else {
-                if (copilot_live_allowlist) {
-                    // If Copilot model listing fails, fall back to static catalog.
-                    for (spec.models) |m_id| {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
-                    }
-                    continue;
-                }
-                for (spec.models) |m_id| {
-                    if (utils.isCodexModelId(m_id)) {
-                        try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
-                    }
+                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
                 }
                 continue;
             }
+            for (spec.models) |m_id| {
+                if (utils.isCodexModelId(m_id)) {
+                    try out.append(allocator, .{ .provider_id = spec.id, .model_id = m_id });
+                }
+            }
+            continue;
         }
 
         for (spec.models) |m_id| {

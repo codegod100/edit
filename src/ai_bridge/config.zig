@@ -41,6 +41,14 @@ pub fn getProviderConfig(provider_id: []const u8) types.ProviderConfig {
             .title = "zagent",
             .user_agent = "zagent/0.1",
         };
+    } else if (std.mem.eql(u8, provider_id, "deepinfra")) {
+        return .{
+            .endpoint = "https://api.deepinfra.com/v1/openai/chat/completions",
+            .models_endpoint = "https://api.deepinfra.com/v1/openai/models",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
     } else {
         return .{
             .endpoint = "https://api.openai.com/v1/chat/completions",

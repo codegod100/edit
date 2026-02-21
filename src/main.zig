@@ -3,6 +3,8 @@ const repl = @import("repl/main.zig");
 const logger = @import("logger.zig");
 const cancel = @import("cancel.zig");
 const context = @import("context.zig");
+const config_store = @import("config_store.zig");
+const paths = @import("paths.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -15,6 +17,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var resume_session_id: ?[]const u8 = null;
+    var model_flag: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -23,22 +26,34 @@ pub fn main() !void {
                 \\Usage: zagent [OPTIONS]
                 \\
                 \\Options:
-                \\      --resume [ID]          Resume from a session (show menu if no ID)
-                \\  -h, --help                 Show this help message
+                \\  -m, --model PROVIDER/MODEL  Set the model (e.g., zai/glm-5, opencode/glm-5)
+                \\      --resume [ID]           Resume from a session (show menu if no ID)
+                \\  -h, --help                  Show this help message
                 \\
                 \\Environment Variables:
-                \\  ZAGENT_RESTORE_CONTEXT=1   Also enables context restoration from current project
+                \\  ZAGENT_RESTORE_CONTEXT=1    Also enables context restoration from current project
                 \\
                 \\Examples:
-                \\  zagent --resume             Show menu to select from recent sessions
-                \\  zagent --resume 56ffe754    Resume session with ID 56ffe754
+                \\  zagent --model zai/glm-5      Start with zai/glm-5 model
+                \\  zagent --resume               Show menu to select from recent sessions
+                \\  zagent --resume 56ffe754      Resume session with ID 56ffe754
                 \\
             ;
             _ = try std.posix.write(1, help_text);
             return;
         }
 
-        if (std.mem.eql(u8, arg, "--resume")) {
+        if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                model_flag = args[i];
+            } else {
+                std.debug.print("Error: --model requires PROVIDER/MODEL argument\n", .{});
+                return error.MissingArgument;
+            }
+        } else if (std.mem.startsWith(u8, arg, "--model=")) {
+            model_flag = arg["--model=".len..];
+        } else if (std.mem.eql(u8, arg, "--resume")) {
             // Check if next argument exists and doesn't start with --
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
                 i += 1;
@@ -56,8 +71,7 @@ pub fn main() !void {
     }
 
     // Initialize verbose logging
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    const log_path = try std.fs.path.join(allocator, &.{ home, ".config", "zagent", "debug.log" });
+    const log_path = try paths.getLogPath(allocator);
     defer allocator.free(log_path);
 
     try logger.init(allocator, .info, log_path);
@@ -71,7 +85,7 @@ pub fn main() !void {
     // Handle resume if requested
     var resumed_session_hash: ?u64 = null;
     if (resume_session_id) |id| {
-        const config_dir = try std.fs.path.join(allocator, &.{ home, ".config", "zagent" });
+        const config_dir = try paths.getConfigDir(allocator);
         defer allocator.free(config_dir);
 
         if (id.len == 0) {
@@ -119,7 +133,37 @@ pub fn main() !void {
         }
     }
 
-    try repl.run(allocator, resumed_session_hash);
+    // Handle --model flag
+    if (model_flag) |model_str| {
+        const config_dir = try paths.getConfigDir(allocator);
+        defer allocator.free(config_dir);
+
+        // Parse model string: "provider/model" or just "model"
+        if (std.mem.indexOfScalar(u8, model_str, '/')) |slash_pos| {
+            const provider_id = model_str[0..slash_pos];
+            const model_id = model_str[slash_pos + 1 ..];
+            try config_store.saveSelectedModel(allocator, config_dir, .{
+                .provider_id = provider_id,
+                .model_id = model_id,
+            });
+            std.debug.print("Set model: {s}/{s}\n", .{ provider_id, model_id });
+        } else {
+            std.debug.print("Error: --model format is PROVIDER/MODEL (e.g., zai/glm-5)\n", .{});
+            return error.InvalidModelFormat;
+        }
+    }
+
+    repl.run(allocator, resumed_session_hash) catch |err| {
+        // Graceful exit on interrupt or EOF - don't print error trace
+        if (err == error.InputOutput or err == error.EndOfStream or err == error.BrokenPipe) {
+            cancel.deinit();
+            return;
+        }
+        return err;
+    };
+
+    // Normal shutdown
+    cancel.deinit();
 
     logger.info("zagent shutting down", .{});
 }

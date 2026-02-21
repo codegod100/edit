@@ -18,6 +18,8 @@ class ZagentApp {
         this.pendingProjectSet = false;
         this.currentModel = null;
         this.currentProvider = null;
+        this.modelOptions = [];
+        this.modelPickerOpen = false;
         
         this.init();
     }
@@ -25,6 +27,7 @@ class ZagentApp {
     init() {
         this.cacheElements();
         this.bindEvents();
+        this.updateModelDisplay();
         this.connect();
     }
     
@@ -52,7 +55,9 @@ class ZagentApp {
             folderManualGoBtn: document.getElementById('folderManualGoBtn'),
             refreshSessionsBtn: document.getElementById('refreshSessionsBtn'),
             sessionsList: document.getElementById('sessionsList'),
+            modelInfo: document.getElementById('modelInfo'),
             modelValue: document.getElementById('modelValue'),
+            modelPicker: document.getElementById('modelPicker'),
         };
     }
     
@@ -100,6 +105,26 @@ class ZagentApp {
             }
         });
         this.elements.refreshSessionsBtn.addEventListener('click', () => this.requestRecentSessions());
+        this.elements.modelValue.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (this.modelPickerOpen) {
+                this.closeModelPicker();
+            } else {
+                this.openModelPicker();
+            }
+        });
+        document.addEventListener('click', (e) => {
+            if (!this.modelPickerOpen) return;
+            if (!this.elements.modelInfo.contains(e.target)) {
+                this.closeModelPicker();
+            }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && this.modelPickerOpen) {
+                this.closeModelPicker();
+            }
+        });
         
         // Chat input
         this.elements.userInput.addEventListener('input', () => {
@@ -135,6 +160,7 @@ class ZagentApp {
             this.addSystemMessage('Connected to zagent');
             this.requestRecentSessions();
             this.requestModelInfo();
+            this.requestModelOptions();
         };
         
         this.ws.onclose = () => {
@@ -264,6 +290,11 @@ class ZagentApp {
                 this.currentProvider = data.provider_id || null;
                 this.currentModel = data.model_id || null;
                 this.updateModelDisplay();
+                this.closeModelPicker();
+                break;
+
+            case 'model_options':
+                this.renderModelOptions(data);
                 break;
 
             case 'assistant_output':
@@ -309,6 +340,10 @@ class ZagentApp {
             case 'recent_sessions':
                 this.maybeRestoreLastSession(data.sessions || []);
                 this.renderRecentSessions(data.sessions || []);
+                if (!this.currentProvider || !this.currentModel) {
+                    this.requestModelInfo();
+                    this.requestModelOptions();
+                }
                 break;
 
             case 'session_loaded':
@@ -381,6 +416,62 @@ class ZagentApp {
 
     requestModelInfo() {
         this.send({ type: 'get_model_info' });
+    }
+
+    requestModelOptions() {
+        this.send({ type: 'list_models' });
+    }
+
+    openModelPicker() {
+        if (!this.connected) return;
+        this.modelPickerOpen = true;
+        this.elements.modelValue.setAttribute('aria-expanded', 'true');
+        this.elements.modelPicker.classList.remove('hidden');
+        this.elements.modelPicker.innerHTML = '<div class="model-picker-empty">Loading models...</div>';
+        this.requestModelOptions();
+    }
+
+    closeModelPicker() {
+        this.modelPickerOpen = false;
+        this.elements.modelValue.setAttribute('aria-expanded', 'false');
+        this.elements.modelPicker.classList.add('hidden');
+    }
+
+    renderModelOptions(data) {
+        const options = Array.isArray(data.options) ? data.options : [];
+        this.modelOptions = options;
+        this.elements.modelPicker.innerHTML = '';
+
+        const currentProvider = data.current_provider_id || this.currentProvider;
+        const currentModel = data.current_model_id || this.currentModel;
+        if (currentProvider && currentModel) {
+            this.currentProvider = currentProvider;
+            this.currentModel = currentModel;
+            this.updateModelDisplay();
+        }
+
+        if (!this.modelPickerOpen) return;
+
+        if (options.length === 0) {
+            this.elements.modelPicker.innerHTML = '<div class="model-picker-empty">No connected models available</div>';
+            return;
+        }
+
+        options.forEach((option) => {
+            const provider = option.provider_id || '';
+            const model = option.model_id || '';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'model-option';
+            btn.textContent = `${provider}/${model}`;
+            if (provider === this.currentProvider && model === this.currentModel) {
+                btn.classList.add('active');
+            }
+            btn.addEventListener('click', () => {
+                this.send({ type: 'set_model', provider_id: provider, model_id: model });
+            });
+            this.elements.modelPicker.appendChild(btn);
+        });
     }
 
     renderRecentSessions(sessions) {
@@ -652,6 +743,7 @@ class ZagentApp {
         
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
+        contentDiv.classList.add(`agent-log-${normalizedKind}`);
         contentDiv.innerHTML = this.formatMessage(`### ${label}\n${text}`);
         
         bodyDiv.appendChild(headerDiv);

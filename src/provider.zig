@@ -1,5 +1,7 @@
 const std = @import("std");
 const client = @import("llm/client.zig");
+const utils = @import("utils.zig");
+const paths = @import("paths.zig");
 
 // ============================================================
 // Types
@@ -76,7 +78,7 @@ pub fn deinitProviderSpecs() void {
 // ============================================================
 
 pub fn loadProviderSpecs(allocator: std.mem.Allocator, config_dir: []const u8) ![]ProviderSpec {
-    const settings_path = try std.fs.path.join(allocator, &.{ config_dir, "settings.json" });
+    const settings_path = try std.fs.path.join(allocator, &.{ config_dir, paths.SETTINGS_FILENAME });
     defer allocator.free(settings_path);
 
     const file = try std.fs.openFileAbsolute(settings_path, .{});
@@ -144,6 +146,26 @@ pub fn getProviderConfig(provider_id: []const u8) ProviderConfig {
     }
     
     // Default fallback if requested provider not found in settings.json
+    if (std.mem.eql(u8, provider_id, "deepinfra")) {
+        return .{
+            .endpoint = "https://api.deepinfra.com/v1/openai/chat/completions",
+            .models_endpoint = "https://api.deepinfra.com/v1/openai/models",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
+    }
+
+    if (std.mem.eql(u8, provider_id, "zai")) {
+        return .{
+            .endpoint = "https://api.zai.ai/v1/chat/completions",
+            .models_endpoint = "https://api.zai.ai/v1/models",
+            .referer = null,
+            .title = null,
+            .user_agent = null,
+        };
+    }
+
     return .{
         .endpoint = "https://api.openai.com/v1/chat/completions",
         .models_endpoint = "https://api.openai.com/v1/models",
@@ -217,18 +239,27 @@ fn findEnvValue(names: []const []const u8, env: []const EnvPair) ?[]const u8 {
 pub fn defaultModelIDForProvider(provider_id: []const u8, models: []const []const u8) ?[]const u8 {
     const openai_priority = [_][]const u8{ "gpt-5-nano", "gpt-5-mini", "gpt-4o-mini" };
     const anthropic_priority = [_][]const u8{ "haiku", "sonnet" };
+    const deepinfra_priority = [_][]const u8{ "glm-5", "glm-4" };
+    const zai_priority = [_][]const u8{ "glm-5", "glm-4" };
+    const glm_priority = [_][]const u8{ "glm-5", "glm-4" };
     const generic_priority = [_][]const u8{ "haiku", "flash", "nano", "mini" };
 
     const priority: []const []const u8 = if (std.mem.eql(u8, provider_id, "openai"))
         openai_priority[0..]
     else if (std.mem.eql(u8, provider_id, "anthropic"))
         anthropic_priority[0..]
+    else if (std.mem.eql(u8, provider_id, "deepinfra"))
+        deepinfra_priority[0..]
+    else if (std.mem.eql(u8, provider_id, "zai"))
+        zai_priority[0..]
+    else if (std.mem.eql(u8, provider_id, "opencode"))
+        glm_priority[0..]
     else
         generic_priority[0..];
 
     for (priority) |needle| {
         for (models) |model_id| {
-            if (std.mem.indexOf(u8, model_id, needle) != null) return model_id;
+            if (utils.containsIgnoreCase(model_id, needle)) return model_id;
         }
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths = @import("paths.zig");
 
 pub const LogLevel = enum {
     debug,
@@ -17,26 +18,51 @@ pub fn getSessionID() []const u8 {
     return session_id_buf[0..session_id_len];
 }
 
-pub fn init(_allocator: std.mem.Allocator, level: LogLevel, file_path: ?[]const u8) !void {
-    _ = _allocator;
+pub fn init(allocator: std.mem.Allocator, level: LogLevel, file_path: ?[]const u8) !void {
     log_level = level;
 
     if (file_path) |path| {
-        log_file = try std.fs.createFileAbsolute(path, .{ .truncate = false });
-        try log_file.?.seekFromEnd(0);
+        // Ensure log directory exists
+        const dir = std.fs.path.dirname(path) orelse return;
+        std.fs.makeDirAbsolute(dir) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+
+        // Rotate existing log
+        const old_path = try std.fmt.allocPrint(allocator, "{s}.old", .{path});
+        defer allocator.free(old_path);
+        std.fs.renameAbsolute(path, old_path) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        };
+
+        log_file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
 
         // Generate unique Session ID (timestamp-based)
         const now = std.time.timestamp();
         const sid = try std.fmt.bufPrint(&session_id_buf, "{d}", .{@as(u64, @intCast(now))});
         session_id_len = sid.len;
 
-        // Also initialize transcript in the same directory
-        const dir = std.fs.path.dirname(path) orelse return;
-        const transcript_name = try std.fmt.allocPrint(std.heap.page_allocator, "transcript_{s}.txt", .{sid});
-        defer std.heap.page_allocator.free(transcript_name);
+        // Also initialize transcript in a dedicated subdirectory
+        // The path passed in is already expected to be inside the config dir (or logs subdir)
+        // main.zig passes ~/.config/zagent/logs/debug.log
+        // So dir is ~/.config/zagent/logs
+        // We want transcripts in ~/.config/zagent/transcripts
+        const config_dir = std.fs.path.dirname(dir) orelse dir;
+        const transcripts_dir = try std.fs.path.join(allocator, &.{ config_dir, paths.TRANSCRIPTS_DIR_NAME });
+        defer allocator.free(transcripts_dir);
         
-        const transcript_path = try std.fs.path.join(std.heap.page_allocator, &.{ dir, transcript_name });
-        defer std.heap.page_allocator.free(transcript_path);
+        std.fs.makeDirAbsolute(transcripts_dir) catch |e| switch (e) {
+            error.PathAlreadyExists => {},
+            else => return e,
+        };
+
+        const transcript_name = try std.fmt.allocPrint(allocator, "transcript_{s}.txt", .{sid});
+        defer allocator.free(transcript_name);
+        
+        const transcript_path = try std.fs.path.join(allocator, &.{ transcripts_dir, transcript_name });
+        defer allocator.free(transcript_path);
         
         transcript_file = try std.fs.createFileAbsolute(transcript_path, .{ .truncate = false });
         try transcript_file.?.seekFromEnd(0);
@@ -60,7 +86,7 @@ pub fn deinit() void {
 
 pub fn transcriptWrite(comptime fmt: []const u8, args: anytype) !void {
     if (transcript_file) |f| {
-        const msg = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args);
+        const msg = try std.fmt.allocPrint(std.heap.page_allocator, fmt, args); // Still using page_allocator for one-off prints, or should we use arena?
         defer std.heap.page_allocator.free(msg);
         _ = try f.write(msg);
     }

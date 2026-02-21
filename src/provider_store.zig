@@ -1,4 +1,5 @@
 const std = @import("std");
+const paths = @import("paths.zig");
 
 pub const StoredPair = struct {
     name: []u8,
@@ -20,7 +21,15 @@ pub fn load(allocator: std.mem.Allocator, base_path: []const u8) ![]StoredPair {
     defer allocator.free(path);
 
     const content = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return allocator.alloc(StoredPair, 0),
+        error.FileNotFound => blk: {
+            const legacy_path = try legacyStorePathAlloc(allocator, base_path);
+            defer allocator.free(legacy_path);
+
+            break :blk std.fs.openFileAbsolute(legacy_path, .{}) catch |legacy_err| switch (legacy_err) {
+                error.FileNotFound => return allocator.alloc(StoredPair, 0),
+                else => return legacy_err,
+            };
+        },
         else => return err,
     };
     defer content.close();
@@ -129,7 +138,11 @@ fn parseContent(allocator: std.mem.Allocator, content: []const u8) ![]StoredPair
 }
 
 fn storePathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ base_path, "provider.env" });
+    return std.fs.path.join(allocator, &.{ base_path, paths.PROVIDER_ENV_FILENAME });
+}
+
+fn legacyStorePathAlloc(allocator: std.mem.Allocator, base_path: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base_path, paths.PROVIDER_ENV_LEGACY_FILENAME });
 }
 
 test "upsert file stores and updates provider key" {
@@ -157,4 +170,27 @@ test "sanitize env value strips non-ascii" {
     defer allocator.free(out.value);
     try std.testing.expect(out.stripped);
     try std.testing.expectEqualStrings("sk-abc", out.value);
+}
+
+test "load supports legacy providers.env path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const legacy_path = try legacyStorePathAlloc(allocator, root);
+    defer allocator.free(legacy_path);
+
+    var file = try std.fs.createFileAbsolute(legacy_path, .{});
+    defer file.close();
+    try file.writeAll("OPENAI_API_KEY=legacy-key\n");
+
+    const loaded = try load(allocator, root);
+    defer free(allocator, loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", loaded[0].name);
+    try std.testing.expectEqualStrings("legacy-key", loaded[0].value);
 }

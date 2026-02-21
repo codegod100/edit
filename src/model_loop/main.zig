@@ -13,16 +13,16 @@ pub const SubagentThreadArgs = @import("types.zig").SubagentThreadArgs;
 
 // Core execution functions
 pub const runModelTurnWithTools = @import("turn.zig").runModelTurnWithTools;
-pub const runModel = @import("legacy.zig").runModel;
+pub const runModel = @import("orchestrator.zig").runModel;
 pub const executeInlineToolCalls = @import("tools.zig").executeInlineToolCalls;
 
 // Helper functions
 pub const toolDefsToLlm = @import("turn.zig").toolDefsToLlm;
 pub const isCancelled = @import("turn.zig").isCancelled;
-pub const setToolOutputCallback = @import("legacy.zig").setToolOutputCallback;
-pub const ToolOutputCallback = @import("legacy.zig").ToolOutputCallback;
-pub const initToolOutputArena = @import("legacy.zig").initToolOutputArena;
-pub const deinitToolOutputArena = @import("legacy.zig").deinitToolOutputArena;
+pub const setToolOutputCallback = @import("orchestrator.zig").setToolOutputCallback;
+pub const ToolOutputCallback = @import("orchestrator.zig").ToolOutputCallback;
+pub const initToolOutputArena = @import("orchestrator.zig").initToolOutputArena;
+pub const deinitToolOutputArena = @import("orchestrator.zig").deinitToolOutputArena;
 
 // Subagent handling
 pub const subagentThreadMain = @import("subagent.zig").subagentThreadMain;

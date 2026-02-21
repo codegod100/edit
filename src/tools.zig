@@ -205,6 +205,7 @@ pub fn execute(allocator: std.mem.Allocator, spec: []const u8) ![]u8 {
 }
 
 pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_json: []const u8, todo_list: *todo.TodoList) ![]u8 {
+    if (cancel.isCancelled()) return NamedToolError.Cancelled;
     if (std.mem.eql(u8, name, "bash")) {
         const A = struct { command: ?[]const u8 = null };
         var p = std.json.parseFromSlice(A, allocator, arguments_json, .{ .ignore_unknown_fields = true }) catch return NamedToolError.InvalidArguments;
@@ -1011,6 +1012,7 @@ fn countEditedLines(before: []const u8, after: []const u8) usize {
 }
 
 fn runBash(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
+    if (cancel.isCancelled()) return NamedToolError.Cancelled;
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "sh", "-c", command },

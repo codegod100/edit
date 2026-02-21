@@ -3,7 +3,8 @@ const tools = @import("../tools.zig");
 const display = @import("../display.zig");
 const todo = @import("../todo.zig");
 const utils = @import("../utils.zig");
-const legacy = @import("legacy.zig");
+const cancel = @import("../cancel.zig");
+const orchestrator = @import("orchestrator.zig");
 
 pub fn executeInlineToolCalls(
     allocator: std.mem.Allocator,
@@ -18,6 +19,10 @@ pub fn executeInlineToolCalls(
 
     var lines = std.mem.splitScalar(u8, response, '\n');
     while (lines.next()) |line| {
+        if (cancel.isCancelled()) {
+            try result_buf.writer(allocator).writeAll("Operation cancelled by user.");
+            break;
+        }
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (!std.mem.startsWith(u8, trimmed, "TOOL_CALL ")) continue;
 
@@ -65,8 +70,9 @@ pub fn executeInlineToolCalls(
         var tool_desc_pos: usize = 0;
         const tool_desc_w = std.io.fixedBufferStream(&tool_desc_buf);
         const tool_desc_writer = tool_desc_w.writer();
-        tool_desc_writer.print("• {s}", .{tool_name}) catch {};
-        tool_desc_pos = @min(tool_name.len + 2, tool_desc_buf.len);
+        const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) "listing files in" else tool_name;
+        tool_desc_writer.print("{s}• {s}{s}", .{ display.C_CYAN, shown_tool_name, display.C_RESET }) catch {};
+        tool_desc_pos = @min(shown_tool_name.len + 2 + display.C_CYAN.len + display.C_RESET.len, tool_desc_buf.len);
         if (file_path) |fp| {
             const written = (std.fmt.bufPrint(tool_desc_buf[tool_desc_pos..], " {s}file={s}{s}", .{ display.C_CYAN, fp, display.C_RESET }) catch "").len;
             tool_desc_pos += written;
@@ -88,10 +94,14 @@ pub fn executeInlineToolCalls(
                 tool_desc_pos += written;
             }
         }
-        legacy.toolOutput("{s}", .{tool_desc_buf[0..tool_desc_pos]});
+        orchestrator.toolOutput("{s}", .{tool_desc_buf[0..tool_desc_pos]});
 
         const tool_out = tools.executeNamed(allocator, tool_name, args, todo_list) catch |err| {
-            try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ tool_name, @errorName(err) });
+            if (err == tools.NamedToolError.Cancelled or cancel.isCancelled()) {
+                try result_buf.writer(allocator).writeAll("Operation cancelled by user.");
+                break;
+            }
+            try result_buf.writer(allocator).print("Tool {s} failed: {s}\n", .{ shown_tool_name, @errorName(err) });
             continue;
         };
         defer allocator.free(tool_out);
@@ -105,7 +115,7 @@ pub fn executeInlineToolCalls(
         const clean_out = try utils.sanitizeTextForModel(allocator, no_ansi, 128 * 1024);
         defer allocator.free(clean_out);
 
-        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ tool_name, clean_out });
+        try result_buf.writer(allocator).print("Tool {s} result:\n{s}\n", .{ shown_tool_name, clean_out });
     }
 
     if (result_buf.items.len == 0) return null;

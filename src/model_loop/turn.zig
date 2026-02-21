@@ -8,7 +8,7 @@ const tool_routing = @import("../tool_routing.zig");
 const todo = @import("../todo.zig");
 const cancel = @import("../cancel.zig");
 const logger = @import("../logger.zig");
-const legacy = @import("legacy.zig");
+const orchestrator = @import("orchestrator.zig");
 
 pub fn toolDefsToLlm(defs: []const tools.ToolDef) []const llm.ToolRouteDef {
     return @ptrCast(defs);
@@ -94,7 +94,7 @@ pub fn runModelTurnWithTools(
         var routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, route_prompt, false);
         if (routed == null and step == 0 and repo_specific and !forced_repo_probe_done) {
             forced_repo_probe_done = true;
-            legacy.toolOutput("{s}»{s} ", .{ display.C_DIM, display.C_RESET });
+            orchestrator.toolOutput("{s}»{s} ", .{ display.C_DIM, display.C_RESET });
             const strict_prompt = try tool_routing.buildStrictToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_prompt);
             routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, strict_prompt, true);
@@ -102,14 +102,14 @@ pub fn runModelTurnWithTools(
 
         if (routed == null and step == 0 and mutation_request and !forced_mutation_probe_done) {
             forced_mutation_probe_done = true;
-            legacy.toolOutput("{s}✎{s} ", .{ display.C_DIM, display.C_RESET });
+            orchestrator.toolOutput("{s}✎{s} ", .{ display.C_DIM, display.C_RESET });
             const strict_mutation_prompt = try tool_routing.buildStrictMutationToolRoutingPrompt(allocator, context_prompt);
             defer allocator.free(strict_mutation_prompt);
             routed = try tool_routing.inferToolCallWithModel(allocator, stdout, active, strict_mutation_prompt, true);
         }
 
         if (routed == null and step == 0 and mutation_request) {
-            legacy.toolOutput("{s}ƒ{s} ", .{ display.C_DIM, display.C_RESET });
+            orchestrator.toolOutput("{s}ƒ{s} ", .{ display.C_DIM, display.C_RESET });
             routed = try tool_routing.inferToolCallWithTextFallback(allocator, active, context_prompt, true);
         }
 
@@ -138,7 +138,7 @@ pub fn runModelTurnWithTools(
         }
 
         if (routed == null) {
-            legacy.toolOutput("{s}—{s}", .{ display.C_YELLOW, display.C_RESET });
+            orchestrator.toolOutput("{s}—{s}", .{ display.C_YELLOW, display.C_RESET });
 
             if (mutation_request and tool_calls == 0) {
                 allocator.free(context_prompt);
@@ -283,18 +283,49 @@ pub fn runModelTurnWithTools(
         } else {
             display.setSpinnerState(.tool);
         }
-        legacy.toolOutput("• {s}", .{routed.?.tool});
+        if (std.mem.eql(u8, routed.?.tool, "list_files") or std.mem.eql(u8, routed.?.tool, "list")) {
+            if (tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json)) |header_path| {
+                defer allocator.free(header_path);
+                orchestrator.toolOutput("{s}• listing files in{s} {s}", .{ display.C_CYAN, display.C_RESET, header_path });
+            } else {
+                orchestrator.toolOutput("{s}• listing files in{s}", .{ display.C_CYAN, display.C_RESET });
+            }
+        } else {
+            orchestrator.toolOutput("{s}• {s}{s}", .{ display.C_CYAN, routed.?.tool, display.C_RESET });
+        }
 
         const started_ms = std.time.milliTimestamp();
         const file_path = tools.parsePrimaryPathFromArgs(allocator, routed.?.arguments_json);
+        if (isCancelled()) {
+            if (file_path) |fp| allocator.free(fp);
+            allocator.free(context_prompt);
+            return .{
+                .response = try allocator.dupe(u8, "Operation cancelled by user during tool execution."),
+                .reasoning = try allocator.dupe(u8, ""),
+                .tool_calls = tool_calls,
+                .error_count = 0,
+                .files_touched = try utils.joinPaths(allocator, paths.items),
+            };
+        }
 
         const tool_out = tools.executeNamed(allocator, routed.?.tool, routed.?.arguments_json, todo_list) catch |err| {
+            if (err == tools.NamedToolError.Cancelled or isCancelled()) {
+                if (file_path) |fp| allocator.free(fp);
+                allocator.free(context_prompt);
+                return .{
+                    .response = try allocator.dupe(u8, "Operation cancelled by user during tool execution."),
+                    .reasoning = try allocator.dupe(u8, ""),
+                    .tool_calls = tool_calls,
+                    .error_count = 0,
+                    .files_touched = try utils.joinPaths(allocator, paths.items),
+                };
+            }
             const failed_ms = std.time.milliTimestamp();
             const duration_ms = failed_ms - started_ms;
             const err_line = try display.buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "error", 0, duration_ms, file_path);
             defer allocator.free(err_line);
             if (file_path) |fp| allocator.free(fp);
-            legacy.toolOutput("{s}", .{err_line});
+            orchestrator.toolOutput("{s}", .{err_line});
             allocator.free(context_prompt);
             return .{
                 .response = try std.fmt.allocPrint(
@@ -315,7 +346,7 @@ pub fn runModelTurnWithTools(
         const ok_line = try display.buildToolResultEventLine(allocator, step + 1, call_id, routed.?.tool, "ok", tool_out.len, duration_ms, file_path);
         defer allocator.free(ok_line);
         if (file_path) |fp| allocator.free(fp);
-        legacy.toolOutput("{s}", .{ok_line});
+        orchestrator.toolOutput("{s}", .{ok_line});
 
         if (tool_out.len > 0) {
             try display.printTruncatedCommandOutput(stdout, tool_out);

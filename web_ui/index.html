@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>zagent - AI Coding Assistant</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -20,7 +22,8 @@
                 </div>
                 <div class="model-info" id="modelInfo">
                     <span class="model-label">Model:</span>
-                    <span class="model-value" id="modelValue">Not loaded</span>
+                    <button class="model-value" id="modelValue" type="button" title="Choose model" aria-haspopup="listbox" aria-expanded="false">Not loaded</button>
+                    <div class="model-picker hidden" id="modelPicker" role="listbox" aria-label="Available models"></div>
                 </div>
             </div>
             

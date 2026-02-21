@@ -233,6 +233,30 @@ pub const Server = struct {
         }
     }
 
+    const StaticRoute = struct {
+        path: []const u8,
+        content_type: []const u8,
+    };
+
+    fn staticRouteForPath(path: []const u8) ?StaticRoute {
+        if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
+            return .{ .path = "web_ui/index.html", .content_type = "text/html; charset=utf-8" };
+        }
+        if (std.mem.eql(u8, path, "/app.js")) {
+            return .{ .path = "web_ui/app.js", .content_type = "application/javascript; charset=utf-8" };
+        }
+        if (std.mem.eql(u8, path, "/styles.css")) {
+            return .{ .path = "web_ui/styles.css", .content_type = "text/css; charset=utf-8" };
+        }
+        if (std.mem.eql(u8, path, "/favicon.svg")) {
+            return .{ .path = "web_ui/favicon.svg", .content_type = "image/svg+xml; charset=utf-8" };
+        }
+        if (std.mem.eql(u8, path, "/favicon.ico")) {
+            return .{ .path = "web_ui/favicon.ico", .content_type = "image/x-icon" };
+        }
+        return null;
+    }
+
     /// Handle HTTP GET request
     fn handleHttpRequest(self: *Server, stream: net.Stream, request: []const u8) !void {
         // Parse the request line
@@ -247,13 +271,8 @@ pub const Server = struct {
             return;
         }
 
-        // Serve static files
-        if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
-            try self.serveStaticFile(stream, "web_ui/index.html", "text/html; charset=utf-8");
-        } else if (std.mem.eql(u8, path, "/app.js")) {
-            try self.serveStaticFile(stream, "web_ui/app.js", "application/javascript; charset=utf-8");
-        } else if (std.mem.eql(u8, path, "/styles.css")) {
-            try self.serveStaticFile(stream, "web_ui/styles.css", "text/css; charset=utf-8");
+        if (staticRouteForPath(path)) |route| {
+            try self.serveStaticFile(stream, route.path, route.content_type);
         } else {
             try sendHttpResponse(stream, "404 Not Found", "text/plain", "Not found");
         }
@@ -348,6 +367,18 @@ pub const Server = struct {
         }
         self.clients_mutex.unlock();
 
+        // Bootstrap with recent sessions so the sidebar can populate on initial page load.
+        if (global_message_handler) |callback| {
+            const bootstrap_response = callback(self.allocator, client_id, initialWebSocketBootstrapMessage()) catch |err| blk: {
+                log.warn("WebSocket bootstrap callback failed for client {d}: {}", .{ client_id, err });
+                break :blk "";
+            };
+            if (bootstrap_response.len > 0) {
+                defer self.allocator.free(bootstrap_response);
+                try self.sendToClient(client_id, bootstrap_response);
+            }
+        }
+
         // Handle WebSocket messages
         try self.handleWebSocketMessages(stream, client_id);
     }
@@ -402,6 +433,10 @@ pub const Server = struct {
         }
     }
 };
+
+fn initialWebSocketBootstrapMessage() []const u8 {
+    return "{\"type\":\"list_sessions\"}";
+}
 
 fn hasWebSocketUpgradeHeader(request: []const u8) bool {
     var lines = std.mem.splitScalar(u8, request, '\n');
@@ -581,4 +616,22 @@ fn jsonQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try out.append(allocator, '"');
 
     return out.toOwnedSlice(allocator);
+}
+
+test "staticRouteForPath serves favicon assets" {
+    const svg = Server.staticRouteForPath("/favicon.svg") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("web_ui/favicon.svg", svg.path);
+    try std.testing.expectEqualStrings("image/svg+xml; charset=utf-8", svg.content_type);
+
+    const ico = Server.staticRouteForPath("/favicon.ico") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("web_ui/favicon.ico", ico.path);
+    try std.testing.expectEqualStrings("image/x-icon", ico.content_type);
+}
+
+test "staticRouteForPath returns null for unknown path" {
+    try std.testing.expect(Server.staticRouteForPath("/missing") == null);
+}
+
+test "initialWebSocketBootstrapMessage requests recent sessions" {
+    try std.testing.expectEqualStrings("{\"type\":\"list_sessions\"}", initialWebSocketBootstrapMessage());
 }
