@@ -70,7 +70,12 @@ pub fn executeInlineToolCalls(
         var tool_desc_pos: usize = 0;
         const tool_desc_w = std.io.fixedBufferStream(&tool_desc_buf);
         const tool_desc_writer = tool_desc_w.writer();
-        const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) "listing files in" else tool_name;
+        const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list"))
+            "listing files in"
+        else if (std.mem.eql(u8, tool_name, "set_status"))
+            "updating status"
+        else
+            tool_name;
         tool_desc_writer.print("{s}• {s}{s}", .{ display.C_CYAN, shown_tool_name, display.C_RESET }) catch {};
         tool_desc_pos = @min(shown_tool_name.len + 2 + display.C_CYAN.len + display.C_RESET.len, tool_desc_buf.len);
         if (file_path) |fp| {

@@ -17,6 +17,75 @@ const ArtifactSnapshot = struct {
     content: []u8,
 };
 
+const CompletionOutcome = enum {
+    completed_with_work,
+    completed_with_blocker,
+    insufficient_progress,
+};
+
+fn isImplementationIntentRequest(raw_user_request: []const u8) bool {
+    const q = std.mem.trim(u8, raw_user_request, " \t\r\n");
+    if (q.len == 0) return false;
+
+    const hints = [_][]const u8{
+        "implement",
+        "build",
+        "add feature",
+        "fix",
+        "patch",
+        "update code",
+        "refactor",
+        "write code",
+        "change ",
+        "edit ",
+    };
+
+    for (hints) |h| {
+        if (utils.containsIgnoreCase(q, h)) return true;
+    }
+    return false;
+}
+
+fn isExplicitBlockerText(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t.len == 0) return false;
+
+    const hints = [_][]const u8{
+        "blocked",
+        "unable",
+        "cannot",
+        "can't",
+        "permission",
+        "missing",
+        "failed",
+        "error:",
+        "requires",
+        "not available",
+    };
+
+    for (hints) |h| {
+        if (utils.containsIgnoreCase(t, h)) return true;
+    }
+    return false;
+}
+
+fn evaluateCompletionOutcome(
+    implementation_intent: bool,
+    mutating_tools_executed: usize,
+    files_touched_count: usize,
+    final_text: []const u8,
+) CompletionOutcome {
+    if (!implementation_intent) return .completed_with_work;
+
+    const blocker = isExplicitBlockerText(final_text);
+    if (blocker) return .completed_with_blocker;
+
+    const has_work = mutating_tools_executed > 0 or files_touched_count > 0;
+    if (has_work) return .completed_with_work;
+
+    return .insufficient_progress;
+}
+
 // Tool output callback type for timeline integration
 // Takes a pre-formatted string and adds it to timeline
 pub const ToolOutputCallback = *const fn ([]const u8) void;
@@ -170,6 +239,41 @@ fn formatLatencySuffix(allocator: std.mem.Allocator, total_model_latency_ns: u64
     return std.fmt.allocPrint(allocator, " ⏱ {d}.{d}s", .{ whole, frac });
 }
 
+test "implementation intent heuristic detects action verbs" {
+    try std.testing.expect(isImplementationIntentRequest("please implement oauth login"));
+    try std.testing.expect(isImplementationIntentRequest("Fix this bug in parser"));
+    try std.testing.expect(!isImplementationIntentRequest("summarize this file"));
+}
+
+test "blocker text heuristic detects explicit blockers" {
+    try std.testing.expect(isExplicitBlockerText("I am blocked due to missing permissions."));
+    try std.testing.expect(isExplicitBlockerText("cannot proceed: dependency not available"));
+    try std.testing.expect(!isExplicitBlockerText("implemented successfully"));
+}
+
+test "completion outcome requires work or blocker for implementation intent" {
+    try std.testing.expectEqual(
+        CompletionOutcome.insufficient_progress,
+        evaluateCompletionOutcome(true, 0, 0, "I will implement this next."),
+    );
+    try std.testing.expectEqual(
+        CompletionOutcome.completed_with_work,
+        evaluateCompletionOutcome(true, 1, 0, "Done."),
+    );
+    try std.testing.expectEqual(
+        CompletionOutcome.completed_with_work,
+        evaluateCompletionOutcome(true, 0, 2, "Done."),
+    );
+    try std.testing.expectEqual(
+        CompletionOutcome.completed_with_blocker,
+        evaluateCompletionOutcome(true, 0, 0, "Blocked: missing API credentials."),
+    );
+    try std.testing.expectEqual(
+        CompletionOutcome.completed_with_work,
+        evaluateCompletionOutcome(false, 0, 0, "Analysis complete."),
+    );
+}
+
 // Simplified bridge-based tool loop - uses Bun AI SDK
 pub fn runModel(
     allocator: std.mem.Allocator,
@@ -197,6 +301,7 @@ pub fn runModel(
     const mutation_request = tool_routing.isLikelyFileMutationRequest(raw_user_request);
     const skill_request = isSkillCreationRequest(raw_user_request);
     const objective_request = isObjectiveMetricsRequest(raw_user_request);
+    const implementation_intent = mutation_request or objective_request or isImplementationIntentRequest(raw_user_request);
     var required_output_paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer required_output_paths.deinit(arena_alloc);
     try collectRequiredOutputPaths(arena_alloc, raw_user_request, &required_output_paths);
@@ -301,6 +406,8 @@ pub fn runModel(
     var prev_correctness_fix_rechecked = false;
     var iter: usize = 0;
     var total_model_latency_ns: u64 = 0;
+    var completion_correction_retries: usize = 0;
+    const max_completion_correction_retries: usize = 2;
 
     while (iter < max_iterations) : (iter += 1) {
         if (iter == 0 and skill_request) {
@@ -381,6 +488,32 @@ pub fn runModel(
         if (response.tool_calls.len == 0) {
             const trimmed_text = std.mem.trim(u8, response.text, " \t\r\n");
             if (trimmed_text.len > 0) {
+                const outcome = evaluateCompletionOutcome(
+                    implementation_intent,
+                    mutating_tools_executed,
+                    paths.items.len,
+                    response.text,
+                );
+                if (outcome == .insufficient_progress and completion_correction_retries < max_completion_correction_retries) {
+                    completion_correction_retries += 1;
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                    try w.writer(arena_alloc).print(
+                        "{f}",
+                        .{std.json.fmt("Implementation intent detected, but no concrete file edits or explicit blocker were produced. Execute required code/file changes now, or return a clear blocker with cause.", .{})},
+                    );
+                    try w.appendSlice(arena_alloc, "}");
+                    continue;
+                }
+                if (outcome == .insufficient_progress) {
+                    return .{
+                        .response = try allocator.dupe(u8, "Unable to complete requested implementation: no concrete edits were produced and no explicit blocker was provided."),
+                        .reasoning = try allocator.dupe(u8, response.reasoning),
+                        .tool_calls = tool_calls,
+                        .error_count = 1,
+                        .files_touched = try utils.joinPaths(allocator, paths.items),
+                    };
+                }
+
                 try logger.transcriptWrite("\n<<< Assistant: {s}\n", .{response.text});
                 const latency_suffix = try formatLatencySuffix(arena_alloc, total_model_latency_ns);
                 try display.addAssistantMessageWithSuffix(allocator, response.text, latency_suffix);
@@ -550,6 +683,19 @@ pub fn runModel(
             } else if (std.mem.eql(u8, tc.tool, "respond_text")) {
                 display.setSpinnerState(.thinking);
                 toolUsage("responding", .{});
+            } else if (std.mem.eql(u8, tc.tool, "set_status")) {
+                const A = struct { status: ?[]const u8 = null };
+                if (std.json.parseFromSlice(A, allocator, tc.args, .{ .ignore_unknown_fields = true })) |p| {
+                    defer p.deinit();
+                    if (p.value.status) |status_text| {
+                        display.setSpinnerStateWithText(.thinking, status_text);
+                    } else {
+                        display.setSpinnerState(.thinking);
+                    }
+                } else |_| {
+                    display.setSpinnerState(.thinking);
+                }
+                toolUsage("updating status", .{});
             } else if (std.mem.eql(u8, tc.tool, "list_files") or std.mem.eql(u8, tc.tool, "list")) {
                 display.setSpinnerState(.tool);
                 toolUsage("listing files", .{});
@@ -690,6 +836,32 @@ pub fn runModel(
                         .files_touched = try utils.joinPaths(allocator, paths.items),
                     };
                 };
+                const outcome = evaluateCompletionOutcome(
+                    implementation_intent,
+                    mutating_tools_executed,
+                    paths.items.len,
+                    final_text,
+                );
+                if (outcome == .insufficient_progress and completion_correction_retries < max_completion_correction_retries) {
+                    completion_correction_retries += 1;
+                    try w.appendSlice(arena_alloc, ",{\"role\":\"user\",\"content\":");
+                    try w.writer(arena_alloc).print(
+                        "{f}",
+                        .{std.json.fmt("Implementation intent detected, but no concrete file edits or explicit blocker were produced. Execute required code/file changes now, or return a clear blocker with cause.", .{})},
+                    );
+                    try w.appendSlice(arena_alloc, "}");
+                    continue;
+                }
+                if (outcome == .insufficient_progress) {
+                    return .{
+                        .response = try allocator.dupe(u8, "Unable to complete requested implementation: no concrete edits were produced and no explicit blocker was provided."),
+                        .reasoning = try allocator.dupe(u8, response.reasoning),
+                        .tool_calls = tool_calls,
+                        .error_count = 1,
+                        .files_touched = try utils.joinPaths(allocator, paths.items),
+                    };
+                }
+
                 const latency_suffix = try formatLatencySuffix(arena_alloc, total_model_latency_ns);
                 try display.addAssistantMessageWithSuffix(arena_alloc, final_text, latency_suffix);
                 return .{
@@ -771,7 +943,12 @@ pub fn runModel(
                 }
                 toolOutput("{s}  error: {s}{s}", .{ display.C_RED, @errorName(err), display.C_RESET });
                 saw_tool_error = true;
-                const shown_tool_name = if (std.mem.eql(u8, tc.tool, "list_files") or std.mem.eql(u8, tc.tool, "list")) "listing files in" else tc.tool;
+                const shown_tool_name = if (std.mem.eql(u8, tc.tool, "list_files") or std.mem.eql(u8, tc.tool, "list"))
+                    "listing files in"
+                else if (std.mem.eql(u8, tc.tool, "set_status"))
+                    "updating status"
+                else
+                    tc.tool;
                 const err_msg = try std.fmt.allocPrint(arena_alloc, "Tool {s} failed: {s}", .{ shown_tool_name, @errorName(err) });
                 try turn_results.append(arena_alloc, err_msg);
                 continue;

@@ -280,6 +280,18 @@ pub fn runModelTurnWithTools(
             display.setSpinnerState(.writing);
         } else if (std.mem.eql(u8, routed.?.tool, "bash")) {
             display.setSpinnerState(.bash);
+        } else if (std.mem.eql(u8, routed.?.tool, "set_status")) {
+            const A = struct { status: ?[]const u8 = null };
+            if (std.json.parseFromSlice(A, allocator, routed.?.arguments_json, .{ .ignore_unknown_fields = true })) |p| {
+                defer p.deinit();
+                if (p.value.status) |status_text| {
+                    display.setSpinnerStateWithText(.thinking, status_text);
+                } else {
+                    display.setSpinnerState(.thinking);
+                }
+            } else |_| {
+                display.setSpinnerState(.thinking);
+            }
         } else {
             display.setSpinnerState(.tool);
         }
@@ -290,6 +302,8 @@ pub fn runModelTurnWithTools(
             } else {
                 orchestrator.toolOutput("{s}• listing files in{s}", .{ display.C_CYAN, display.C_RESET });
             }
+        } else if (std.mem.eql(u8, routed.?.tool, "set_status")) {
+            orchestrator.toolOutput("{s}• updating status{s}", .{ display.C_CYAN, display.C_RESET });
         } else {
             orchestrator.toolOutput("{s}• {s}{s}", .{ display.C_CYAN, routed.?.tool, display.C_RESET });
         }

@@ -251,7 +251,12 @@ pub fn buildToolResultEventLine(
 
     const status_color = if (std.mem.eql(u8, status, "ok")) C_GREEN else C_RED;
     const status_symbol = if (std.mem.eql(u8, status, "ok")) "✓" else "✗";
-    const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list")) "listing files in" else tool_name;
+    const shown_tool_name = if (std.mem.eql(u8, tool_name, "list_files") or std.mem.eql(u8, tool_name, "list"))
+        "listing files in"
+    else if (std.mem.eql(u8, tool_name, "set_status"))
+        "updating status"
+    else
+        tool_name;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
@@ -271,7 +276,12 @@ pub fn buildToolResultEventLine(
 pub fn printColoredToolEvent(stdout: anytype, event_type: []const u8, step: ?usize, call_id: ?[]const u8, tool_name: ?[]const u8) !void {
     if (!std.mem.eql(u8, event_type, "tool-call")) return;
     if (tool_name) |tname| {
-        const shown_tool_name = if (std.mem.eql(u8, tname, "list_files") or std.mem.eql(u8, tname, "list")) "listing files in" else tname;
+        const shown_tool_name = if (std.mem.eql(u8, tname, "list_files") or std.mem.eql(u8, tname, "list"))
+            "listing files in"
+        else if (std.mem.eql(u8, tname, "set_status"))
+            "updating status"
+        else
+            tname;
         try stdout.print("{s}• {s}{s}\n", .{ C_CYAN, shown_tool_name, C_RESET });
     }
     _ = step;

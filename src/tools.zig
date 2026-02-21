@@ -456,7 +456,7 @@ pub fn executeNamed(allocator: std.mem.Allocator, name: []const u8, arguments_js
         defer p.deinit();
         const status = p.value.status orelse return NamedToolError.InvalidArguments;
         display.setSpinnerStateWithText(.thinking, status);
-        return std.fmt.allocPrint(allocator, "Status updated to: {s}", .{status});
+        return std.fmt.allocPrint(allocator, "{s}", .{status});
     }
 
     if (std.mem.eql(u8, name, "get_file_outline")) {
