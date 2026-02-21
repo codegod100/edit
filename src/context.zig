@@ -139,6 +139,25 @@ pub fn normalizeHistoryLine(line: []const u8) []const u8 {
         }
         break;
     }
+
+    // Strip trailing ANSI escape sequences (e.g. "\x1b[0m").
+    while (trimmed.len > 2) {
+        const esc_idx = std.mem.lastIndexOf(u8, trimmed, "\x1b[") orelse break;
+        var i: usize = esc_idx + 2;
+        while (i < trimmed.len) : (i += 1) {
+            const c = trimmed[i];
+            if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
+                i += 1;
+                break;
+            }
+        }
+        if (i == trimmed.len) {
+            trimmed = std.mem.trimRight(u8, trimmed[0..esc_idx], " \t");
+            continue;
+        }
+        break;
+    }
+
     return trimmed;
 }
 
@@ -258,6 +277,44 @@ pub const SessionInfo = struct {
     }
 };
 
+fn isValidHexId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    for (id) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn contextProjectIdAlloc(allocator: std.mem.Allocator, project_hash: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{x}", .{project_hash});
+}
+
+fn contextProjectDirAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const project_id = try contextProjectIdAlloc(allocator, project_hash);
+    defer allocator.free(project_id);
+    return std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_V2_DIR_NAME, project_id });
+}
+
+fn contextMetaPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const dir = try contextProjectDirAlloc(allocator, base_path, project_hash);
+    defer allocator.free(dir);
+    return std.fs.path.join(allocator, &.{ dir, "meta.json" });
+}
+
+fn contextSnapshotPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const dir = try contextProjectDirAlloc(allocator, base_path, project_hash);
+    defer allocator.free(dir);
+    return std.fs.path.join(allocator, &.{ dir, "snapshot.json" });
+}
+
+fn contextEventsPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
+    const dir = try contextProjectDirAlloc(allocator, base_path, project_hash);
+    defer allocator.free(dir);
+    return std.fs.path.join(allocator, &.{ dir, "events.ndjson" });
+}
+
 // List available context sessions
 pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) !std.ArrayListUnmanaged(SessionInfo) {
     var sessions: std.ArrayListUnmanaged(SessionInfo) = .empty;
@@ -266,7 +323,7 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
         sessions.deinit(allocator);
     }
 
-    const contexts_dir_path = try std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_DIR_NAME });
+    const contexts_dir_path = try std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_V2_DIR_NAME });
     defer allocator.free(contexts_dir_path);
 
     var dir = std.fs.openDirAbsolute(contexts_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -275,91 +332,66 @@ pub fn listContextSessions(allocator: std.mem.Allocator, base_path: []const u8) 
     };
     defer dir.close();
 
+    const SnapshotPreview = struct {
+        title: ?[]const u8 = null,
+        turns: []const struct { role: []const u8, content: []const u8 } = &.{},
+    };
+
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
-        if (entry.kind != .file) continue;
-        
-        // Match context-{hex}.json pattern
-        if (!std.mem.startsWith(u8, entry.name, "context-")) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-        
-        const hash_part = entry.name["context-".len .. entry.name.len - ".json".len];
-        
-        // Validate it's a hex string
-        var valid_hex = true;
-        for (hash_part) |c| {
-            if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) {
-                valid_hex = false;
-                break;
-            }
+        if (entry.kind != .directory) continue;
+        if (!isValidHexId(entry.name)) continue;
+
+        const snapshot_path = try std.fs.path.join(allocator, &.{ contexts_dir_path, entry.name, "snapshot.json" });
+        defer allocator.free(snapshot_path);
+
+        var title: ?[]u8 = null;
+        const file = std.fs.openFileAbsolute(snapshot_path, .{}) catch continue;
+        defer file.close();
+        const stat = file.stat() catch continue;
+        const text = file.readToEndAlloc(allocator, 128 * 1024) catch null;
+        if (text) |t| {
+            defer allocator.free(t);
+            if (std.json.parseFromSlice(SnapshotPreview, allocator, t, .{ .ignore_unknown_fields = true })) |parsed| {
+                defer parsed.deinit();
+                if (parsed.value.title) |session_title| {
+                    const cleaned = std.mem.trim(u8, session_title, " \t\r\n");
+                    if (cleaned.len > 0 and !std.fs.path.isAbsolute(cleaned)) {
+                        title = allocator.dupe(u8, cleaned) catch null;
+                    }
+                }
+                if (title == null) {
+                    for (parsed.value.turns) |turn| {
+                        if (!std.mem.eql(u8, turn.role, "user")) continue;
+                        const clean = std.mem.trim(u8, turn.content, " \t\r\n");
+                        if (clean.len == 0) continue;
+                        const cap = @min(clean.len, 60);
+                        title = allocator.dupe(u8, clean[0..cap]) catch null;
+                        if (title != null and clean.len > 60) {
+                            const old = title.?;
+                            title = std.fmt.allocPrint(allocator, "{s}...", .{old}) catch old;
+                            if (!std.mem.eql(u8, title.?, old)) allocator.free(old);
+                        }
+                        break;
+                    }
+                }
+            } else |_| {}
         }
-        if (!valid_hex) continue;
 
-        // Get file stats
-        const stat = dir.statFile(entry.name) catch continue;
-
-        // Build full path
         const full_path = try std.fs.path.join(allocator, &.{ contexts_dir_path, entry.name });
         errdefer allocator.free(full_path);
 
-        // Peek for title or first prompt snippet
-        var title: ?[]u8 = null;
-        const file = std.fs.openFileAbsolute(full_path, .{}) catch null;
-        if (file) |f| {
-            defer f.close();
-            var peek_buf: [4096]u8 = undefined;
-            const peek_len = f.readAll(&peek_buf) catch 0;
-            const peek_data = peek_buf[0..peek_len];
-
-            // 1. Try explicit title
-            if (std.mem.indexOf(u8, peek_data, "\"title\":\"")) |idx| {
-                const start = idx + 9;
-                if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
-                    title = try allocator.dupe(u8, peek_data[start..end]);
-                }
-            }
-            if (title) |parsed_title| {
-                const trimmed = std.mem.trim(u8, parsed_title, " \t\r\n");
-                if (trimmed.len > 0 and std.fs.path.isAbsolute(trimmed)) {
-                    allocator.free(parsed_title);
-                    title = null;
-                }
-            }
-
-            // 2. Fallback to first user prompt snippet
-            if (title == null) {
-                if (std.mem.indexOf(u8, peek_data, "\"role\":\"user\",\"content\":\"")) |idx| {
-                    const start = idx + 25;
-                    if (std.mem.indexOfScalarPos(u8, peek_data, start, '"')) |end| {
-                        const snippet = peek_data[start..end];
-                        const cap = @min(snippet.len, 60);
-                        var clean = try allocator.alloc(u8, cap);
-                        for (snippet[0..cap], 0..) |c, j| {
-                            clean[j] = if (c == '\n' or c == '\r' or c == '\t') ' ' else c;
-                        }
-                        title = clean;
-                        if (snippet.len > 60) {
-                            const old = title.?;
-                            title = try std.fmt.allocPrint(allocator, "{s}...", .{old});
-                            allocator.free(old);
-                        }
-                    }
-                }
-            }
-        }
-
         try sessions.append(allocator, .{
-            .id = try allocator.dupe(u8, hash_part),
+            .id = try allocator.dupe(u8, entry.name),
             .path = full_path,
             .title = title,
             .modified_time = stat.mtime,
-            .turn_count = 0, // Disabled for performance
+            .turn_count = 0,
             .file_size = @intCast(stat.size),
             .size_str = try formatSize(allocator, stat.size),
         });
     }
 
-    // Sort by modified time (newest first)
     std.mem.sort(SessionInfo, sessions.items, {}, struct {
         fn lessThan(_: void, a: SessionInfo, b: SessionInfo) bool {
             return a.modified_time > b.modified_time;
@@ -380,13 +412,12 @@ fn formatSize(allocator: std.mem.Allocator, size: usize) ![]u8 {
 }
 
 pub fn contextPathAlloc(allocator: std.mem.Allocator, base_path: []const u8, project_hash: u64) ![]u8 {
-    const filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{project_hash});
-    defer allocator.free(filename);
-    return std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_DIR_NAME, filename });
+    // Compatibility shim for call sites that only check path existence.
+    return contextSnapshotPathAlloc(allocator, base_path, project_hash);
 }
 
 pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *ContextWindow, project_hash: u64) !void {
-    const path = try contextPathAlloc(allocator, base_path, project_hash);
+    const path = try contextSnapshotPathAlloc(allocator, base_path, project_hash);
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
@@ -406,29 +437,35 @@ pub fn loadContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         error_count: ?usize = null,
         files_touched: ?[]const u8 = null,
     };
-    const ContextJson = struct {
+    const SnapshotJson = struct {
+        schema_version: u32 = 2,
         summary: ?[]const u8 = null,
         title: ?[]const u8 = null,
         project_path: ?[]const u8 = null,
+        last_event_seq: usize = 0,
         turns: []const TurnJson = &.{},
     };
 
-    var parsed = std.json.parseFromSlice(ContextJson, allocator, text, .{ .ignore_unknown_fields = true }) catch return;
+    var parsed = std.json.parseFromSlice(SnapshotJson, allocator, text, .{ .ignore_unknown_fields = true }) catch return;
     defer parsed.deinit();
 
-    if (parsed.value.summary) |s| {
-        if (window.summary) |existing| allocator.free(existing);
-        window.summary = try allocator.dupe(u8, s);
+    if (parsed.value.schema_version != 2) return;
+
+    if (window.summary) |existing| allocator.free(existing);
+    window.summary = null;
+    if (window.title) |existing| allocator.free(existing);
+    window.title = null;
+    if (window.project_path) |existing| allocator.free(existing);
+    window.project_path = null;
+
+    while (window.turns.items.len > 0) {
+        var turn = window.turns.pop().?;
+        turn.deinit(allocator);
     }
 
-    if (parsed.value.title) |t| {
-        if (window.title) |existing| allocator.free(existing);
-        window.title = try allocator.dupe(u8, t);
-    }
-    if (parsed.value.project_path) |p| {
-        if (window.project_path) |existing| allocator.free(existing);
-        window.project_path = try allocator.dupe(u8, p);
-    }
+    if (parsed.value.summary) |s| window.summary = try allocator.dupe(u8, s);
+    if (parsed.value.title) |t| window.title = try allocator.dupe(u8, t);
+    if (parsed.value.project_path) |p| window.project_path = try allocator.dupe(u8, p);
 
     for (parsed.value.turns) |turn| {
         const role: Role = if (std.mem.eql(u8, turn.role, "assistant")) .assistant else .user;
@@ -456,18 +493,32 @@ pub fn loadContextWindowWithHash(allocator: std.mem.Allocator, base_path: []cons
     return hash;
 }
 
-
 pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, window: *const ContextWindow, project_hash: u64) !void {
     const logger = @import("logger.zig");
-    const path = try contextPathAlloc(allocator, base_path, project_hash);
-    defer allocator.free(path);
 
-    logger.info("Saving context to {s}...", .{path});
-    const dir_path = std.fs.path.dirname(path) orelse return;
-    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+    const contexts_root = try std.fs.path.join(allocator, &.{ base_path, paths.CONTEXTS_V2_DIR_NAME });
+    defer allocator.free(contexts_root);
+    std.fs.makeDirAbsolute(contexts_root) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
+
+    const project_dir = try contextProjectDirAlloc(allocator, base_path, project_hash);
+    defer allocator.free(project_dir);
+
+    std.fs.makeDirAbsolute(project_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const meta_path = try contextMetaPathAlloc(allocator, base_path, project_hash);
+    defer allocator.free(meta_path);
+    const snapshot_path = try contextSnapshotPathAlloc(allocator, base_path, project_hash);
+    defer allocator.free(snapshot_path);
+    const events_path = try contextEventsPathAlloc(allocator, base_path, project_hash);
+    defer allocator.free(events_path);
+
+    logger.info("Saving context to {s}...", .{snapshot_path});
 
     const TurnJson = struct {
         role: []const u8,
@@ -477,40 +528,97 @@ pub fn saveContextWindow(allocator: std.mem.Allocator, base_path: []const u8, wi
         error_count: usize,
         files_touched: ?[]const u8,
     };
-    const ContextJson = struct {
+    const SnapshotJson = struct {
+        schema_version: u32,
         summary: ?[]const u8,
         title: ?[]const u8,
         project_path: ?[]const u8,
+        last_event_seq: usize,
         turns: []TurnJson,
+    };
+    const MetaJson = struct {
+        schema_version: u32,
+        project_id: []const u8,
+        project_root: ?[]const u8,
+        turn_count: usize,
+    };
+    const EventJson = struct {
+        schema_version: u32,
+        event_seq: usize,
+        event_type: []const u8,
+        role: []const u8,
+        content: []const u8,
     };
 
     var turns: std.ArrayListUnmanaged(TurnJson) = .empty;
     defer turns.deinit(allocator);
-    for (window.turns.items) |turn| {
+    var events: std.ArrayListUnmanaged(EventJson) = .empty;
+    defer events.deinit(allocator);
+
+    for (window.turns.items, 0..) |turn, idx| {
+        const role = if (turn.role == .assistant) "assistant" else "user";
         try turns.append(allocator, .{
-            .role = if (turn.role == .assistant) "assistant" else "user",
+            .role = role,
             .content = turn.content,
             .reasoning = turn.reasoning,
             .tool_calls = turn.tool_calls,
             .error_count = turn.error_count,
             .files_touched = turn.files_touched,
         });
+        try events.append(allocator, .{
+            .schema_version = 2,
+            .event_seq = idx + 1,
+            .event_type = "turn",
+            .role = role,
+            .content = turn.content,
+        });
     }
 
-    const payload = ContextJson{
+    const project_id = try contextProjectIdAlloc(allocator, project_hash);
+    defer allocator.free(project_id);
+
+    const meta_payload = MetaJson{
+        .schema_version = 2,
+        .project_id = project_id,
+        .project_root = window.project_path,
+        .turn_count = window.turns.items.len,
+    };
+
+    var meta_out: std.ArrayListUnmanaged(u8) = .empty;
+    defer meta_out.deinit(allocator);
+    try meta_out.writer(allocator).print("{f}\n", .{std.json.fmt(meta_payload, .{})});
+
+    var meta_file = try std.fs.createFileAbsolute(meta_path, .{});
+    defer meta_file.close();
+    try meta_file.writeAll(meta_out.items);
+
+    const snapshot_payload = SnapshotJson{
+        .schema_version = 2,
         .summary = window.summary,
         .title = window.title,
         .project_path = window.project_path,
+        .last_event_seq = window.turns.items.len,
         .turns = turns.items,
     };
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    defer out.deinit(allocator);
-    try out.writer(allocator).print("{f}\n", .{std.json.fmt(payload, .{})});
 
-    var file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(out.items);
-    logger.info("Saved context ({d} turns, {d} bytes)", .{ window.turns.items.len, out.items.len });
+    var snapshot_out: std.ArrayListUnmanaged(u8) = .empty;
+    defer snapshot_out.deinit(allocator);
+    try snapshot_out.writer(allocator).print("{f}\n", .{std.json.fmt(snapshot_payload, .{})});
+
+    var snapshot_file = try std.fs.createFileAbsolute(snapshot_path, .{});
+    defer snapshot_file.close();
+    try snapshot_file.writeAll(snapshot_out.items);
+
+    var events_file = try std.fs.createFileAbsolute(events_path, .{});
+    defer events_file.close();
+    for (events.items) |ev| {
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(allocator);
+        try line.writer(allocator).print("{f}\n", .{std.json.fmt(ev, .{})});
+        try events_file.writeAll(line.items);
+    }
+
+    logger.info("Saved context ({d} turns, {d} bytes)", .{ window.turns.items.len, snapshot_out.items.len });
 }
 
 // --- Context compaction and summarization ---
@@ -696,4 +804,69 @@ pub fn buildContextMessagesJson(allocator: std.mem.Allocator, window: *const Con
     try w.writeAll("}]");
 
     return out.toOwnedSlice(allocator);
+}
+
+test "saveContextWindow writes v2 context layout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    var window = ContextWindow.init(32000, 20);
+    defer window.deinit(allocator);
+
+    try window.append(allocator, .user, "hello", .{});
+    try window.append(allocator, .assistant, "world", .{});
+
+    const hash: u64 = 0x1a2b3c;
+    try saveContextWindow(allocator, base, &window, hash);
+
+    const project_id = try std.fmt.allocPrint(allocator, "{x}", .{hash});
+    defer allocator.free(project_id);
+
+    const meta_path = try std.fs.path.join(allocator, &.{ base, paths.CONTEXTS_V2_DIR_NAME, project_id, "meta.json" });
+    defer allocator.free(meta_path);
+    const snapshot_path = try std.fs.path.join(allocator, &.{ base, paths.CONTEXTS_V2_DIR_NAME, project_id, "snapshot.json" });
+    defer allocator.free(snapshot_path);
+    const events_path = try std.fs.path.join(allocator, &.{ base, paths.CONTEXTS_V2_DIR_NAME, project_id, "events.ndjson" });
+    defer allocator.free(events_path);
+
+    var meta_file = try std.fs.openFileAbsolute(meta_path, .{});
+    defer meta_file.close();
+    var snapshot_file = try std.fs.openFileAbsolute(snapshot_path, .{});
+    defer snapshot_file.close();
+    var events_file = try std.fs.openFileAbsolute(events_path, .{});
+    defer events_file.close();
+}
+
+test "loadContextWindow ignores legacy v1 context files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const hash: u64 = 0x55aa;
+    const legacy_filename = try std.fmt.allocPrint(allocator, "context-{x}.json", .{hash});
+    defer allocator.free(legacy_filename);
+
+    const legacy_dir = try std.fs.path.join(allocator, &.{ base, paths.CONTEXTS_DIR_NAME });
+    defer allocator.free(legacy_dir);
+    try std.fs.makeDirAbsolute(legacy_dir);
+
+    const legacy_path = try std.fs.path.join(allocator, &.{ legacy_dir, legacy_filename });
+    defer allocator.free(legacy_path);
+
+    var f = try std.fs.createFileAbsolute(legacy_path, .{});
+    defer f.close();
+    try f.writeAll("{\"summary\":null,\"turns\":[{\"role\":\"user\",\"content\":\"legacy\"}]}");
+
+    var window = ContextWindow.init(32000, 20);
+    defer window.deinit(allocator);
+
+    try loadContextWindow(allocator, base, &window, hash);
+    try std.testing.expectEqual(@as(usize, 0), window.turns.items.len);
 }

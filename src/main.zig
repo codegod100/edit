@@ -227,6 +227,7 @@ fn selectSessionMenu(allocator: std.mem.Allocator, config_dir: []const u8) !?[]c
 }
 
 test {
+    _ = @import("context.zig");
     _ = @import("config_store.zig");
     _ = @import("llm.zig");
     _ = @import("provider.zig");

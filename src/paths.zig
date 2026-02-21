@@ -5,6 +5,7 @@ pub const CONFIG_SUBDIR = ".config";
 pub const LOGS_DIR_NAME = "logs";
 pub const TRANSCRIPTS_DIR_NAME = "transcripts";
 pub const CONTEXTS_DIR_NAME = "contexts";
+pub const CONTEXTS_V2_DIR_NAME = "contexts-v2";
 pub const DEBUG_LOG_NAME = "debug.log";
 pub const SETTINGS_FILENAME = "settings.json";
 pub const PROVIDER_ENV_FILENAME = "provider.env";
