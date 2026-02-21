@@ -156,15 +156,12 @@ pub fn main() !void {
     repl.run(allocator, resumed_session_hash) catch |err| {
         // Graceful exit on interrupt or EOF - don't print error trace
         if (err == error.InputOutput or err == error.EndOfStream or err == error.BrokenPipe) {
-            cancel.deinit();
             return;
         }
         return err;
     };
 
-    // Normal shutdown
-    cancel.deinit();
-
+    // Normal shutdown (deinit handled by defer)
     logger.info("zagent shutting down", .{});
 }
 
