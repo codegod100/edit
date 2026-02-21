@@ -220,9 +220,13 @@ fn sigintHandler(sig: c_int) callconv(.c) void {
         // 3rd Ctrl+C - nuclear exit
         std.posix.exit(130);
     } else if (already_cancelled) {
-        // 2nd Ctrl+C - request exit, restore terminal
-        @atomicStore(bool, &tm.exit_requested, true, .monotonic);
+        // 2nd Ctrl+C - restore terminal and exit
         tm.restore();
+        // Reset scroll region with async-signal-safe write
+        const stdout_fd = std.posix.STDOUT_FILENO;
+        _ = std.posix.write(stdout_fd, "\x1b[r") catch {}; // Reset scroll region
+        _ = std.posix.write(stdout_fd, "\n") catch {}; // New line
+        std.posix.exit(130);
     } else {
         // 1st Ctrl+C - just cancel
         @atomicStore(bool, &tm.cancelled, true, .monotonic);
