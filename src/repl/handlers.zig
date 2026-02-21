@@ -113,6 +113,27 @@ pub fn handleCommand(
             display.addTimelineEntry("{s}", .{view});
         },
         .connect_provider => {
+            if (std.mem.eql(u8, arg, "codex")) {
+                const existing = try auth.readCodexAuthToken(allocator);
+                if (existing == null) {
+                    try stdout.print("No Codex OAuth token found in ~/.codex/auth.json.\n", .{});
+                    try stdout.print("Please run Codex login once, then retry /connect codex.\n", .{});
+                    return true;
+                }
+                defer allocator.free(existing.?);
+
+                try stdout.print("Found Codex OAuth token in ~/.codex/auth.json\n", .{});
+                if (std.posix.getenv("OPENAI_API_KEY") != null) {
+                    try stdout.print("Note: OPENAI_API_KEY env var is set and will override Codex OAuth. Unset it to use Codex auth.\n", .{});
+                }
+
+                const new_stored = try store.load(allocator, state.config_dir);
+                allocator.free(state.provider_states);
+                state.provider_states = try model_select.resolveProviderStates(allocator, state.providers, new_stored);
+                store.free(allocator, new_stored);
+                return true;
+            }
+
             const chosen = if (arg.len > 0)
                 model_select.findProviderSpecByID(state.providers, arg)
             else

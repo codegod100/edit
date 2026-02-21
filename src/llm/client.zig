@@ -106,7 +106,12 @@ fn tryRequest(
     };
 
     if (result.status != .ok) {
-        std.log.err("HTTP error: status={d} url={s}", .{ @intFromEnum(result.status), url });
+        const body = allocating_writer.written();
+        if (body.len > 0) {
+            std.log.err("HTTP error: status={d} url={s} body={s}", .{ @intFromEnum(result.status), url, body });
+        } else {
+            std.log.err("HTTP error: status={d} url={s}", .{ @intFromEnum(result.status), url });
+        }
         if (result.status == .unauthorized) return error.AuthenticationError;
         if (result.status == .too_many_requests) return error.RateLimited;
         if (@intFromEnum(result.status) >= 500) return error.ServerError;

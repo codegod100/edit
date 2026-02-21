@@ -96,7 +96,7 @@ pub fn buildCodexBody(
         try w.writeAll("]");
     }
 
-    try w.writeAll(",\"tool_choice\":\"auto\",\"stream\":true}");
+    try w.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":false,\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"]}");
     return out.toOwnedSlice(allocator);
 }
 

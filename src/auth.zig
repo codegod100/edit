@@ -3,6 +3,9 @@ const ai_bridge = @import("ai_bridge.zig");
 const pm = @import("provider.zig");
 const store = @import("provider_store.zig");
 
+pub const CODEX_AUTH_PRIMARY_REL_PATH = ".codex/auth.json";
+pub const CODEX_AUTH_LEGACY_REL_PATH = ".codex/copilot_auth.json";
+
 pub const AuthMethod = enum {
     api,
     subscription,
@@ -15,6 +18,92 @@ pub const GITHUB_DEVICE_TOKEN_URL = "https://github.com/login/oauth/access_token
 pub const GITHUB_DEVICE_CLIENT_ID = "Iv1.b507a08c87ecfe98";
 pub const GITHUB_DEVICE_SCOPE = "read:user";
 pub const GITHUB_DEVICE_VERIFY_URL = "https://github.com/login/device";
+
+fn codexAuthPathAlloc(allocator: std.mem.Allocator, rel_path: []const u8) ![]u8 {
+    const home = std.posix.getenv("HOME") orelse return error.MissingHome;
+    return std.fs.path.join(allocator, &.{ home, rel_path });
+}
+
+pub fn readCodexAuthToken(allocator: std.mem.Allocator) !?[]u8 {
+    const paths = [_][]const u8{ CODEX_AUTH_PRIMARY_REL_PATH, CODEX_AUTH_LEGACY_REL_PATH };
+
+    for (paths) |rel_path| {
+        const path = codexAuthPathAlloc(allocator, rel_path) catch continue;
+        defer allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer file.close();
+
+        const data = try file.readToEndAlloc(allocator, 128 * 1024);
+        defer allocator.free(data);
+
+        // Primary Codex format: { "tokens": { "access_token": "..." } }
+        const Primary = struct {
+            tokens: ?struct {
+                access_token: ?[]const u8 = null,
+            } = null,
+            access_token: ?[]const u8 = null,
+        };
+        if (std.json.parseFromSlice(Primary, allocator, data, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.tokens) |t| {
+                if (t.access_token) |tok| {
+                    const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+                    if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+                }
+            }
+            if (parsed.value.access_token) |tok| {
+                const trimmed = std.mem.trim(u8, tok, " \t\r\n");
+                if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+            }
+        } else |_| {}
+
+        // Legacy fallback: { "token": "..." }
+        const Legacy = struct {
+            token: ?[]const u8 = null,
+            access_token: ?[]const u8 = null,
+        };
+        if (std.json.parseFromSlice(Legacy, allocator, data, .{ .ignore_unknown_fields = true })) |parsed_legacy| {
+            defer parsed_legacy.deinit();
+            const token = parsed_legacy.value.token orelse parsed_legacy.value.access_token orelse continue;
+            const trimmed = std.mem.trim(u8, token, " \t\r\n");
+            if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+        } else |_| {}
+    }
+
+    return null;
+}
+
+pub fn writeCodexAuthToken(allocator: std.mem.Allocator, token: []const u8) !void {
+    const trimmed = std.mem.trim(u8, token, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidToken;
+
+    const path = try codexAuthPathAlloc(allocator, CODEX_AUTH_LEGACY_REL_PATH);
+    defer allocator.free(path);
+
+    const dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    var tmp = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+    defer tmp.close();
+
+    const payload = try std.fmt.allocPrint(allocator, "{{\n  \"token\": {f}\n}}\n", .{std.json.fmt(trimmed, .{})});
+    defer allocator.free(payload);
+
+    try tmp.writeAll(payload);
+    try tmp.sync();
+
+    try std.fs.renameAbsolute(tmp_path, path);
+}
 
 pub fn supportsSubscription(provider_id: []const u8) bool {
     return std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "github-copilot");
@@ -321,6 +410,9 @@ fn openaiPollAndExchange(
         const PollResp = struct {
             authorization_code: ?[]const u8 = null,
             code_verifier: ?[]const u8 = null,
+            @"error": ?[]const u8 = null,
+            error_description: ?[]const u8 = null,
+            message: ?[]const u8 = null,
         };
         var parsed = std.json.parseFromSlice(PollResp, allocator, poll, .{ .ignore_unknown_fields = true }) catch {
             std.Thread.sleep(interval_sec * std.time.ns_per_s);
@@ -329,6 +421,23 @@ fn openaiPollAndExchange(
         defer parsed.deinit();
 
         if (parsed.value.authorization_code == null or parsed.value.code_verifier == null) {
+            if (parsed.value.@"error") |err_code| {
+                const detail = parsed.value.error_description orelse parsed.value.message orelse "no details";
+                if (std.mem.eql(u8, err_code, "authorization_pending")) {
+                    std.Thread.sleep(interval_sec * std.time.ns_per_s);
+                    continue;
+                }
+                if (std.mem.eql(u8, err_code, "expired_token")) {
+                    try stdout.print("OpenAI device code expired. Run /connect codex again.\n", .{});
+                    return null;
+                }
+                if (std.mem.eql(u8, err_code, "access_denied")) {
+                    try stdout.print("OpenAI authorization denied.\n", .{});
+                    return null;
+                }
+                try stdout.print("OpenAI authorization polling failed: {s} ({s})\n", .{ err_code, detail });
+                return null;
+            }
             std.Thread.sleep(interval_sec * std.time.ns_per_s);
             continue;
         }
@@ -357,8 +466,15 @@ fn openaiPollAndExchange(
         const TokenResp = struct {
             access_token: ?[]const u8 = null,
             refresh_token: ?[]const u8 = null,
+            @"error": ?[]const u8 = null,
+            error_description: ?[]const u8 = null,
+            message: ?[]const u8 = null,
         };
         var tok = std.json.parseFromSlice(TokenResp, allocator, token, .{ .ignore_unknown_fields = true }) catch {
+            const trimmed = std.mem.trim(u8, token, " \t\r\n");
+            if (trimmed.len > 0) {
+                try stdout.print("OpenAI token exchange returned non-JSON response: {s}\n", .{trimmed});
+            }
             return null;
         };
         defer tok.deinit();
@@ -367,6 +483,14 @@ fn openaiPollAndExchange(
             try stdout.print("Subscription authorized successfully.\n", .{});
             return try allocator.dupe(u8, access);
         }
+
+        if (tok.value.@"error") |err_code| {
+            const detail = tok.value.error_description orelse tok.value.message orelse "no details";
+            try stdout.print("OpenAI token exchange failed: {s} ({s})\n", .{ err_code, detail });
+            return null;
+        }
+
+        try stdout.print("OpenAI token exchange succeeded without an access_token.\n", .{});
         return null;
     }
 

@@ -37,18 +37,38 @@ pub fn envPairsForProviders(
     for (providers) |p| {
         // Always include opencode even without API key (free tier uses "public")
         const is_opencode = std.mem.eql(u8, p.id, "opencode");
+        const is_openai = std.mem.eql(u8, p.id, "openai");
         var found_any = false;
 
         for (p.env_vars) |name| {
+            // ENV first (highest precedence)
+            if (std.posix.getenv(name)) |value| {
+                try out.append(allocator, .{ .name = name, .value = value });
+                found_any = true;
+                continue;
+            }
+
+            // For OpenAI, codex auth should be env -> ~/.codex/auth.json only.
+            // Do not fall back to provider.env OPENAI_API_KEY here.
+            if (is_openai) continue;
+
+            // Stored provider.env fallback (all other providers)
             for (stored) |pair| {
                 if (std.mem.eql(u8, pair.name, name)) {
                     try out.append(allocator, .{ .name = pair.name, .value = pair.value });
                     found_any = true;
+                    break;
                 }
             }
-            const value = std.posix.getenv(name) orelse continue;
-            try out.append(allocator, .{ .name = name, .value = value });
-            found_any = true;
+        }
+
+        // Codex OAuth fallback for OpenAI when env and store are absent
+        if (is_openai and !found_any and p.env_vars.len > 0) {
+            if (try auth.readCodexAuthToken(allocator)) |token| {
+                // Intentionally keep token allocated for provider state lifetime.
+                try out.append(allocator, .{ .name = p.env_vars[0], .value = token });
+                found_any = true;
+            }
         }
 
         // For opencode, add a placeholder if no key found so it passes through
@@ -95,6 +115,8 @@ pub fn providerHasModel(providers: []const provider.ProviderSpec, provider_id: [
     // OpenRouter is an aggregator and its model catalog changes frequently; don't hard-fail on
     // stale local catalogs. `/model` already does an optional live check for OpenRouter.
     if (std.mem.eql(u8, provider_id, "openrouter")) return true;
+    // OpenAI Codex model ids are served from the codex backend and may not exist in local static catalogs.
+    if (std.mem.eql(u8, provider_id, "openai") and utils.isCodexModelId(model_id)) return true;
     const spec = findProviderSpecByID(providers, provider_id) orelse return false;
     for (spec.models) |m_id| {
         if (std.mem.eql(u8, m_id, model_id)) return true;
@@ -112,9 +134,8 @@ pub fn chooseDefaultModelForConnected(state: provider.ProviderState) ?[]const u8
             if (best == null) best = m_id else if (std.mem.lessThan(u8, best.?, m_id)) best = m_id;
         }
         if (best) |b| return b;
-        // No codex model found - return first available model for OAuth fallback
-        if (state.models.len > 0) return state.models[0];
-        return null;
+        // No codex model in static catalog - use a known codex default.
+        return "gpt-5.3-codex";
     }
     return provider.defaultModelIDForProvider(state.id, state.models);
 }

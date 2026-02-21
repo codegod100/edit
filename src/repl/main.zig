@@ -224,39 +224,8 @@ pub fn run(allocator: std.mem.Allocator, resumed_session_hash_arg: ?u64) !void {
     // Providers are static configuration, but we might want them in state.
     // Spec says []const ProviderSpec. We can keep it.
 
-    var stored_pairs = try store.load(allocator, config_dir);
+    const stored_pairs = try store.load(allocator, config_dir);
     defer store.free(allocator, stored_pairs);
-
-    // Codex token sync
-    const home = std.posix.getenv("HOME") orelse "/tmp";
-    {
-        const codex_path = try std.fs.path.join(allocator, &.{ home, ".codex", "copilot_auth.json" });
-        defer allocator.free(codex_path);
-        const f = std.fs.openFileAbsolute(codex_path, .{}) catch |err| blk: {
-            if (err != error.FileNotFound) {} // ignore
-            break :blk null;
-        };
-        if (f) |file| {
-            defer file.close();
-            const text = file.readToEndAlloc(allocator, 16 * 1024) catch null;
-            if (text) |t| {
-                defer allocator.free(t);
-                // Simple grep for token
-                if (std.mem.indexOf(u8, t, "\"token\":\"")) |idx| {
-                    const start = idx + 9;
-                    if (std.mem.indexOfScalarPos(u8, t, start, '"')) |end| {
-                        const token = t[start..end];
-                        // Upsert into stored_pairs if not present or different
-                        // Actually just upsert file
-                        _ = store.upsertFile(allocator, config_dir, "GITHUB_COPILOT_API_KEY", token) catch {};
-                        // Reload stored
-                        store.free(allocator, stored_pairs);
-                        stored_pairs = try store.load(allocator, config_dir);
-                    }
-                }
-            }
-        }
-    }
 
     const provider_states = try model_select.resolveProviderStates(allocator, provider_specs, stored_pairs);
 

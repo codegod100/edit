@@ -213,6 +213,9 @@ fn chatCodex(
     if (config.referer) |r| try extra_headers.append(allocator, .{ .name = "HTTP-Referer", .value = r });
     if (config.title) |t| try extra_headers.append(allocator, .{ .name = "X-Title", .value = t });
     try extra_headers.append(allocator, .{ .name = "originator", .value = "zagent" });
+    try extra_headers.append(allocator, .{ .name = "x-initiator", .value = "agent" });
+    try extra_headers.append(allocator, .{ .name = "Openai-Intent", .value = "conversation-edits" });
+    try extra_headers.append(allocator, .{ .name = "accept", .value = "text/event-stream" });
 
     const raw = try client.httpRequest(
         allocator,
