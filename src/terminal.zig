@@ -109,11 +109,8 @@ pub const TerminalManager = struct {
 
         _ = std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw) catch {};
 
-        // Set non-blocking for escape sequence polling
-        const O_NONBLOCK: u32 = if (builtin.os.tag == .linux) 0o4000 else 0x0004;
-        if (self.original_flags) |flags| {
-            _ = std.posix.fcntl(std.posix.STDIN_FILENO, 4, flags | O_NONBLOCK) catch {}; // F_SETFL = 4
-        }
+        // Do NOT set non-blocking here - read() should block waiting for input
+        // Non-blocking is only needed during polling operations
 
         self.in_raw_mode = true;
     }
